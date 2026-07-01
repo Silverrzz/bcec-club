@@ -6,7 +6,7 @@ from engine_instance import EngineInstance
 from time_control import TimeControl, TimeControlCategory
 from game_state import GameState
 from match import Match
-import time
+from match_runner import MatchRunner
 
 if __name__ == "__main__":
 
@@ -15,8 +15,8 @@ if __name__ == "__main__":
 
     time_control = TimeControl(
         category=TimeControlCategory.INCREMENT,
-        initial_time=2_000,
-        increment=1_000
+        initial_time=500,
+        increment=50
     )
 
     match = Match(
@@ -28,14 +28,11 @@ if __name__ == "__main__":
         black_tm=time_control.get_manager_object()
     )
 
-    match.white_tm.start_clock()
+    runner = MatchRunner(match)
 
-    test_start_time = time.time()
+    while not match.get_game_state().is_finished():
+        move = runner.run_next_move()
+        if move is not None:
+            print(move)
 
-    try:
-        while True:
-            time.sleep(0.001)
-            print(match.white_tm.probe_clock())
-    except Exception as e:
-        print(f"Exception: {e}")
-        print(f"Total elapsed time: {time.time() - test_start_time} seconds")
+    print(match.get_game_state().get_summary())
