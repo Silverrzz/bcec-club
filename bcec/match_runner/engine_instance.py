@@ -1,13 +1,14 @@
 from concurrent.futures import Future, ThreadPoolExecutor
 
 import chess
-import random
-import time
+
+from .uci import position_command, setoption_command
 
 class EngineInstance():
-    def __init__(self, id, host):
+    def __init__(self, id, host, options: dict[str, str | int | bool] | None = None):
         self._name = id
         self._host = host
+        self._options = dict(options or {})
         self._search_executor = ThreadPoolExecutor(max_workers=1)
         self._search_future: Future | None = None
 
@@ -23,16 +24,32 @@ class EngineInstance():
     def set_host(self, host):
         self._host = host
 
-    def get_move(self, board: chess.Board) -> chess.Move:
-        while random.random() < 0.5:
-            time.sleep(0.1)
+    def get_options(self) -> dict[str, str | int | bool]:
+        return dict(self._options)
+
+    def set_options(self, options: dict[str, str | int | bool]):
+        self._options = dict(options)
+
+    def start_new_game(self):
+        for name, value in self._options.items():
+            self._send_uci_command(setoption_command(name, value))
+
+        self._send_uci_command("ucinewgame")
+
+    def get_move(self, board: chess.Board, go_command_arg: str) -> chess.Move:
+        self._send_uci_command(position_command(board))
+        self._send_uci_command(go_command_arg)
+
         return next(iter(board.legal_moves))
 
-    def start_search(self, board: chess.Board):
+    def start_search(self, board: chess.Board, go_command_arg: str = "go"):
         if self.is_searching():
             raise RuntimeError(f"{self._name} is already searching")
 
-        self._search_future = self._search_executor.submit(self.get_move, board.copy())
+        self._search_future = self._search_executor.submit(self.get_move, board.copy(), go_command_arg)
+
+    def _send_uci_command(self, command: str):
+        pass
 
     def is_searching(self) -> bool:
         return self._search_future is not None and not self._search_future.done()
