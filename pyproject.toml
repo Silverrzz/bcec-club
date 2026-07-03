@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "bcec-club"
+name = "cope-chess"
 version = "0.1.0"
-description = "BCEC Club chess engine tournament runner"
+description = "COPE tournament runner"
 requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2.7",
@@ -27,7 +27,7 @@ worker = [
 dev = []
 
 [project.scripts]
-bcec = "bcec.cli:main"
+cope = "cope.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["bcec*"]
+include = ["cope*"]

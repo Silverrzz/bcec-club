@@ -1,4 +1,4 @@
-from bcec.prototype import run_prototype_tournament
+from cope.prototype import run_prototype_tournament
 
 
 if __name__ == "__main__":

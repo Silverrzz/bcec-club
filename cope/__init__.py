@@ -1,0 +1,2 @@
+"""COPE package."""
+

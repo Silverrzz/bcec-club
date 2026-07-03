@@ -8,7 +8,7 @@ from .prototype import run_prototype_tournament
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="python -m bcec")
+    parser = argparse.ArgumentParser(prog="python -m cope")
     subparsers = parser.add_subparsers(dest="role", required=True)
 
     subparsers.add_parser("web", help="start the web server")
@@ -48,7 +48,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.role == "web":
-        print("bcec web is not implemented yet")
+        print("cope web is not implemented yet")
         return 0
 
     if args.role == "worker":
@@ -69,4 +69,4 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _default_app_commit() -> str:
-    return os.environ.get("BCEC_DEPLOY_COMMIT", "dev")
+    return os.environ.get("COPE_DEPLOY_COMMIT", "dev")

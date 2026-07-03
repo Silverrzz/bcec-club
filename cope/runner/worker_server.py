@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from websockets.exceptions import ConnectionClosed
 from websockets.server import WebSocketServerProtocol, serve
 
-from bcec.core.models import WorkerSessionHello, WorkerTokenHello, WorkerWelcome
-from bcec.core.protocol import (
+from cope.core.models import WorkerSessionHello, WorkerTokenHello, WorkerWelcome
+from cope.core.protocol import (
     ProtocolError,
     ProtocolValidationError,
     decode_message,

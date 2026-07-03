@@ -1,2 +1,0 @@
-"""BCEC Club package."""
-

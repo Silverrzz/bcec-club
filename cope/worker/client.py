@@ -6,8 +6,8 @@ from dataclasses import dataclass
 
 from websockets.client import connect
 
-from bcec.core.models import BenchInfo, HardwareInfo, WorkerSessionHello, WorkerTokenHello, WorkerWelcome
-from bcec.core.protocol import (
+from cope.core.models import BenchInfo, HardwareInfo, WorkerSessionHello, WorkerTokenHello, WorkerWelcome
+from cope.core.protocol import (
     decode_message,
     encode_message,
     make_message,
