@@ -19,10 +19,11 @@ web = [
     "uvicorn[standard]>=0.30",
 ]
 runner = [
-    "websockets>=12",
+    "websockets>=12,<14",
 ]
 worker = [
-    "websockets>=12",
+    "psutil>=5.9",
+    "websockets>=12,<14",
 ]
 dev = []
 
@@ -31,3 +32,6 @@ cope = "cope.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["cope*"]
+
+[tool.setuptools.package-data]
+"cope.db" = ["schema.sql"]

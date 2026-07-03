@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 from .engine_instance import EngineInstance
 from .game_state import GameState
-from .time_control import TimeControl
+from .time_control import RuntimeTimeControl
 from .time_control import TimeManager
 
 
@@ -22,7 +22,7 @@ class Tournament():
         id: int,
         name: str,
         engines: list[EngineInstance],
-        time_control: TimeControl,
+        time_control: RuntimeTimeControl,
     ):
         self._id = id
         self._name = name
@@ -48,10 +48,10 @@ class Tournament():
     def set_engines(self, engines: list[EngineInstance]):
         self._engines = engines
 
-    def get_time_control(self) -> TimeControl:
+    def get_time_control(self) -> RuntimeTimeControl:
         return self._time_control
 
-    def set_time_control(self, time_control: TimeControl):
+    def set_time_control(self, time_control: RuntimeTimeControl):
         self._time_control = time_control
 
     def get_games(self) -> tuple[Game, ...]:

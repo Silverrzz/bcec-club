@@ -60,14 +60,25 @@ def _build_hello(config: WorkerClientConfig) -> WorkerTokenHello | WorkerSession
 
 def _detect_hardware() -> HardwareInfo:
     logical_cores = os.cpu_count() or 1
+    physical_cores = logical_cores
+    ram_gb = 1
+
+    try:
+        import psutil
+
+        physical_cores = psutil.cpu_count(logical=False) or logical_cores
+        logical_cores = psutil.cpu_count(logical=True) or logical_cores
+        ram_gb = max(1, round(psutil.virtual_memory().total / (1024**3)))
+    except ImportError:
+        pass
+
     return HardwareInfo(
         cpu_model=platform.processor() or platform.machine() or "unknown",
-        physical_cores=logical_cores,
+        physical_cores=physical_cores,
         logical_cores=logical_cores,
-        ram_gb=1,
+        ram_gb=ram_gb,
         gpu=None,
         os=f"{platform.system()} {platform.release()}".strip(),
         python=platform.python_version(),
         bench=BenchInfo(),
     )
-

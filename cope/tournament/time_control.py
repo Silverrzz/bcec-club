@@ -7,7 +7,7 @@ class TimeControlCategory(Enum):
     MOVESTOGO = 3
     MOVENODES = 4
 
-class TimeControl:
+class RuntimeTimeControl:
     def __init__(
         self,
         category: TimeControlCategory,
@@ -84,7 +84,7 @@ class TimeOutError(Exception):
     pass
 
 class TimeManager():
-    def __init__(self, time_control: TimeControl):
+    def __init__(self, time_control: RuntimeTimeControl):
         self._time_control = time_control
         self._chess_clock = ChessClock()
         self._remaining_time = time_control.get_initial_time()
@@ -92,7 +92,7 @@ class TimeManager():
         self._moves_to_go = time_control.get_moves_to_go()
         self._nodes = time_control.get_nodes()
 
-    def get_time_control(self) -> TimeControl:
+    def get_time_control(self) -> RuntimeTimeControl:
         return self._time_control
 
     def get_remaining_time(self) -> int | None:

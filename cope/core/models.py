@@ -244,37 +244,30 @@ class HardwareInfo(StrictModel):
         return self
 
 
-class WorkerTokenHello(StrictModel):
+class WorkerActiveAssignmentsMixin(StrictModel):
+    active_assignment_ids: list[int] = Field(default_factory=list)
+
+    @field_validator("active_assignment_ids")
+    @classmethod
+    def validate_active_assignment_ids(cls, value: list[int]) -> list[int]:
+        if any(assignment_id <= 0 for assignment_id in value):
+            raise ValueError("active assignment ids must be positive")
+        if len(set(value)) != len(value):
+            raise ValueError("active assignment ids must be unique")
+        return value
+
+
+class WorkerTokenHello(WorkerActiveAssignmentsMixin):
     token: str = Field(min_length=1)
     label_hint: str = Field(default="", max_length=80)
     hw: HardwareInfo
     app_commit: str = Field(min_length=1)
-    active_assignment_ids: list[int] = Field(default_factory=list)
-
-    @field_validator("active_assignment_ids")
-    @classmethod
-    def validate_active_assignment_ids(cls, value: list[int]) -> list[int]:
-        if any(assignment_id <= 0 for assignment_id in value):
-            raise ValueError("active assignment ids must be positive")
-        if len(set(value)) != len(value):
-            raise ValueError("active assignment ids must be unique")
-        return value
 
 
-class WorkerSessionHello(StrictModel):
+class WorkerSessionHello(WorkerActiveAssignmentsMixin):
     session_id: str = Field(min_length=1)
     hw: HardwareInfo
     app_commit: str = Field(min_length=1)
-    active_assignment_ids: list[int] = Field(default_factory=list)
-
-    @field_validator("active_assignment_ids")
-    @classmethod
-    def validate_active_assignment_ids(cls, value: list[int]) -> list[int]:
-        if any(assignment_id <= 0 for assignment_id in value):
-            raise ValueError("active assignment ids must be positive")
-        if len(set(value)) != len(value):
-            raise ValueError("active assignment ids must be unique")
-        return value
 
 
 class WorkerWelcome(StrictModel):
