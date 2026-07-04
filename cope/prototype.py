@@ -8,7 +8,6 @@ from .core.models import (
     EngineSpec,
     HardwareMode,
     IncrementTimeControl,
-    RatingCategory,
     RoundRobinFormatOptions,
     TournamentConfig,
     TournamentFormat,
@@ -104,11 +103,11 @@ def run_prototype_data_setup() -> None:
         )
 
         config = TournamentConfig(
+            category_id=1,
             format=TournamentFormat.ROUND_ROBIN,
             format_options=RoundRobinFormatOptions(double_rr=True),
             participants=[1, 2],
             time_control=IncrementTimeControl(initial_ms=60_000, increment_ms=1_000),
-            rating_category=RatingCategory.BLITZ,
             hardware_mode=HardwareMode.SHARED,
             concurrency=1,
             adjudication=AdjudicationConfig(),

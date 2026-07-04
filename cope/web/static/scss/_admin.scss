@@ -1,0 +1,315 @@
+// ---------------------------------------------------------------------
+// Admin: WordPress-style shell - dark top bar, left sidebar, content.
+// ---------------------------------------------------------------------
+
+$admin-sidebar-width: 200px;
+$admin-topbar-height: 46px;
+
+.admin-body {
+  background: $page;
+}
+
+.admin-topbar {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  height: $admin-topbar-height;
+  padding: 0 18px;
+  background: #090d13;
+  border-bottom: 1px solid $line;
+
+  &__brand {
+    font-weight: 700;
+    color: $text;
+
+    &:hover {
+      color: $accent;
+      text-decoration: none;
+    }
+  }
+
+  &__link {
+    font-size: 13px;
+    color: $muted;
+
+    &:hover {
+      color: $text;
+    }
+  }
+}
+
+.admin-shell {
+  display: grid;
+  grid-template-columns: $admin-sidebar-width minmax(0, 1fr);
+  min-height: calc(100vh - #{$admin-topbar-height});
+}
+
+.admin-sidebar {
+  padding: 14px 0;
+  background: #0e141d;
+  border-right: 1px solid $line;
+
+  nav {
+    position: sticky;
+    top: $admin-topbar-height + 14px;
+    display: grid;
+  }
+
+  &__item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 18px;
+    color: $muted;
+    border-left: 3px solid transparent;
+
+    &:hover {
+      color: $text;
+      background: $surface;
+      text-decoration: none;
+    }
+
+    &.active {
+      color: $text;
+      font-weight: 600;
+      background: $surface;
+      border-left-color: $accent;
+    }
+  }
+
+  &__icon {
+    width: 20px;
+    text-align: center;
+  }
+}
+
+.admin-content {
+  display: grid;
+  gap: $gap;
+  align-content: start;
+  padding: 24px;
+  width: 100%;
+}
+
+.admin-page-title {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+
+  h1 {
+    margin: 0;
+  }
+
+  p {
+    margin: 4px 0 0;
+  }
+}
+
+.admin-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px;
+}
+
+.admin-stat {
+  padding: 16px;
+  color: $text;
+  background: $panel;
+  border: 1px solid $line;
+  border-radius: $radius;
+  transition: border-color 120ms ease;
+
+  &:hover {
+    border-color: $accent;
+    text-decoration: none;
+  }
+
+  strong {
+    display: block;
+    font-size: 24px;
+  }
+
+  span {
+    color: $muted;
+    font-size: 13px;
+  }
+}
+
+.admin-columns {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: $gap;
+  align-items: start;
+}
+
+.admin-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+
+  li {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 0;
+    border-bottom: 1px solid $line;
+
+    &:last-child {
+      border-bottom: none;
+    }
+
+    .muted {
+      margin-left: auto;
+      font-size: 12px;
+    }
+  }
+}
+
+.action-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+
+  form {
+    margin: 0;
+  }
+
+  p {
+    margin: 0;
+  }
+}
+
+.workers-page {
+  display: grid;
+  gap: $gap;
+}
+
+.worker-token-panel {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.35fr) minmax(0, 1fr);
+  gap: 16px 24px;
+  align-items: end;
+
+  h2,
+  p {
+    grid-column: 1;
+  }
+}
+
+.worker-token-form {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) 180px auto;
+  gap: 14px;
+  align-items: end;
+
+  .field,
+  .form-actions {
+    margin: 0;
+  }
+}
+
+.workers-panel {
+  padding: 0;
+  overflow: hidden;
+}
+
+.worker-list {
+  display: grid;
+}
+
+.worker-card {
+  display: grid;
+  grid-template-columns: 240px minmax(0, 1fr) auto;
+  gap: 24px;
+  align-items: center;
+  padding: 16px 18px;
+  border-bottom: 1px solid $line;
+
+  &:last-child {
+    border-bottom: none;
+  }
+}
+
+.worker-card__main {
+  display: grid;
+  gap: 8px;
+  align-content: center;
+}
+
+.worker-card__actions {
+  display: flex;
+  gap: 8px;
+
+  form {
+    margin: 0;
+  }
+}
+
+.worker-facts {
+  display: grid;
+  grid-template-columns: minmax(320px, 1.6fr) 90px 100px minmax(220px, 1fr);
+  gap: 18px;
+  margin: 0;
+
+  div {
+    min-width: 0;
+  }
+
+  dt {
+    margin-bottom: 3px;
+    color: $muted;
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+
+  dd {
+    margin: 0;
+    color: $text;
+    overflow-wrap: anywhere;
+  }
+}
+
+@media (max-width: 900px) {
+  .admin-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .admin-sidebar {
+    border-right: none;
+    border-bottom: 1px solid $line;
+
+    nav {
+      position: static;
+      grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+    }
+
+    &__item {
+      border-left: none;
+      padding: 8px 10px;
+    }
+  }
+
+  .admin-columns {
+    grid-template-columns: 1fr;
+  }
+
+  .worker-card {
+    grid-template-columns: 1fr;
+  }
+
+  .worker-token-panel,
+  .worker-token-form {
+    grid-template-columns: 1fr;
+  }
+
+  .worker-facts {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}

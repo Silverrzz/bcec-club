@@ -17,6 +17,7 @@ web = [
     "fastapi>=0.111",
     "jinja2>=3.1",
     "libsass>=0.23",
+    "python-multipart>=0.0.9",
     "uvicorn[standard]>=0.30",
 ]
 runner = [
@@ -36,4 +37,4 @@ include = ["cope*"]
 
 [tool.setuptools.package-data]
 "cope.db" = ["schema.sql"]
-"cope.web" = ["templates/*.html", "static/*.css", "static/*.js", "static/*.scss"]
+"cope.web" = ["templates/*.html", "templates/admin/*.html", "static/*.css", "static/*.js", "static/scss/*.scss"]

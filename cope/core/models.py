@@ -74,6 +74,7 @@ class AdjudicationConfig(StrictModel):
 class EngineSpec(StrictModel):
     engine_id: int = Field(gt=0)
     name: str = Field(min_length=1, max_length=80)
+    version: str = Field(default="", max_length=80)
     git_url: str = Field(min_length=1)
     commit: str
     build_cmd: str = Field(min_length=1)
@@ -101,14 +102,6 @@ class TournamentFormat(StrEnum):
     SWISS = "swiss"
     KNOCKOUT = "knockout"
     GAUNTLET = "gauntlet"
-
-
-class RatingCategory(StrEnum):
-    BULLET = "bullet"
-    BLITZ = "blitz"
-    RAPID = "rapid"
-    CLASSICAL = "classical"
-    NODES = "nodes"
 
 
 class HardwareMode(StrEnum):
@@ -145,17 +138,28 @@ FormatOptions = (
 
 
 class TournamentConfig(StrictModel):
+    category_id: int = Field(default=1, gt=0)
+    category_settings_linked: bool = True
     format: TournamentFormat
     format_options: FormatOptions
     participants: list[int] = Field(min_length=2)
     time_control: TimeControl
-    rating_category: RatingCategory
     hardware_mode: HardwareMode
     concurrency: int = Field(gt=0)
     opening_suite_id: int | None = Field(default=None, gt=0)
     adjudication: AdjudicationConfig
     rated: bool = True
     lag_compensation_ms: int = Field(default=50, ge=0)
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_rating_category(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            data = dict(data)
+            data.pop("rating_category", None)
+            data.setdefault("category_id", 1)
+            data.setdefault("category_settings_linked", True)
+        return data
 
     @field_validator("participants")
     @classmethod

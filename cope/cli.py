@@ -22,7 +22,7 @@ def main(argv: list[str] | None = None) -> int:
     build_css_parser = subparsers.add_parser("build-css", help="compile web SCSS")
     build_css_parser.add_argument(
         "--source",
-        default="cope/web/static/style.scss",
+        default="cope/web/static/scss/style.scss",
         help="SCSS source file",
     )
     build_css_parser.add_argument(
@@ -213,3 +213,7 @@ def _build_css(source: Path, output: Path) -> None:
     css = sass.compile(filename=str(source), output_style="expanded")
     output.write_text(css, encoding="utf-8")
     print(f"compiled {source} -> {output}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

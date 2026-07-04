@@ -1,0 +1,128 @@
+// ---------------------------------------------------------------------
+// Layout: public site shell - header, nav, page container, footer.
+// ---------------------------------------------------------------------
+
+.site-header {
+  background: rgba(15, 23, 34, 0.95);
+  border-bottom: 1px solid $line;
+
+  &__inner {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    max-width: $page-width;
+    margin: 0 auto;
+    padding: 10px 18px;
+  }
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 18px;
+  font-weight: 700;
+  color: $text;
+
+  &:hover {
+    text-decoration: none;
+  }
+
+  &__mark {
+    font-size: 24px;
+    color: $accent;
+  }
+
+  &__name em {
+    font-style: normal;
+    color: $accent;
+  }
+}
+
+.site-nav {
+  display: flex;
+  gap: 4px;
+
+  a {
+    padding: 7px 12px;
+    color: $muted;
+    border-radius: $radius-small;
+
+    &:hover {
+      color: $text;
+      text-decoration: none;
+      background: $surface;
+    }
+
+    &.active {
+      color: $text;
+      font-weight: 600;
+      background: $surface;
+    }
+  }
+
+  &__admin {
+    border: 1px solid $line;
+  }
+}
+
+.page {
+  max-width: $page-width;
+  min-height: calc(100vh - 160px);
+  margin: 0 auto;
+  padding: 14px 10px 36px;
+}
+
+.page-title {
+  margin-bottom: 36px;
+
+  p {
+    margin: 0;
+    color: $muted;
+  }
+}
+
+.site-footer {
+  padding: 20px 24px;
+  color: $muted;
+  font-size: 13px;
+  text-align: center;
+  border-top: 1px solid $line;
+
+  p {
+    margin: 0;
+  }
+}
+
+.game-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(360px, 440px);
+  gap: 64px;
+  align-items: start;
+}
+
+.game-main,
+.side-panel {
+  display: grid;
+  gap: 40px;
+}
+
+.game-main {
+  align-content: start;
+}
+
+@media (max-width: 1000px) {
+  .game-layout {
+    grid-template-columns: 1fr;
+    gap: 40px;
+  }
+
+  .site-header__inner {
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .page {
+    padding: 28px 20px 56px;
+  }
+}

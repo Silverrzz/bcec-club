@@ -1,0 +1,81 @@
+{% extends "admin/base.html" %}
+{% from "_macros.html" import flash %}
+
+{% block title %}Chat - COPE Admin{% endblock %}
+
+{% block content %}
+  <header class="admin-page-title">
+    <h1>Chat moderation</h1>
+  </header>
+
+  {{ flash(notice, error, errors) }}
+
+  <section class="panel">
+    <h2>Settings</h2>
+    <form class="settings-form" method="post" action="/admin/chat/settings">
+      <div class="field-row">
+        <div class="field">
+          <label for="slowmode_seconds">Slowmode (seconds)</label>
+          <input class="input input--small" id="slowmode_seconds" name="slowmode_seconds" type="number" min="0" value="{{ settings.slowmode_seconds }}">
+        </div>
+        <div class="field">
+          <label for="max_message_length">Max message length</label>
+          <input class="input input--small" id="max_message_length" name="max_message_length" type="number" min="1" value="{{ settings.max_message_length }}">
+        </div>
+        <div class="field">
+          <label for="retention_days">Retention (days)</label>
+          <input class="input input--small" id="retention_days" name="retention_days" type="number" min="1" value="{{ settings.retention_days }}">
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field field--checkbox">
+          <label>
+            <input type="checkbox" name="enabled" {% if settings.enabled %}checked{% endif %}>
+            Chat enabled
+          </label>
+        </div>
+        <div class="field field--checkbox">
+          <label>
+            <input type="checkbox" name="allow_anonymous_names" {% if settings.allow_anonymous_names %}checked{% endif %}>
+            Allow anonymous display names
+          </label>
+        </div>
+      </div>
+      <div class="form-actions">
+        <button class="button button--primary" type="submit">Save settings</button>
+      </div>
+    </form>
+  </section>
+
+  <section class="panel">
+    {% if messages %}
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Message</th>
+            <th>Posted</th>
+            <th class="col-actions"></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for message in messages %}
+            <tr>
+              <td>{{ message.display_name }}</td>
+              <td>{{ message.text }}</td>
+              <td class="muted">{{ message.at }}</td>
+              <td class="col-actions">
+                <form method="post" action="/admin/chat/{{ message.id }}/delete">
+                  <button class="button button--small button--danger" type="submit"
+                          data-confirm="Delete this message?">Delete</button>
+                </form>
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="empty">No chat messages yet.</p>
+    {% endif %}
+  </section>
+{% endblock %}

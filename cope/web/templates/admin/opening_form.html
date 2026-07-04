@@ -1,0 +1,40 @@
+{% extends "admin/base.html" %}
+{% from "_macros.html" import flash %}
+
+{% block title %}New opening suite - COPE Admin{% endblock %}
+
+{% block content %}
+  <header class="admin-page-title">
+    <h1>New opening suite</h1>
+    <a class="button button--ghost" href="/admin/openings">&larr; All suites</a>
+  </header>
+
+  {{ flash(notice, error, errors) }}
+
+  <form class="panel settings-form" method="post" action="/admin/openings" enctype="multipart/form-data">
+    <div class="field-row">
+      <div class="field">
+        <label for="name">Name</label>
+        <input class="input" id="name" name="name" required placeholder="e.g. 8-move balanced book">
+      </div>
+      <div class="field">
+        <label for="description">Description <span class="field-optional">(optional)</span></label>
+        <input class="input" id="description" name="description">
+      </div>
+    </div>
+    <div class="field">
+      <label for="book_file">Upload book</label>
+      <input class="input" id="book_file" name="book_file" type="file" accept=".epd,.pgn">
+      <p class="field-help">PGN files create one opening per game, using the final position of each mainline. EPD files create one opening per line.</p>
+    </div>
+    <div class="field">
+      <label for="positions">Manual positions</label>
+      <textarea class="input input--mono" id="positions" name="positions" rows="10"
+                placeholder="One FEN per line, optionally prefixed with a name:&#10;Sicilian Najdorf; rnbqkb1r/1p2pppp/p2p1n2/8/3NP3/2N5/PPP2PPP/R1BQKB1R w KQkq - 0 6"></textarea>
+      <p class="field-help">Saving combines uploaded PGN/EPD positions with these manual entries.</p>
+    </div>
+    <div class="form-actions">
+      <button class="button button--primary" type="submit">Create suite</button>
+    </div>
+  </form>
+{% endblock %}

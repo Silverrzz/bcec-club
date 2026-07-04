@@ -1,52 +1,196 @@
 {% extends "base.html" %}
+{% from "_macros.html" import engine_name, games_table %}
 
 {% block title %}{{ tournament.name }} - COPE Chess{% endblock %}
 
 {% block content %}
-  <section class="page-title">
-    <h1>{{ tournament.name }}</h1>
-    <p>{{ tournament.status }} | round {{ tournament.current_round }}</p>
+  {% set empty_engine = {"eval": "-", "depth": "-", "nodes": "-", "nps": "-", "pv": "not recorded"} %}
+  {% set black_data = engine_data.black if engine_data is defined and engine_data.black is defined else empty_engine %}
+  {% set white_data = engine_data.white if engine_data is defined and engine_data.white is defined else empty_engine %}
+  {% set chat_message_list = chat_messages if chat_messages is defined else [] %}
+  {% set opening_info = opening if opening is defined and opening else {"name": "Start position", "fen": "startpos"} %}
+  <section class="arena">
+    <div class="arena__grid">
+      <div class="arena__analysis">
+        <article class="engine-console engine-console--black">
+          <div class="engine-console__main">
+            <header>
+              <div>
+                <span>Black</span>
+                {% if viewer_game %}
+                  <strong><a href="/engines/{{ viewer_game.black_engine_id }}">{{ engine_name(engines, viewer_game.black_engine_id) }}</a></strong>
+                {% else %}
+                  <strong>Black</strong>
+                {% endif %}
+              </div>
+              <time>--:--</time>
+            </header>
+            <dl class="engine-console__feature-list">
+              <div><dt>Depth</dt><dd>{{ black_data.depth }}</dd></div>
+              <div><dt>Nodes</dt><dd>{{ black_data.nodes }}</dd></div>
+              <div><dt>NPS</dt><dd>{{ black_data.nps }}</dd></div>
+              <div class="engine-console__feature-item--pv"><dt>PV</dt><dd>{{ black_data.pv }}</dd></div>
+            </dl>
+          </div>
+          <div class="engine-console__pv-board board-shell board-shell--pv" data-board data-fen="{{ opening_info.fen }}" data-moves="">
+            <div class="board board--pv" data-board-grid></div>
+          </div>
+          <section class="engine-console__eval-card" aria-label="Black evaluation">
+            <span>Eval</span>
+            <strong>{{ black_data.eval }}</strong>
+          </section>
+        </article>
+
+        <article class="engine-console engine-console--white">
+          <div class="engine-console__main">
+            <header>
+              <div>
+                <span>White</span>
+                {% if viewer_game %}
+                  <strong><a href="/engines/{{ viewer_game.white_engine_id }}">{{ engine_name(engines, viewer_game.white_engine_id) }}</a></strong>
+                {% else %}
+                  <strong>White</strong>
+                {% endif %}
+              </div>
+              <time>--:--</time>
+            </header>
+            <dl class="engine-console__feature-list">
+              <div><dt>Depth</dt><dd>{{ white_data.depth }}</dd></div>
+              <div><dt>Nodes</dt><dd>{{ white_data.nodes }}</dd></div>
+              <div><dt>NPS</dt><dd>{{ white_data.nps }}</dd></div>
+              <div class="engine-console__feature-item--pv"><dt>PV</dt><dd>{{ white_data.pv }}</dd></div>
+            </dl>
+          </div>
+          <div class="engine-console__pv-board board-shell board-shell--pv" data-board data-fen="{{ opening_info.fen }}" data-moves="">
+            <div class="board board--pv" data-board-grid></div>
+          </div>
+          <section class="engine-console__eval-card" aria-label="White evaluation">
+            <span>Eval</span>
+            <strong>{{ white_data.eval }}</strong>
+          </section>
+        </article>
+      </div>
+
+      <div class="arena__board">
+        <section class="board-shell board-shell--arena" data-board data-board-coordinates="true" data-fen="{{ opening_info.fen }}" data-moves="{{ viewer_moves | map(attribute='uci') | join(' ') if viewer_game else '' }}">
+          <div class="board" data-board-grid></div>
+          <div class="board-footer">
+            <div class="board-controls">
+              <button type="button" class="button button--ghost" data-board-first title="First move">&#8676;</button>
+              <button type="button" class="button button--ghost" data-board-prev title="Previous move">&#8592;</button>
+              <span class="board-controls__status" data-board-status></span>
+              <button type="button" class="button button--ghost" data-board-next title="Next move">&#8594;</button>
+              <button type="button" class="button button--ghost" data-board-last title="Last move">&#8677;</button>
+            </div>
+            <div class="board-meta">
+              <button type="button" data-copy="{{ opening_info.name }}{% if opening_info.fen != 'startpos' %} | {{ opening_info.fen }}{% endif %}">
+                <span>Opening</span>
+                <strong>{{ opening_info.name }}</strong>
+              </button>
+              <button type="button" data-current-fen data-copy="{{ opening_info.fen }}">
+                <span>FEN</span>
+                <strong>{{ opening_info.fen }}</strong>
+              </button>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <div class="arena__chat-column">
+        <section class="arena-chat" id="chat">
+          <div class="arena-chat__log" data-chat-log>
+            {% for message in chat_message_list | reverse %}
+              <p><strong>{{ message.display_name }}</strong> {{ message.text }}</p>
+            {% else %}
+              <p class="muted">No chat.</p>
+            {% endfor %}
+          </div>
+          <form class="arena-chat__form" method="post" action="/chat" data-chat-form>
+            <input type="hidden" name="next" value="/tournaments/{{ tournament.id }}#chat">
+            <input class="input" type="text" name="display_name" maxlength="40" placeholder="Name" data-chat-display-name>
+            <input class="input" type="text" name="text" maxlength="500" placeholder="Message" required>
+            <button class="button" type="submit">Send</button>
+          </form>
+        </section>
+      </div>
+    </div>
   </section>
 
-  <section class="stats">
-    <div><strong>{{ summary.total }}</strong><span>games</span></div>
-    <div><strong>{{ summary.live }}</strong><span>live</span></div>
-    <div><strong>{{ summary.finished }}</strong><span>finished</span></div>
-    <div><strong>{{ summary.pending }}</strong><span>pending</span></div>
-  </section>
+  <section class="tournament-tables">
+    <div class="tabs" data-tabs>
+      <a href="#standings" class="active" data-tab="standings">Standings</a>
+      <a href="#games" data-tab="games">Games</a>
+      <a href="#settings" data-tab="settings">Settings</a>
+    </div>
 
-  <section class="panel">
-    <h2>Games</h2>
-    {% if games %}
-      <table>
-        <thead>
-          <tr>
-            <th>Round</th>
-            <th>White</th>
-            <th>Black</th>
-            <th>Status</th>
-            <th>Result</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for game in games %}
-            <tr data-href="/games/{{ game.id }}">
-              <td>{{ game.round }}</td>
-              <td>{{ engines.get(game.white_engine_id, "Engine " ~ game.white_engine_id) }}</td>
-              <td>{{ engines.get(game.black_engine_id, "Engine " ~ game.black_engine_id) }}</td>
-              <td>{{ game.status }}</td>
-              <td>{{ game.result or "-" }}</td>
+    <section class="panel" id="standings" data-tab-panel="standings">
+      <h2>Standings</h2>
+      {% if standings %}
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th class="col-narrow">#</th>
+              <th>Engine</th>
+              <th>Points</th>
+              <th>Played</th>
             </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    {% else %}
-      <p class="empty">No games scheduled yet.</p>
-    {% endif %}
-  </section>
+          </thead>
+          <tbody>
+            {% for row in standings %}
+              <tr data-href="/engines/{{ row.engine_id }}">
+                <td class="col-narrow">{{ loop.index }}</td>
+                <td>{{ row.name }}</td>
+                <td>{{ row.points }}</td>
+                <td>{{ row.played }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      {% else %}
+        <p class="empty">No participants yet.</p>
+      {% endif %}
+    </section>
 
-  <section class="panel">
-    <h2>Config</h2>
-    <pre>{{ config | tojson(indent=2) }}</pre>
+    <section class="panel" id="games" data-tab-panel="games" hidden>
+      <h2>All games</h2>
+      {% if games %}
+        {{ games_table(games, engines) }}
+      {% else %}
+        <p class="empty">No games scheduled yet.</p>
+      {% endif %}
+    </section>
+
+    <section class="panel" id="settings" data-tab-panel="settings" hidden>
+      <h2>Settings</h2>
+      <dl class="definition-grid">
+        {% for label, value in settings %}
+          <dt>{{ label }}</dt>
+          <dd>{{ value }}</dd>
+        {% endfor %}
+      </dl>
+      {% if engine_hardware %}
+        <h3 class="settings-subheading">Engine hardware</h3>
+        <table class="data-table engine-hardware-table">
+          <thead>
+            <tr>
+              <th>Engine</th>
+              <th>Hash</th>
+              <th>Threads</th>
+              <th>Active hardware</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in engine_hardware %}
+              <tr>
+                <td><a href="/engines/{{ row.engine_id }}">{{ row.name }}</a></td>
+                <td>{{ row.hash }}</td>
+                <td>{{ row.threads }}</td>
+                <td>{{ row.hardware }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      {% endif %}
+    </section>
   </section>
 {% endblock %}

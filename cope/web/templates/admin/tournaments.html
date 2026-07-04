@@ -1,0 +1,58 @@
+{% extends "admin/base.html" %}
+{% from "_macros.html" import status_badge, flash %}
+
+{% block title %}Tournaments - COPE Admin{% endblock %}
+
+{% block content %}
+  <header class="admin-page-title">
+    <h1>Tournaments</h1>
+    <a class="button" href="/admin/tournaments/new">Add new</a>
+  </header>
+
+  {{ flash(notice, error, errors) }}
+
+  <div class="tabs">
+    <a class="{% if not status_filter %}active{% endif %}" href="/admin/tournaments">All</a>
+    {% for status in statuses %}
+      <a class="{% if status_filter == status %}active{% endif %}" href="/admin/tournaments?status={{ status }}">{{ status | title }}</a>
+    {% endfor %}
+  </div>
+
+  <section class="panel">
+    {% if tournaments %}
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Status</th>
+            <th>Format</th>
+            <th>Time control</th>
+            <th>Progress</th>
+            <th class="col-actions"></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for item in tournaments %}
+            <tr data-href="/admin/tournaments/{{ item.record.id }}">
+              <td><a href="/admin/tournaments/{{ item.record.id }}">{{ item.record.name }}</a></td>
+              <td>{{ status_badge(item.record.status) }}</td>
+              <td>{{ item.format }}</td>
+              <td>{{ item.time_control }}</td>
+              <td class="muted">{{ item.summary.finished }} / {{ item.summary.total }}</td>
+              <td class="col-actions">
+                {% if item.record.status not in ("scheduled", "running") %}
+                  <form method="post" action="/admin/tournaments/{{ item.record.id }}/delete">
+                    <button class="button button--small button--danger" type="submit"
+                            data-confirm="Delete tournament '{{ item.record.name }}' and all of its games?">Delete</button>
+                  </form>
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="empty">No tournaments{% if status_filter %} with status "{{ status_filter }}"{% endif %} yet.</p>
+    {% endif %}
+  </section>
+{% endblock %}

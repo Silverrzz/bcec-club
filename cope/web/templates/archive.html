@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% from "_macros.html" import status_badge, games_table %}
+
+{% block title %}Archive - COPE Chess{% endblock %}
+
+{% block content %}
+  <section class="page-title">
+    <h1>Archive</h1>
+    <p>{{ tournaments|length }} finished tournament{{ "s" if tournaments|length != 1 }}</p>
+  </section>
+
+  {% if tournaments %}
+    <section class="card-grid">
+      {% for item in tournaments %}
+        <article class="card card--link" data-href="/tournaments/{{ item.record.id }}">
+          <header class="card__header">
+            <h2><a href="/tournaments/{{ item.record.id }}">{{ item.record.name }}</a></h2>
+            {{ status_badge(item.record.status) }}
+          </header>
+          <p class="card__meta">{{ item.format }} &middot; {{ item.time_control }}</p>
+          <p class="muted">{{ item.summary.finished }} games finished</p>
+        </article>
+      {% endfor %}
+    </section>
+  {% endif %}
+
+  <section class="panel">
+    <h2>Finished games</h2>
+    {% if games %}
+      {{ games_table(games, engines, show_round=false) }}
+    {% else %}
+      <p class="empty">No finished games yet.</p>
+    {% endif %}
+  </section>
+{% endblock %}

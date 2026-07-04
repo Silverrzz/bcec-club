@@ -1,0 +1,94 @@
+{% extends "admin/base.html" %}
+{% from "_macros.html" import status_badge, flash %}
+
+{% block title %}Workers - COPE Admin{% endblock %}
+
+{% block content %}
+  <header class="admin-page-title">
+    <h1>Workers</h1>
+  </header>
+
+  {{ flash(notice, error, errors) }}
+
+  {% if minted %}
+    <section class="panel panel--highlight">
+      <h2>New worker token</h2>
+      <p>Worker <strong>#{{ minted.worker_id }}</strong> &middot; expires {{ minted.expires_at }}</p>
+      <pre class="token-block">{{ minted.token }}</pre>
+      <p class="field-help">Start the worker with:
+        <code>cope worker --token {{ minted.token }}</code></p>
+    </section>
+  {% endif %}
+
+  <div class="workers-page">
+    <section class="panel worker-token-panel">
+      <h2>Mint worker token</h2>
+      <p class="field-help">A worker uses this one-time token to register itself with the runner.</p>
+      <form class="worker-token-form" method="post" action="/admin/workers/mint">
+        <div class="field">
+          <label for="label">Label</label>
+          <input class="input" id="label" name="label" required placeholder="e.g. basement-ryzen">
+        </div>
+        <div class="field">
+          <label for="ttl_seconds">Token lifetime (seconds)</label>
+          <input class="input input--small" id="ttl_seconds" type="number" min="60" name="ttl_seconds" value="7200">
+        </div>
+        <div class="form-actions">
+          <button class="button button--primary" type="submit">Mint token</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="panel workers-panel">
+      {% if workers %}
+        <div class="worker-list">
+          {% for worker in workers %}
+            <article class="worker-card">
+              <div class="worker-card__main">
+                <form class="rename-form" method="post" action="/admin/workers/{{ worker.id }}/label">
+                  <input class="input input--inline" name="label" value="{{ worker.label }}" aria-label="Worker label">
+                  <button class="button button--small button--ghost" type="submit" title="Rename">&#10003;</button>
+                </form>
+                {{ status_badge(worker.status) }}
+              </div>
+
+              <dl class="worker-facts">
+                <div>
+                  <dt>CPU</dt>
+                  <dd>{% if worker.hw %}{{ worker.hw.cpu_model }}{% else %}-{% endif %}</dd>
+                </div>
+                <div>
+                  <dt>Cores</dt>
+                  <dd>{% if worker.hw %}{{ worker.hw.physical_cores }}{% else %}-{% endif %}</dd>
+                </div>
+                <div>
+                  <dt>RAM</dt>
+                  <dd>{% if worker.hw %}{{ worker.hw.ram_gb }}GB{% else %}-{% endif %}</dd>
+                </div>
+                <div>
+                  <dt>Last seen</dt>
+                  <dd>{{ worker.last_seen or "never" }}</dd>
+                </div>
+              </dl>
+
+              <div class="worker-card__actions">
+                {% if worker.status != "revoked" %}
+                  <form method="post" action="/admin/workers/{{ worker.id }}/revoke">
+                    <button class="button button--small" type="submit"
+                            data-confirm="Revoke worker '{{ worker.label }}'? It will not be able to reconnect.">Revoke</button>
+                  </form>
+                {% endif %}
+                <form method="post" action="/admin/workers/{{ worker.id }}/delete">
+                  <button class="button button--small button--danger" type="submit"
+                          data-confirm="Delete worker '{{ worker.label }}'?">Delete</button>
+                </form>
+              </div>
+            </article>
+          {% endfor %}
+        </div>
+      {% else %}
+        <p class="empty">No workers yet. Mint a token to register one.</p>
+      {% endif %}
+    </section>
+  </div>
+{% endblock %}

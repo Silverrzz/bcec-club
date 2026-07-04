@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% from "_macros.html" import games_table %}
+
+{% block title %}{{ engine.name }} - COPE Chess{% endblock %}
+
+{% block content %}
+  <section class="page-title">
+    <h1>{{ engine.name }}</h1>
+    <p><a href="{{ engine.git_url }}" rel="noopener">{{ engine.git_url }}</a></p>
+  </section>
+
+  <section class="stats">
+    <div><strong>{{ record.wins }}</strong><span>wins</span></div>
+    <div><strong>{{ record.draws }}</strong><span>draws</span></div>
+    <div><strong>{{ record.losses }}</strong><span>losses</span></div>
+    <div><strong>{{ record.games }}</strong><span>games</span></div>
+  </section>
+
+  <section class="panel">
+    <h2>Build</h2>
+    <dl class="definition-grid">
+      <dt>Version</dt><dd>{{ engine.version or "-" }}</dd>
+      <dt>Commit</dt><dd><code>{{ engine.commit[:12] }}</code></dd>
+      <dt>Build command</dt><dd><code>{{ engine.build_cmd }}</code></dd>
+      <dt>Binary</dt><dd><code>{{ engine.binary_path }}</code></dd>
+      {% if engine.uci_options %}
+        <dt>UCI options</dt>
+        <dd>
+          {% for key, value in engine.uci_options.items() %}
+            <code>{{ key }} = {{ value }}</code>{% if not loop.last %}, {% endif %}
+          {% endfor %}
+        </dd>
+      {% endif %}
+    </dl>
+  </section>
+
+  <section class="panel">
+    <h2>Recent games</h2>
+    {% if games %}
+      {{ games_table(games, engines, show_round=false) }}
+    {% else %}
+      <p class="empty">No games for this engine yet.</p>
+    {% endif %}
+  </section>
+{% endblock %}

@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+
+{% block title %}Ratings - COPE Chess{% endblock %}
+
+{% block content %}
+  <section class="page-title">
+    <h1>Ratings</h1>
+    {% if category %}
+      <p>{{ category.description or category.name }}</p>
+    {% else %}
+      <p>No rating categories are active.</p>
+    {% endif %}
+  </section>
+
+  {% if categories|length > 1 %}
+    <div class="tabs">
+      {% for item in categories %}
+        <a class="{% if category and item.id == category.id %}active{% endif %}" href="/ratings?category_id={{ item.id }}">{{ item.name }}</a>
+      {% endfor %}
+    </div>
+  {% endif %}
+
+  <section class="panel">
+    {% if ratings %}
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th class="col-narrow">#</th>
+            <th>Engine</th>
+            <th>Elo</th>
+            <th>Games</th>
+            <th>Updated</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in ratings %}
+            <tr data-href="/engines/{{ row.engine.engine_id }}">
+              <td class="col-narrow">{{ loop.index }}</td>
+              <td>{{ row.engine.name }}</td>
+              <td><strong>{{ "%.0f"|format(row.elo) if row.elo is not none else "-" }}</strong></td>
+              <td>{{ row.games_played }}</td>
+              <td class="muted">{{ row.updated_at or "-" }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="empty">No rated games in this category yet. Ratings appear once a tournament's results are committed.</p>
+    {% endif %}
+  </section>
+{% endblock %}

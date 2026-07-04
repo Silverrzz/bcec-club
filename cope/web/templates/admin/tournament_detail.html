@@ -1,0 +1,85 @@
+{% extends "admin/base.html" %}
+{% from "_macros.html" import status_badge, games_table, flash %}
+
+{% block title %}{{ tournament.name }} - COPE Admin{% endblock %}
+
+{% block content %}
+  <header class="admin-page-title">
+    <div>
+      <h1>{{ tournament.name }}</h1>
+      <p class="muted">
+        {{ status_badge(tournament.status) }} &middot;
+        {{ category.name if category else "Category " ~ tournament.category_id }}
+        {% if tournament.settings_unlinked %}&middot; custom settings{% endif %}
+        &middot; <a href="/tournaments/{{ tournament.id }}">view public page</a>
+      </p>
+    </div>
+    <a class="button button--ghost" href="/admin/tournaments">&larr; All tournaments</a>
+  </header>
+
+  {{ flash(notice, error, errors) }}
+
+  <section class="panel action-bar">
+    {% for action, target in actions.items() %}
+      <form method="post" action="/admin/tournaments/{{ tournament.id }}/status">
+        <input type="hidden" name="action" value="{{ action }}">
+        <button class="button {% if action == 'abort' %}button--danger{% else %}button--primary{% endif %}" type="submit"
+                {% if action == "abort" %}data-confirm="Abort '{{ tournament.name }}'? Unfinished games will not be played."{% endif %}>
+          {{ action | title }}
+        </button>
+      </form>
+    {% endfor %}
+    {% if tournament.status == "finished" and not commit %}
+      <form method="post" action="/admin/tournaments/{{ tournament.id }}/commit-results">
+        <button class="button button--primary" type="submit">Commit results to ratings</button>
+      </form>
+    {% endif %}
+    {% if tournament.status not in ("scheduled", "running") %}
+      <form method="post" action="/admin/tournaments/{{ tournament.id }}/delete">
+        <button class="button button--danger" type="submit"
+                data-confirm="Delete '{{ tournament.name }}' and all of its games? This cannot be undone.">Delete</button>
+      </form>
+    {% endif %}
+    {% if not actions and tournament.status == "finished" and commit %}
+      <p class="muted">This tournament is complete.</p>
+    {% endif %}
+  </section>
+
+  {% if commit %}
+    <section class="panel">
+      <h2>Rating commit</h2>
+      <p>{{ status_badge(commit.status) }} requested {{ commit.requested_at }}
+        {% if commit.applied_at %}&middot; applied {{ commit.applied_at }}{% endif %}</p>
+      {% if commit.error %}<p class="flash flash--error">{{ commit.error }}</p>{% endif %}
+    </section>
+  {% endif %}
+
+  {% if tournament.status == "draft" %}
+    <form class="panel settings-form" method="post" action="/admin/tournaments/{{ tournament.id }}">
+      <h2>Edit draft</h2>
+      {% include "admin/_tournament_fields.html" %}
+      <div class="form-actions">
+        <button class="button button--primary" type="submit">Save changes</button>
+      </div>
+    </form>
+  {% else %}
+    <section class="panel">
+      <h2>Settings</h2>
+      <dl class="definition-grid">
+        {% for label, value in settings %}
+          <dt>{{ label }}</dt>
+          <dd>{{ value }}</dd>
+        {% endfor %}
+      </dl>
+    </section>
+  {% endif %}
+
+  <section class="panel">
+    <h2>Games</h2>
+    {% if games %}
+      {{ games_table(games, engines) }}
+    {% else %}
+      <p class="empty">No games yet. Games are generated when the tournament is scheduled and the runner picks it up.</p>
+    {% endif %}
+  </section>
+{% endblock %}

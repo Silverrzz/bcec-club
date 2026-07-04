@@ -4,19 +4,33 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{% block title %}COPE Chess{% endblock %}</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/chessground@9/assets/chessground.base.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/chessground@9/assets/chessground.brown.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/chessground@9/assets/chessground.cburnett.css">
     <link rel="stylesheet" href="{{ url_for('static', path='style.css') }}">
     <script src="{{ url_for('static', path='script.js') }}" defer></script>
   </head>
   <body>
     <header class="site-header">
-      <a class="brand" href="/tournaments">COPE Chess</a>
-      <nav>
-        <a class="{% if active_nav == 'tournaments' %}active{% endif %}" href="/tournaments">Tournaments</a>
-      </nav>
+      <div class="site-header__inner">
+        <a class="brand" href="/">
+          <span class="brand__mark">&#9822;</span>
+          <span class="brand__name">COPE <em>Chess</em></span>
+        </a>
+        <nav class="site-nav">
+          <a class="{% if active_nav == 'ratings' %}active{% endif %}" href="/ratings">Ratings</a>
+          <a class="{% if active_nav == 'archive' %}active{% endif %}" href="/archive">Archive</a>
+          <a class="site-nav__admin {% if active_nav == 'admin' %}active{% endif %}" href="/admin">Admin</a>
+        </nav>
+      </div>
     </header>
 
     <main class="page">
       {% block content %}{% endblock %}
     </main>
+
+    <footer class="site-footer">
+      <p>COPE Chess</p>
+    </footer>
   </body>
 </html>

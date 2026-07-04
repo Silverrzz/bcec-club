@@ -1,25 +1,92 @@
 {% extends "base.html" %}
+{% from "_macros.html" import status_badge %}
 
-{% block title %}Tournaments - COPE Chess{% endblock %}
+{% block title %}COPE Chess{% endblock %}
 
 {% block content %}
-  <section class="page-title">
-    <h1>Tournaments</h1>
-    <p>{{ tournaments|length }} total</p>
+  <section class="tournament-index-hero">
+    <div>
+      <p class="eyebrow">Tournament hub</p>
+      <h1>COPE Chess tournaments</h1>
+      <p>Scheduled, running, and completed engine events.</p>
+    </div>
+    <dl class="tournament-index-stats" aria-label="Tournament overview">
+      <div>
+        <dt>Tournaments</dt>
+        <dd>{{ tournament_stats.total }}</dd>
+      </div>
+      <div>
+        <dt>Active</dt>
+        <dd>{{ tournament_stats.active }}</dd>
+      </div>
+      <div>
+        <dt>Live games</dt>
+        <dd>{{ tournament_stats.live_games }}</dd>
+      </div>
+      <div>
+        <dt>Complete</dt>
+        <dd>{{ tournament_stats.completion_percent }}%</dd>
+      </div>
+    </dl>
   </section>
 
   {% if tournaments %}
-    <section class="list">
+    <section class="tournament-list" aria-label="Tournaments">
       {% for item in tournaments %}
-        <article class="card">
-          <h2><a href="/tournaments/{{ item.record.id }}">{{ item.record.name }}</a></h2>
-          <p>{{ item.format }} | {{ item.time_control }} | {{ item.record.status }}</p>
-          <p>{{ item.participant_names|join(" vs ") }}</p>
-          <p>{{ item.summary.finished }} / {{ item.summary.total }} games finished</p>
+        <article class="tournament-card card--link" data-href="/tournaments/{{ item.record.id }}">
+          <header class="tournament-card__header">
+            <div>
+              <h2><a href="/tournaments/{{ item.record.id }}">{{ item.record.name }}</a></h2>
+              <p>{{ item.format }} &middot; {{ item.time_control }}</p>
+            </div>
+            <div class="tournament-card__status">
+              {{ status_badge(item.record.status) }}
+            </div>
+          </header>
+
+          <dl class="tournament-card__facts">
+            <div>
+              <dt>Engines</dt>
+              <dd>{{ item.participant_count }}</dd>
+            </div>
+            <div>
+              <dt>Games</dt>
+              <dd>{{ item.summary.finished }} / {{ item.summary.total }}</dd>
+            </div>
+            <div>
+              <dt>Live</dt>
+              <dd>{{ item.summary.live }}</dd>
+            </div>
+          </dl>
+
+          <div class="tournament-card__participants" aria-label="Participants">
+            {% for name in item.participant_preview %}
+              <span>{{ name }}</span>
+            {% endfor %}
+            {% if item.participant_overflow %}
+              <span>+{{ item.participant_overflow }}</span>
+            {% endif %}
+          </div>
+
+          {% if item.summary.total %}
+            <div class="tournament-card__progress-label">
+              <span>{{ item.summary.finished }} of {{ item.summary.total }} games finished</span>
+              <span>{{ item.progress_percent }}%</span>
+            </div>
+            <div class="progress tournament-card__progress">
+              <div class="progress__bar" style="width: {{ item.progress_percent }}%"></div>
+            </div>
+          {% else %}
+            <p class="tournament-card__empty">No games scheduled yet.</p>
+          {% endif %}
         </article>
       {% endfor %}
     </section>
   {% else %}
-    <p class="empty">No tournaments yet.</p>
+    <div class="empty-state empty-state--large tournament-index-empty">
+      <h2>No tournaments yet</h2>
+      <p>Created tournaments will appear here.</p>
+      <a class="button button--primary" href="/admin/tournaments/new">Create tournament</a>
+    </div>
   {% endif %}
 {% endblock %}

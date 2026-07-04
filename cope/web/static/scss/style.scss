@@ -1,0 +1,9 @@
+// COPE Chess stylesheet entry point.
+// Compile with: cope build-css
+
+@import "variables";
+@import "base";
+@import "layout";
+@import "components";
+@import "pages";
+@import "admin";

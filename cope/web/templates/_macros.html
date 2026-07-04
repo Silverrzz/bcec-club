@@ -1,0 +1,248 @@
+{% macro engine_name(engines, engine_id) -%}
+  {{- engines.get(engine_id, "Engine " ~ engine_id) -}}
+{%- endmacro %}
+
+{% macro status_badge(status) -%}
+  <span class="badge badge--{{ status }}">{{ status }}</span>
+{%- endmacro %}
+
+{% macro result_text(result) -%}
+  {%- if result == "1-0" %}1&ndash;0
+  {%- elif result == "0-1" %}0&ndash;1
+  {%- elif result == "1/2-1/2" %}&frac12;&ndash;&frac12;
+  {%- else %}-
+  {%- endif -%}
+{%- endmacro %}
+
+{% macro flash(notice, error, errors) %}
+  {% if notice %}<div class="flash flash--notice">{{ notice }}</div>{% endif %}
+  {% if error %}<div class="flash flash--error">{{ error }}</div>{% endif %}
+  {% if errors %}
+    <div class="flash flash--error">
+      <strong>Please fix the following:</strong>
+      <ul>
+        {% for message in errors %}<li>{{ message }}</li>{% endfor %}
+      </ul>
+    </div>
+  {% endif %}
+{% endmacro %}
+
+{% macro games_table(games, engines, show_round=true, link_prefix="/games/") %}
+  <table class="data-table">
+    <thead>
+      <tr>
+        {% if show_round %}<th class="col-narrow">Rd</th>{% endif %}
+        <th>White</th>
+        <th>Black</th>
+        <th>Status</th>
+        <th>Result</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for game in games %}
+        <tr data-href="{{ link_prefix }}{{ game.id }}">
+          {% if show_round %}<td class="col-narrow">{{ game.round }}</td>{% endif %}
+          <td>{{ engine_name(engines, game.white_engine_id) }}</td>
+          <td>{{ engine_name(engines, game.black_engine_id) }}</td>
+          <td>{{ status_badge(game.status) }}</td>
+          <td class="col-result">{{ result_text(game.result) }}</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endmacro %}
+
+{# ------------------------------------------------------------------ #}
+{# Structured tournament-settings fields, shared by the tournament     #}
+{# form and the category defaults form.                                #}
+{# ------------------------------------------------------------------ #}
+{% macro settings_fields(values, engine_options, opening_suites) %}
+  <fieldset class="form-section">
+    <legend>Format</legend>
+    <div class="field">
+      <label for="format">Tournament format</label>
+      <select class="input" id="format" name="format" data-toggle="format">
+        <option value="round_robin" {% if values.format == "round_robin" %}selected{% endif %}>Round robin</option>
+        <option value="swiss" {% if values.format == "swiss" %}selected{% endif %}>Swiss</option>
+        <option value="knockout" {% if values.format == "knockout" %}selected{% endif %}>Knockout</option>
+        <option value="gauntlet" {% if values.format == "gauntlet" %}selected{% endif %}>Gauntlet</option>
+      </select>
+      <p class="field-help">Only round robin is currently played by the runner; other formats stay paused.</p>
+    </div>
+
+    <div class="field field--checkbox" data-format-field="round_robin">
+      <label>
+        <input type="checkbox" name="round_robin_double" {% if values.round_robin_double %}checked{% endif %}>
+        Double round robin (each pairing plays both colours)
+      </label>
+    </div>
+
+    <div class="field" data-format-field="swiss">
+      <label for="swiss_rounds">Rounds</label>
+      <input class="input input--small" id="swiss_rounds" type="number" min="1" name="swiss_rounds" value="{{ values.swiss_rounds }}">
+    </div>
+
+    <div class="field-row" data-format-field="knockout">
+      <div class="field">
+        <label for="knockout_games_per_match">Games per match</label>
+        <input class="input input--small" id="knockout_games_per_match" type="number" min="1" name="knockout_games_per_match" value="{{ values.knockout_games_per_match }}">
+        <p class="field-help">Base games in each knockout match, before any tiebreak games.</p>
+      </div>
+      <div class="field">
+        <label for="knockout_tiebreak">Tiebreak</label>
+        <select class="input" id="knockout_tiebreak" name="knockout_tiebreak">
+          <option value="armageddon" {% if values.knockout_tiebreak == "armageddon" %}selected{% endif %}>Armageddon</option>
+          <option value="extra_pair" {% if values.knockout_tiebreak == "extra_pair" %}selected{% endif %}>Extra game pair</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="field-row" data-format-field="gauntlet">
+      <div class="field">
+        <label for="gauntlet_hero_engine_id">Hero engine</label>
+        <select class="input" id="gauntlet_hero_engine_id" name="gauntlet_hero_engine_id">
+          <option value="">Choose an engine&hellip;</option>
+          {% for engine in engine_options %}
+            <option value="{{ engine.id }}" {% if values.gauntlet_hero_engine_id|string == engine.id|string %}selected{% endif %}>{{ engine.name }}</option>
+          {% endfor %}
+        </select>
+        <p class="field-help">The fixed gauntlet engine. It plays every other selected engine.</p>
+      </div>
+      <div class="field">
+        <label for="gauntlet_games_per_opponent">Hero games per opponent</label>
+        <input class="input input--small" id="gauntlet_games_per_opponent" type="number" min="1" name="gauntlet_games_per_opponent" value="{{ values.gauntlet_games_per_opponent }}">
+        <p class="field-help">Total games the hero plays against each opponent.</p>
+      </div>
+    </div>
+  </fieldset>
+
+  <fieldset class="form-section">
+    <legend>Time control</legend>
+    <div class="field">
+      <label for="tc_type">Type</label>
+      <select class="input" id="tc_type" name="tc_type" data-toggle="tc">
+        <option value="increment" {% if values.tc_type == "increment" %}selected{% endif %}>Base + increment</option>
+        <option value="movetime" {% if values.tc_type == "movetime" %}selected{% endif %}>Fixed time per move</option>
+        <option value="movestogo" {% if values.tc_type == "movestogo" %}selected{% endif %}>Time per N moves</option>
+        <option value="movenodes" {% if values.tc_type == "movenodes" %}selected{% endif %}>Fixed nodes per move</option>
+      </select>
+    </div>
+    <div class="field-row">
+      <div class="field" data-tc-field="increment movestogo">
+        <label for="tc_initial_s">Initial time (seconds)</label>
+        <input class="input input--small" id="tc_initial_s" type="number" min="0" step="any" name="tc_initial_s" value="{{ values.tc_initial_s }}">
+      </div>
+      <div class="field" data-tc-field="increment">
+        <label for="tc_increment_s">Increment (seconds)</label>
+        <input class="input input--small" id="tc_increment_s" type="number" min="0" step="any" name="tc_increment_s" value="{{ values.tc_increment_s }}">
+      </div>
+      <div class="field" data-tc-field="movetime">
+        <label for="tc_move_time_s">Time per move (seconds)</label>
+        <input class="input input--small" id="tc_move_time_s" type="number" min="0" step="any" name="tc_move_time_s" value="{{ values.tc_move_time_s }}">
+      </div>
+      <div class="field" data-tc-field="movestogo">
+        <label for="tc_moves_to_go">Moves per period</label>
+        <input class="input input--small" id="tc_moves_to_go" type="number" min="1" name="tc_moves_to_go" value="{{ values.tc_moves_to_go }}">
+      </div>
+      <div class="field" data-tc-field="movenodes">
+        <label for="tc_nodes">Nodes per move</label>
+        <input class="input input--small" id="tc_nodes" type="number" min="1" name="tc_nodes" value="{{ values.tc_nodes }}">
+      </div>
+    </div>
+  </fieldset>
+
+  <fieldset class="form-section">
+    <legend>Execution</legend>
+    <div class="field-row">
+      <div class="field">
+        <label for="hardware_mode">Hardware mode</label>
+        <select class="input" id="hardware_mode" name="hardware_mode">
+          <option value="shared" {% if values.hardware_mode == "shared" %}selected{% endif %}>Shared (both engines on one worker)</option>
+          <option value="paired" {% if values.hardware_mode == "paired" %}selected{% endif %}>Paired (one worker per engine)</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="concurrency">Concurrent games</label>
+        <input class="input input--small" id="concurrency" type="number" min="1" name="concurrency" value="{{ values.concurrency }}">
+      </div>
+      <div class="field">
+        <label for="lag_compensation_ms">Lag compensation (ms)</label>
+        <input class="input input--small" id="lag_compensation_ms" type="number" min="0" name="lag_compensation_ms" value="{{ values.lag_compensation_ms }}">
+      </div>
+    </div>
+    <div class="field">
+      <label for="opening_suite_id">Opening suite</label>
+      <select class="input" id="opening_suite_id" name="opening_suite_id">
+        <option value="">None (engines play from the start position)</option>
+        {% for suite in opening_suites %}
+          <option value="{{ suite.id }}" {% if values.opening_suite_id|string == suite.id|string %}selected{% endif %}>{{ suite.name }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="field field--checkbox">
+      <label>
+        <input type="checkbox" name="rated" {% if values.rated %}checked{% endif %}>
+        Rated (results count toward the category's Elo list)
+      </label>
+    </div>
+  </fieldset>
+
+  <fieldset class="form-section">
+    <legend>Adjudication</legend>
+    <div class="field field--checkbox">
+      <label>
+        <input type="checkbox" name="adjudication_draw" data-toggle-panel="draw-rules" {% if values.adjudication_draw %}checked{% endif %}>
+        Adjudicate drawn positions
+      </label>
+    </div>
+    <div class="field-row field-row--nested" id="draw-rules" {% if not values.adjudication_draw %}hidden{% endif %}>
+      <div class="field">
+        <label for="draw_min_fullmove">From move</label>
+        <input class="input input--small" id="draw_min_fullmove" type="number" min="1" name="draw_min_fullmove" value="{{ values.draw_min_fullmove }}">
+      </div>
+      <div class="field">
+        <label for="draw_max_abs_cp">Max eval (centipawns)</label>
+        <input class="input input--small" id="draw_max_abs_cp" type="number" min="0" name="draw_max_abs_cp" value="{{ values.draw_max_abs_cp }}">
+      </div>
+      <div class="field">
+        <label for="draw_plies">Consecutive plies</label>
+        <input class="input input--small" id="draw_plies" type="number" min="1" name="draw_plies" value="{{ values.draw_plies }}">
+      </div>
+    </div>
+
+    <div class="field field--checkbox">
+      <label>
+        <input type="checkbox" name="adjudication_resign" data-toggle-panel="resign-rules" {% if values.adjudication_resign %}checked{% endif %}>
+        Adjudicate hopeless positions
+      </label>
+    </div>
+    <div class="field-row field-row--nested" id="resign-rules" {% if not values.adjudication_resign %}hidden{% endif %}>
+      <div class="field">
+        <label for="resign_min_abs_cp">Min eval (centipawns)</label>
+        <input class="input input--small" id="resign_min_abs_cp" type="number" min="1" name="resign_min_abs_cp" value="{{ values.resign_min_abs_cp }}">
+      </div>
+      <div class="field">
+        <label for="resign_plies">Consecutive plies</label>
+        <input class="input input--small" id="resign_plies" type="number" min="1" name="resign_plies" value="{{ values.resign_plies }}">
+      </div>
+    </div>
+
+    <div class="field field--checkbox">
+      <label>
+        <input type="checkbox" name="adjudication_syzygy" data-toggle-panel="syzygy-rules" {% if values.adjudication_syzygy %}checked{% endif %}>
+        Adjudicate with Syzygy tablebases
+      </label>
+    </div>
+    <div class="field-row field-row--nested" id="syzygy-rules" {% if not values.adjudication_syzygy %}hidden{% endif %}>
+      <div class="field">
+        <label for="syzygy_max_pieces">Max pieces</label>
+        <input class="input input--small" id="syzygy_max_pieces" type="number" min="2" max="7" name="syzygy_max_pieces" value="{{ values.syzygy_max_pieces }}">
+      </div>
+    </div>
+
+    <div class="field">
+      <label for="adjudication_max_moves">Maximum moves per game <span class="field-optional">(optional)</span></label>
+      <input class="input input--small" id="adjudication_max_moves" type="number" min="1" name="adjudication_max_moves" value="{{ values.adjudication_max_moves }}" placeholder="unlimited">
+    </div>
+  </fieldset>
+{% endmacro %}

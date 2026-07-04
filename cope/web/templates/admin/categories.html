@@ -1,0 +1,49 @@
+{% extends "admin/base.html" %}
+{% from "_macros.html" import flash %}
+
+{% block title %}Categories - COPE Admin{% endblock %}
+
+{% block content %}
+  <header class="admin-page-title">
+    <h1>Categories</h1>
+    <a class="button" href="/admin/categories/new">Add new</a>
+  </header>
+
+  {{ flash(notice, error, errors) }}
+
+  <section class="panel">
+    {% if categories %}
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Description</th>
+            <th>Tournaments</th>
+            <th>Status</th>
+            <th class="col-actions"></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for category in categories %}
+            <tr data-href="/admin/categories/{{ category.id }}">
+              <td><a href="/admin/categories/{{ category.id }}">{{ category.name }}</a></td>
+              <td class="muted">{{ category.description or "-" }}</td>
+              <td>{{ tournament_counts.get(category.id, 0) }}</td>
+              <td><span class="badge badge--{{ 'finished' if category.active else 'aborted' }}">{{ "active" if category.active else "inactive" }}</span></td>
+              <td class="col-actions">
+                {% if category.id != 1 %}
+                  <form method="post" action="/admin/categories/{{ category.id }}/delete">
+                    <button class="button button--small button--danger" type="submit"
+                            data-confirm="Delete category '{{ category.name }}'?">Delete</button>
+                  </form>
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="empty">No categories yet.</p>
+    {% endif %}
+  </section>
+{% endblock %}

@@ -1,0 +1,45 @@
+{% extends "admin/base.html" %}
+{% from "_macros.html" import flash %}
+
+{% block title %}Openings - COPE Admin{% endblock %}
+
+{% block content %}
+  <header class="admin-page-title">
+    <h1>Opening suites</h1>
+    <a class="button" href="/admin/openings/new">Add new</a>
+  </header>
+
+  {{ flash(notice, error, errors) }}
+
+  <section class="panel">
+    {% if suites %}
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Description</th>
+            <th>Positions</th>
+            <th class="col-actions"></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for suite in suites %}
+            <tr data-href="/admin/openings/{{ suite.id }}">
+              <td><a href="/admin/openings/{{ suite.id }}">{{ suite.name }}</a></td>
+              <td class="muted">{{ suite.description or "-" }}</td>
+              <td>{{ opening_counts.get(suite.id, 0) }}</td>
+              <td class="col-actions">
+                <form method="post" action="/admin/openings/{{ suite.id }}/delete">
+                  <button class="button button--small button--danger" type="submit"
+                          data-confirm="Delete opening suite '{{ suite.name }}'?">Delete</button>
+                </form>
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="empty">No opening suites yet. <a href="/admin/openings/new">Add your first opening book</a>.</p>
+    {% endif %}
+  </section>
+{% endblock %}

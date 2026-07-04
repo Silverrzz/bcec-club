@@ -1,0 +1,63 @@
+// ---------------------------------------------------------------------
+// Design tokens: colours, spacing, type. Every other partial pulls from
+// here - change the theme in one place.
+// ---------------------------------------------------------------------
+
+// Palette
+$page: #0b1017;
+$surface: #121923;
+$panel: #151f2b;
+$panel-raised: #1a2534;
+$line: #2a3443;
+$line-strong: #3a4557;
+
+$text: #f4f7fb;
+$muted: #9aa4b2;
+$link: #7fb0ff;
+$accent: #4d8dff;
+$accent-strong: #2f6fe0;
+
+$success: #3ecf8e;
+$warning: #f0b429;
+$danger: #e5484d;
+
+// Status colours (tournaments, games, workers)
+$status-colors: (
+  "draft": $muted,
+  "scheduled": $warning,
+  "running": $success,
+  "live": $success,
+  "paused": $warning,
+  "pending": $muted,
+  "assigned": $link,
+  "finished": $accent,
+  "aborted": $danger,
+  "abandoned": $danger,
+  "minted": $warning,
+  "connected": $success,
+  "building": $warning,
+  "ready": $success,
+  "busy": $link,
+  "offline": $muted,
+  "revoked": $danger,
+  "applied": $success,
+  "claimed": $warning,
+  "failed": $danger,
+  "active": $success,
+  "inactive": $muted,
+);
+
+// Chess board
+$board-light: #e8e4d4;
+$board-dark: #7a8a6d;
+$board-highlight: rgba(240, 180, 41, 0.55);
+
+// Type
+$font-stack: "Segoe UI", system-ui, -apple-system, sans-serif;
+$font-mono: "Cascadia Code", Consolas, monospace;
+
+// Layout
+$radius: 8px;
+$radius-small: 5px;
+$page-width: none;
+$gap: 32px;

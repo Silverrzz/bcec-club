@@ -1,0 +1,21 @@
+{% extends "admin/base.html" %}
+{% from "_macros.html" import flash %}
+
+{% block title %}New tournament - COPE Admin{% endblock %}
+
+{% block content %}
+  <header class="admin-page-title">
+    <h1>New tournament</h1>
+    <a class="button button--ghost" href="/admin/tournaments">&larr; All tournaments</a>
+  </header>
+
+  {{ flash(notice, error, errors) }}
+
+  <form class="panel settings-form" method="post" action="/admin/tournaments">
+    {% include "admin/_tournament_fields.html" %}
+    <div class="form-actions">
+      <button class="button button--primary" type="submit">Create draft</button>
+      <span class="field-help">The tournament is created as a draft; you schedule it from its page when ready.</span>
+    </div>
+  </form>
+{% endblock %}

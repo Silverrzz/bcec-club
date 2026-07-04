@@ -1,0 +1,51 @@
+{% from "_macros.html" import settings_fields %}
+
+<fieldset class="form-section">
+  <legend>Basics</legend>
+  <div class="field">
+    <label for="name">Name</label>
+    <input class="input" id="name" name="name" value="{{ form_name }}" required placeholder="e.g. Spring Blitz Championship">
+  </div>
+  <div class="field-row">
+    <div class="field">
+      <label for="category_id">Rating category</label>
+      <select class="input" id="category_id" name="category_id" data-category-select>
+        {% for category in categories %}
+          <option value="{{ category.id }}" {% if category.id == form_category_id %}selected{% endif %}>{{ category.name }}</option>
+        {% endfor %}
+      </select>
+      <p class="field-help">Committed results update this category's Elo list.</p>
+    </div>
+    <div class="field field--checkbox">
+      <label>
+        <input type="checkbox" name="category_settings_linked" data-linked-toggle {% if form_linked %}checked{% endif %}>
+        Use the category's default settings
+      </label>
+      <button class="button button--small" type="button" data-unlink-settings {% if not form_linked %}hidden{% endif %}>Unlink settings</button>
+    </div>
+  </div>
+</fieldset>
+
+<fieldset class="form-section">
+  <legend>Participants</legend>
+  {% if engine_options %}
+    <div class="checkbox-grid">
+      {% for engine in engine_options %}
+        <label class="checkbox-tile">
+          <input type="checkbox" name="participants" value="{{ engine.id }}"
+                 {% if engine.id in form_participants %}checked{% endif %}>
+          <span>{{ engine.name }}</span>
+        </label>
+      {% endfor %}
+    </div>
+    <p class="field-help">Pick at least two engines.</p>
+  {% else %}
+    <p class="empty">No active engines. <a href="/admin/engines/new">Register an engine</a> first.</p>
+  {% endif %}
+</fieldset>
+
+<div data-settings-overrides {% if form_linked %}hidden{% endif %}>
+  {{ settings_fields(form_values, engine_options, opening_suites) }}
+</div>
+
+<script type="application/json" data-category-defaults>{{ category_defaults | tojson }}</script>

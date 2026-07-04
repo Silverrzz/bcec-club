@@ -1,0 +1,111 @@
+{% extends "admin/base.html" %}
+{% from "_macros.html" import engine_name, status_badge, flash %}
+
+{% block title %}Dashboard - COPE Admin{% endblock %}
+
+{% block content %}
+  <header class="admin-page-title">
+    <h1>Dashboard</h1>
+  </header>
+
+  {{ flash(notice, error, errors) }}
+
+  <section class="admin-stat-grid">
+    <a class="admin-stat" href="/admin/tournaments">
+      <strong>{{ db_stats.tournaments }}</strong><span>Tournaments</span>
+    </a>
+    <a class="admin-stat" href="/admin/engines">
+      <strong>{{ db_stats.engines }}</strong><span>Engines</span>
+    </a>
+    <a class="admin-stat" href="/admin/categories">
+      <strong>{{ db_stats.categories }}</strong><span>Categories</span>
+    </a>
+    <a class="admin-stat" href="/admin/openings">
+      <strong>{{ db_stats.opening_suites }}</strong><span>Opening suites</span>
+    </a>
+    <a class="admin-stat" href="/admin/workers">
+      <strong>{{ db_stats.workers }}</strong><span>Workers</span>
+    </a>
+  </section>
+
+  <div class="admin-columns">
+    <section class="panel">
+      <h2>At a glance</h2>
+      {% if running_tournaments %}
+        <ul class="admin-list">
+          {% for tournament in running_tournaments %}
+            <li>
+              <a href="/admin/tournaments/{{ tournament.id }}">{{ tournament.name }}</a>
+              {{ status_badge(tournament.status) }}
+            </li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <p class="empty">Nothing is running. <a href="/admin/tournaments/new">Create a tournament</a> to get things going.</p>
+      {% endif %}
+
+      {% if complete_tournaments %}
+        <h3>Awaiting rating commit</h3>
+        {% for tournament in complete_tournaments %}
+          <form class="inline-form" method="post" action="/admin/tournaments/{{ tournament.id }}/commit-results">
+            <a href="/admin/tournaments/{{ tournament.id }}">{{ tournament.name }}</a>
+            <button class="button button--small" type="submit">Commit results</button>
+          </form>
+        {% endfor %}
+      {% endif %}
+    </section>
+
+    <section class="panel">
+      <h2>Workers</h2>
+      {% if workers %}
+        <ul class="admin-list">
+          {% for worker in workers %}
+            <li>
+              <span>{{ worker.label }}</span>
+              {{ status_badge(worker.status) }}
+              <span class="muted">{{ worker.last_seen or "never seen" }}</span>
+            </li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <p class="empty">No workers registered. <a href="/admin/workers">Mint a worker token</a> to connect one.</p>
+      {% endif %}
+    </section>
+  </div>
+
+  <div class="admin-columns">
+    <section class="panel">
+      <h2>Live games</h2>
+      {% if live_games %}
+        <ul class="admin-list">
+          {% for game in live_games %}
+            <li>
+              <a href="/games/{{ game.id }}">
+                {{ engine_name(engines, game.white_engine_id) }} vs {{ engine_name(engines, game.black_engine_id) }}
+              </a>
+            </li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <p class="empty">No live games.</p>
+      {% endif %}
+    </section>
+
+    <section class="panel">
+      <h2>Recent results</h2>
+      {% if recent_games %}
+        <ul class="admin-list">
+          {% for game in recent_games %}
+            <li>
+              <a href="/games/{{ game.id }}">
+                {{ engine_name(engines, game.white_engine_id) }} {{ game.result }} {{ engine_name(engines, game.black_engine_id) }}
+              </a>
+            </li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <p class="empty">No finished games yet.</p>
+      {% endif %}
+    </section>
+  </div>
+{% endblock %}

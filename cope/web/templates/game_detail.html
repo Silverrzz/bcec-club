@@ -1,60 +1,86 @@
 {% extends "base.html" %}
+{% from "_macros.html" import engine_name, status_badge, result_text %}
 
 {% block title %}Game {{ game.id }} - COPE Chess{% endblock %}
 
 {% block content %}
   <section class="page-title">
-    <h1>Game {{ game.id }}</h1>
+    <h1>
+      {{ engine_name(engines, game.white_engine_id) }}
+      <span class="muted">vs</span>
+      {{ engine_name(engines, game.black_engine_id) }}
+    </h1>
     <p>
-      {% if tournament %}<a href="/tournaments/{{ tournament.id }}">{{ tournament.name }}</a> | {% endif %}
-      {{ game.status }} | {{ game.result or "no result" }}
+      {% if tournament %}<a href="/tournaments/{{ tournament.id }}">{{ tournament.name }}</a> &middot;{% endif %}
+      round {{ game.round }} &middot; {{ status_badge(game.status) }}
+      {% if game.result %}&middot; <strong>{{ result_text(game.result) }}</strong>{% endif %}
+      {% if game.termination %}&middot; {{ game.termination }}{% endif %}
     </p>
   </section>
 
-  <section class="panel">
-    <h2>
-      {{ engines.get(game.white_engine_id, "Engine " ~ game.white_engine_id) }}
-      vs
-      {{ engines.get(game.black_engine_id, "Engine " ~ game.black_engine_id) }}
-    </h2>
-    <p>Round {{ game.round }} | pair {{ game.pair_index }}</p>
-    {% if game.termination %}<p>Termination: {{ game.termination }}</p>{% endif %}
-  </section>
+  <section class="game-layout">
+    <div class="game-main">
+      <section class="board-shell" data-board data-fen="{{ opening.fen if opening else 'startpos' }}" data-moves="{{ uci_moves }}">
+        <div class="player-row player-row--black">
+          <span class="player-row__side">&#9818;</span>
+          <strong><a href="/engines/{{ game.black_engine_id }}">{{ engine_name(engines, game.black_engine_id) }}</a></strong>
+        </div>
+        <div class="board" data-board-grid></div>
+        <div class="player-row player-row--white">
+          <span class="player-row__side">&#9812;</span>
+          <strong><a href="/engines/{{ game.white_engine_id }}">{{ engine_name(engines, game.white_engine_id) }}</a></strong>
+        </div>
+        <div class="board-controls">
+          <button type="button" class="button button--ghost" data-board-first title="First move">&#8676;</button>
+          <button type="button" class="button button--ghost" data-board-prev title="Previous move">&#8592;</button>
+          <span class="board-controls__status" data-board-status></span>
+          <button type="button" class="button button--ghost" data-board-next title="Next move">&#8594;</button>
+          <button type="button" class="button button--ghost" data-board-last title="Last move">&#8677;</button>
+        </div>
+      </section>
+    </div>
 
-  <section class="panel">
-    <h2>Moves</h2>
-    {% if moves %}
-      <table>
-        <thead>
-          <tr>
-            <th>Ply</th>
-            <th>SAN</th>
-            <th>UCI</th>
-            <th>Depth</th>
-            <th>Time</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for move in moves %}
-            <tr>
-              <td>{{ move.ply }}</td>
-              <td>{{ move.san }}</td>
-              <td>{{ move.uci }}</td>
-              <td>{{ move.depth or "-" }}</td>
-              <td>{{ move.time_ms }}ms</td>
-            </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    {% else %}
-      <p class="empty">No moves recorded yet.</p>
-    {% endif %}
-  </section>
+    <aside class="side-panel">
+      <section class="panel">
+        <h2>Moves</h2>
+        {% if moves %}
+          <table class="data-table data-table--compact">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Move</th>
+                <th>Eval</th>
+                <th>Depth</th>
+                <th>Time</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for move in moves %}
+                <tr>
+                  <td>{{ move.ply }}</td>
+                  <td>{{ move.san }}{% if move.is_book %} <span class="muted" title="book move">&#128214;</span>{% endif %}</td>
+                  <td>
+                    {%- if move.eval_mate is not none %}#{{ move.eval_mate }}
+                    {%- elif move.eval_cp is not none %}{{ "%+.2f"|format(move.eval_cp / 100) }}
+                    {%- else %}-{% endif -%}
+                  </td>
+                  <td>{{ move.depth or "-" }}</td>
+                  <td>{{ move.time_ms }}ms</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% else %}
+          <p class="empty">No moves recorded yet.</p>
+        {% endif %}
+      </section>
 
-  {% if game.pgn %}
-    <section class="panel">
-      <h2>PGN</h2>
-      <pre>{{ game.pgn }}</pre>
-    </section>
-  {% endif %}
+      {% if game.pgn %}
+        <section class="panel">
+          <h2>PGN</h2>
+          <pre class="pgn-block">{{ game.pgn }}</pre>
+        </section>
+      {% endif %}
+    </aside>
+  </section>
 {% endblock %}

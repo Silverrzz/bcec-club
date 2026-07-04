@@ -1,0 +1,52 @@
+{% extends "admin/base.html" %}
+{% from "_macros.html" import flash %}
+
+{% block title %}Engines - COPE Admin{% endblock %}
+
+{% block content %}
+  <header class="admin-page-title">
+    <h1>Engines</h1>
+    <a class="button" href="/admin/engines/new">Add new</a>
+  </header>
+
+  {{ flash(notice, error, errors) }}
+
+  <section class="panel">
+    {% if engines %}
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Author</th>
+            <th>Version</th>
+            <th>Commit</th>
+            <th>Games</th>
+            <th>Status</th>
+            <th class="col-actions"></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for engine in engines %}
+            <tr data-href="/admin/engines/{{ engine.id }}/edit">
+              <td><a href="/admin/engines/{{ engine.id }}/edit">{{ engine.name }}</a></td>
+              <td>{{ engine.author or "-" }}</td>
+              <td>{{ engine.version or "-" }}</td>
+              <td><code>{{ engine.commit[:12] }}</code></td>
+              <td>{{ game_counts.get(engine.id, 0) }}</td>
+              <td><span class="badge badge--{{ 'finished' if engine.active else 'aborted' }}">{{ "active" if engine.active else "inactive" }}</span></td>
+              <td class="col-actions">
+                <a class="button button--small" href="/engines/{{ engine.id }}">View</a>
+                <form method="post" action="/admin/engines/{{ engine.id }}/delete">
+                  <button class="button button--small button--danger" type="submit"
+                          data-confirm="Delete engine '{{ engine.name }}'?">Delete</button>
+                </form>
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="empty">No engines registered yet. <a href="/admin/engines/new">Add your first engine</a>.</p>
+    {% endif %}
+  </section>
+{% endblock %}

@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}Admin - COPE Chess{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', path='style.css') }}">
+    <script src="{{ url_for('static', path='script.js') }}" defer></script>
+  </head>
+  <body class="admin-body">
+    <header class="admin-topbar">
+      <a class="admin-topbar__brand" href="/admin">&#9822; COPE Admin</a>
+      <a class="admin-topbar__link" href="/" title="Back to the public site">View site &rarr;</a>
+    </header>
+
+    <div class="admin-shell">
+      <aside class="admin-sidebar">
+        <nav>
+          <a class="admin-sidebar__item {% if admin_section == 'dashboard' %}active{% endif %}" href="/admin">
+            <span class="admin-sidebar__icon">&#8962;</span> Dashboard
+          </a>
+          <a class="admin-sidebar__item {% if admin_section == 'tournaments' %}active{% endif %}" href="/admin/tournaments">
+            <span class="admin-sidebar__icon">&#127942;</span> Tournaments
+          </a>
+          <a class="admin-sidebar__item {% if admin_section == 'engines' %}active{% endif %}" href="/admin/engines">
+            <span class="admin-sidebar__icon">&#9881;</span> Engines
+          </a>
+          <a class="admin-sidebar__item {% if admin_section == 'categories' %}active{% endif %}" href="/admin/categories">
+            <span class="admin-sidebar__icon">&#128202;</span> Categories
+          </a>
+          <a class="admin-sidebar__item {% if admin_section == 'openings' %}active{% endif %}" href="/admin/openings">
+            <span class="admin-sidebar__icon">&#128214;</span> Openings
+          </a>
+          <a class="admin-sidebar__item {% if admin_section == 'workers' %}active{% endif %}" href="/admin/workers">
+            <span class="admin-sidebar__icon">&#128421;</span> Workers
+          </a>
+          <a class="admin-sidebar__item {% if admin_section == 'chat' %}active{% endif %}" href="/admin/chat">
+            <span class="admin-sidebar__icon">&#128172;</span> Chat
+          </a>
+        </nav>
+      </aside>
+
+      <main class="admin-content">
+        {% block content %}{% endblock %}
+      </main>
+    </div>
+  </body>
+</html>

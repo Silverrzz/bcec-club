@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS engines (
   id INTEGER PRIMARY KEY,
   name TEXT NOT NULL UNIQUE,
   author TEXT NOT NULL DEFAULT '',
+  version TEXT NOT NULL DEFAULT '',
   git_url TEXT NOT NULL,
   commit_hash TEXT NOT NULL,
   build_cmd TEXT NOT NULL,
@@ -14,9 +15,29 @@ CREATE TABLE IF NOT EXISTS engines (
   active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1))
 );
 
+CREATE TABLE IF NOT EXISTS categories (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  description TEXT NOT NULL DEFAULT '',
+  default_config TEXT NOT NULL DEFAULT '{}',
+  active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+  created_at TEXT NOT NULL
+);
+
+INSERT OR IGNORE INTO categories (id, name, description, default_config, created_at)
+VALUES (
+  1,
+  'Default',
+  'General rating list and tournament defaults.',
+  '{}',
+  '1970-01-01T00:00:00+00:00'
+);
+
 CREATE TABLE IF NOT EXISTS tournaments (
   id INTEGER PRIMARY KEY,
   name TEXT NOT NULL,
+  category_id INTEGER NOT NULL DEFAULT 1 REFERENCES categories(id),
+  settings_unlinked INTEGER NOT NULL DEFAULT 0 CHECK (settings_unlinked IN (0, 1)),
   config TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'draft'
     CHECK (status IN ('draft', 'scheduled', 'running', 'paused', 'finished', 'aborted')),
@@ -84,6 +105,34 @@ CREATE TABLE IF NOT EXISTS moves (
   PRIMARY KEY (game_id, ply)
 );
 
+CREATE TABLE IF NOT EXISTS ratings (
+  engine_id INTEGER NOT NULL REFERENCES engines(id),
+  category_id INTEGER NOT NULL REFERENCES categories(id),
+  elo REAL NOT NULL DEFAULT 1500,
+  games_played INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (engine_id, category_id)
+);
+
+CREATE TABLE IF NOT EXISTS rating_history (
+  id INTEGER PRIMARY KEY,
+  engine_id INTEGER NOT NULL REFERENCES engines(id),
+  category_id INTEGER NOT NULL REFERENCES categories(id),
+  elo REAL NOT NULL,
+  game_id INTEGER NOT NULL REFERENCES games(id),
+  at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tournament_rating_commits (
+  tournament_id INTEGER PRIMARY KEY REFERENCES tournaments(id) ON DELETE CASCADE,
+  category_id INTEGER NOT NULL REFERENCES categories(id),
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending', 'claimed', 'applied', 'failed')),
+  requested_at TEXT NOT NULL,
+  applied_at TEXT,
+  error TEXT
+);
+
 CREATE TABLE IF NOT EXISTS workers (
   id INTEGER PRIMARY KEY,
   label TEXT NOT NULL,
@@ -97,6 +146,41 @@ CREATE TABLE IF NOT EXISTS workers (
   hw TEXT,
   last_seen TEXT
 );
+
+CREATE TABLE IF NOT EXISTS opening_suites (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  description TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS openings (
+  id INTEGER PRIMARY KEY,
+  suite_id INTEGER NOT NULL REFERENCES opening_suites(id) ON DELETE CASCADE,
+  position INTEGER NOT NULL,
+  name TEXT NOT NULL DEFAULT '',
+  fen TEXT NOT NULL,
+  UNIQUE (suite_id, position)
+);
+
+CREATE TABLE IF NOT EXISTS chat_messages (
+  id INTEGER PRIMARY KEY,
+  display_name TEXT NOT NULL,
+  text TEXT NOT NULL,
+  at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS chat_settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
+INSERT OR IGNORE INTO chat_settings (key, value) VALUES
+  ('enabled', 'true'),
+  ('slowmode_seconds', '0'),
+  ('max_message_length', '300'),
+  ('allow_anonymous_names', 'true'),
+  ('retention_days', '30');
 
 CREATE TABLE IF NOT EXISTS runner_commands (
   id INTEGER PRIMARY KEY,
@@ -112,6 +196,7 @@ CREATE TABLE IF NOT EXISTS runner_commands (
 
 CREATE INDEX IF NOT EXISTS idx_games_tournament_status ON games(tournament_id, status);
 CREATE INDEX IF NOT EXISTS idx_games_round_pair ON games(tournament_id, round, pair_index);
+CREATE INDEX IF NOT EXISTS idx_rating_history_engine_category_at ON rating_history(engine_id, category_id, at);
 CREATE INDEX IF NOT EXISTS idx_runner_commands_status_created ON runner_commands(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_workers_status ON workers(status);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_workers_token_hash ON workers(token_hash) WHERE token_hash IS NOT NULL;

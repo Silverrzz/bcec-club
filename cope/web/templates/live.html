@@ -1,0 +1,118 @@
+{% extends "base.html" %}
+{% from "_macros.html" import engine_name, result_text, status_badge %}
+
+{% block title %}COPE Chess{% endblock %}
+
+{% block content %}
+  <section class="home-section home-live">
+    {% if live_games %}
+      <div class="live-game-list">
+        {% for item in live_games %}
+          <article class="live-game-card" data-href="/games/{{ item.game.id }}">
+            <div class="live-game-card__preview board-shell board-shell--preview" data-board data-fen="{{ item.opening.fen if item.opening else 'startpos' }}" data-moves="{{ item.moves | map(attribute='uci') | join(' ') }}">
+              <div class="board board--preview" data-board-grid></div>
+            </div>
+            <div class="live-game-card__body">
+              <header class="live-game-card__header">
+                <div>
+                  <h3>
+                    {{ item.white_name }}
+                    <span class="muted">vs</span>
+                    {{ item.black_name }}
+                  </h3>
+                  <p>{{ item.tournament.name }} &middot; round {{ item.game.round }} &middot; {{ item.format }} &middot; {{ item.time_control }}</p>
+                </div>
+                {{ status_badge(item.game.status) }}
+              </header>
+
+              <div class="progress">
+                <div class="progress__bar" style="width: {{ (item.summary.finished / item.summary.total * 100) | round if item.summary.total else 0 }}%"></div>
+              </div>
+
+              <dl class="live-game-card__facts">
+                <div>
+                  <dt>Moves</dt>
+                  <dd>{{ item.moves|length }}</dd>
+                </div>
+                <div>
+                  <dt>Last move</dt>
+                  <dd>{{ item.last_move.san if item.last_move else "-" }}</dd>
+                </div>
+                <div>
+                  <dt>Tournament</dt>
+                  <dd>{{ item.summary.finished }} / {{ item.summary.total }} complete</dd>
+                </div>
+              </dl>
+            </div>
+          </article>
+        {% endfor %}
+      </div>
+    {% else %}
+      <div class="empty-state">
+        <p>No active games.</p>
+      </div>
+    {% endif %}
+  </section>
+
+  <section class="home-tables">
+    <section class="panel">
+      <h2>Upcoming games</h2>
+      {% if upcoming_rows %}
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Tournament</th>
+              <th class="col-narrow">Rd</th>
+              <th>White</th>
+              <th>Black</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in upcoming_rows %}
+              <tr data-href="{{ row.href }}">
+                <td>{{ row.tournament }}</td>
+                <td class="col-narrow">{{ row.round }}</td>
+                <td>{{ row.white }}</td>
+                <td>{{ row.black }}</td>
+                <td>{{ status_badge(row.status) }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      {% else %}
+        <p class="empty">No upcoming games.</p>
+      {% endif %}
+    </section>
+
+    <section class="panel">
+      <h2>Recent results</h2>
+      {% if recent_games %}
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Tournament</th>
+              <th class="col-narrow">Rd</th>
+              <th>White</th>
+              <th>Black</th>
+              <th>Result</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for game in recent_games %}
+              <tr data-href="/games/{{ game.id }}">
+                <td>{{ tournament_names.get(game.tournament_id, "Tournament " ~ game.tournament_id) }}</td>
+                <td class="col-narrow">{{ game.round }}</td>
+                <td>{{ engine_name(engines, game.white_engine_id) }}</td>
+                <td>{{ engine_name(engines, game.black_engine_id) }}</td>
+                <td class="col-result">{{ result_text(game.result) }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      {% else %}
+        <p class="empty">No recent results.</p>
+      {% endif %}
+    </section>
+  </section>
+{% endblock %}

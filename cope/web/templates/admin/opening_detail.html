@@ -1,0 +1,42 @@
+{% extends "admin/base.html" %}
+{% from "_macros.html" import flash %}
+
+{% block title %}{{ suite.name }} - COPE Admin{% endblock %}
+
+{% block content %}
+  <header class="admin-page-title">
+    <h1>{{ suite.name }}</h1>
+    <a class="button button--ghost" href="/admin/openings">&larr; All suites</a>
+  </header>
+
+  {{ flash(notice, error, errors) }}
+
+  <form class="panel settings-form" method="post" action="/admin/openings/{{ suite.id }}" enctype="multipart/form-data">
+    <div class="field-row">
+      <div class="field">
+        <label for="name">Name</label>
+        <input class="input" id="name" name="name" value="{{ suite.name }}" required>
+      </div>
+      <div class="field">
+        <label for="description">Description</label>
+        <input class="input" id="description" name="description" value="{{ suite.description }}">
+      </div>
+    </div>
+    <div class="field">
+      <label for="book_file">Upload replacement book</label>
+      <input class="input" id="book_file" name="book_file" type="file" accept=".epd,.pgn">
+      <p class="field-help">Uploaded PGN/EPD positions are combined with the manual list below. Saving replaces the suite.</p>
+    </div>
+    <div class="field">
+      <label for="positions">Positions ({{ openings|length }})</label>
+      <textarea class="input input--mono" id="positions" name="positions" rows="14">{{ positions_text }}</textarea>
+      <p class="field-help">One position per line: either a FEN, or <code>Name; FEN</code>. Saving replaces the whole list.</p>
+    </div>
+    <div class="form-actions">
+      <button class="button button--primary" type="submit">Save suite</button>
+      <button class="button button--danger" type="submit"
+              formaction="/admin/openings/{{ suite.id }}/delete"
+              data-confirm="Delete opening suite '{{ suite.name }}'?">Delete suite</button>
+    </div>
+  </form>
+{% endblock %}

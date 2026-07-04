@@ -1,0 +1,60 @@
+{% extends "admin/base.html" %}
+{% from "_macros.html" import settings_fields, status_badge, flash %}
+
+{% block title %}{{ category.name if category else "New category" }} - COPE Admin{% endblock %}
+
+{% block content %}
+  <header class="admin-page-title">
+    <h1>{{ "Edit " ~ category.name if category else "New category" }}</h1>
+    <a class="button button--ghost" href="/admin/categories">&larr; All categories</a>
+  </header>
+
+  {{ flash(notice, error, errors) }}
+
+  <form class="panel settings-form" method="post"
+        action="{{ '/admin/categories/' ~ category.id if category else '/admin/categories' }}">
+    <fieldset class="form-section">
+      <legend>Basics</legend>
+      <div class="field">
+        <label for="name">Name</label>
+        <input class="input" id="name" name="name" value="{{ form_name }}" required placeholder="e.g. Blitz, Classical, Nodes-limited">
+      </div>
+      <div class="field">
+        <label for="description">Description <span class="field-optional">(optional)</span></label>
+        <input class="input" id="description" name="description" value="{{ form_description }}" placeholder="Shown on the public ratings page">
+      </div>
+      <div class="field field--checkbox">
+        <label>
+          <input type="checkbox" name="active" {% if form_active %}checked{% endif %}>
+          Active (usable for new tournaments and shown in ratings)
+        </label>
+      </div>
+    </fieldset>
+
+    <h2 class="settings-form__subtitle">Default tournament settings</h2>
+    <p class="field-help">New tournaments in this category start with these settings pre-filled.</p>
+    {{ settings_fields(form_values, engine_options, opening_suites) }}
+
+    <div class="form-actions">
+      <button class="button button--primary" type="submit">{{ "Save changes" if category else "Create category" }}</button>
+    </div>
+  </form>
+
+  {% if category %}
+    <section class="panel">
+      <h2>Tournaments in this category</h2>
+      {% if tournaments %}
+        <ul class="admin-list">
+          {% for tournament in tournaments %}
+            <li>
+              <a href="/admin/tournaments/{{ tournament.id }}">{{ tournament.name }}</a>
+              {{ status_badge(tournament.status) }}
+            </li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <p class="empty">No tournaments use this category yet.</p>
+      {% endif %}
+    </section>
+  {% endif %}
+{% endblock %}
