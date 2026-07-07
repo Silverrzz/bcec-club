@@ -76,6 +76,7 @@ class EngineSpec(StrictModel):
     name: str = Field(min_length=1, max_length=80)
     version: str = Field(default="", max_length=80)
     git_url: str = Field(min_length=1)
+    branch: str = Field(default="", max_length=120)
     commit: str
     build_cmd: str = Field(min_length=1)
     binary_path: str = Field(min_length=1)
@@ -153,7 +154,7 @@ class TournamentConfig(StrictModel):
 
     @model_validator(mode="before")
     @classmethod
-    def migrate_legacy_rating_category(cls, data: Any) -> Any:
+    def normalize_category_fields(cls, data: Any) -> Any:
         if isinstance(data, dict):
             data = dict(data)
             data.pop("rating_category", None)
@@ -225,6 +226,66 @@ class GameAssignment(StrictModel):
                 if not name.strip():
                     raise ValueError("uci option override names must be non-empty")
         return value
+
+    def message_fields(self) -> dict[str, int | str]:
+        return {
+            "assignment_id": self.assignment_id,
+            "assignment_key": self.assignment_key,
+            "game_id": self.game_id,
+        }
+
+
+class WorkerGameAssignment(StrictModel):
+    assignment: GameAssignment
+    tournament_name: str = Field(min_length=1)
+    round: int = Field(gt=0)
+    initial_fen: str = Field(min_length=1)
+    opening_name: str | None = None
+    max_plies: int = Field(gt=0)
+    engines: dict[int, EngineSpec]
+
+    @field_validator("engines")
+    @classmethod
+    def validate_engines(cls, value: dict[int, EngineSpec]) -> dict[int, EngineSpec]:
+        if not value:
+            raise ValueError("assignment must include engine specs")
+        for engine_id, spec in value.items():
+            if engine_id <= 0:
+                raise ValueError("engine ids must be positive")
+            if spec.engine_id != engine_id:
+                raise ValueError("engine spec id must match its assignment key")
+        return value
+
+
+class AssignmentMessage(StrictModel):
+    assignment_id: int = Field(gt=0)
+    assignment_key: str = Field(min_length=16, max_length=128)
+    game_id: int = Field(gt=0)
+
+    def matches_assignment(self, assignment: GameAssignment) -> bool:
+        return (
+            self.assignment_id == assignment.assignment_id
+            and self.assignment_key == assignment.assignment_key
+            and self.game_id == assignment.game_id
+        )
+
+
+class EngineCommand(AssignmentMessage):
+    engine_id: int = Field(gt=0)
+    command: str = Field(min_length=1)
+
+
+class EngineCommandResult(AssignmentMessage):
+    engine_id: int = Field(gt=0)
+    lines: list[str]
+
+
+class EngineInfo(EngineCommandResult):
+    pass
+
+
+class AssignmentComplete(AssignmentMessage):
+    pass
 
 
 class BenchInfo(StrictModel):

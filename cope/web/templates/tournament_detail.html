@@ -7,9 +7,10 @@
   {% set empty_engine = {"eval": "-", "depth": "-", "nodes": "-", "nps": "-", "pv": "not recorded"} %}
   {% set black_data = engine_data.black if engine_data is defined and engine_data.black is defined else empty_engine %}
   {% set white_data = engine_data.white if engine_data is defined and engine_data.white is defined else empty_engine %}
+  {% set clock_data = clocks if clocks is defined else {"white": "--:--", "black": "--:--"} %}
   {% set chat_message_list = chat_messages if chat_messages is defined else [] %}
   {% set opening_info = opening if opening is defined and opening else {"name": "Start position", "fen": "startpos"} %}
-  <section class="arena">
+  <section class="arena" data-tournament-live data-tournament-id="{{ tournament.id }}">
     <div class="arena__grid">
       <div class="arena__analysis">
         <article class="engine-console engine-console--black">
@@ -18,18 +19,18 @@
               <div>
                 <span>Black</span>
                 {% if viewer_game %}
-                  <strong><a href="/engines/{{ viewer_game.black_engine_id }}">{{ engine_name(engines, viewer_game.black_engine_id) }}</a></strong>
+                  <strong><a data-live-black-link href="/engines/{{ viewer_game.black_engine_id }}"><span data-live-black-name>{{ engine_name(engines, viewer_game.black_engine_id) }}</span></a></strong>
                 {% else %}
-                  <strong>Black</strong>
+                  <strong data-live-black-name>Black</strong>
                 {% endif %}
               </div>
-              <time>--:--</time>
+              <time data-live-black-clock>{{ clock_data.black }}</time>
             </header>
             <dl class="engine-console__feature-list">
-              <div><dt>Depth</dt><dd>{{ black_data.depth }}</dd></div>
-              <div><dt>Nodes</dt><dd>{{ black_data.nodes }}</dd></div>
-              <div><dt>NPS</dt><dd>{{ black_data.nps }}</dd></div>
-              <div class="engine-console__feature-item--pv"><dt>PV</dt><dd>{{ black_data.pv }}</dd></div>
+              <div><dt>Depth</dt><dd data-live-black-depth>{{ black_data.depth }}</dd></div>
+              <div><dt>Nodes</dt><dd data-live-black-nodes>{{ black_data.nodes }}</dd></div>
+              <div><dt>NPS</dt><dd data-live-black-nps>{{ black_data.nps }}</dd></div>
+              <div class="engine-console__feature-item--pv"><dt>PV</dt><dd data-live-black-pv>{{ black_data.pv }}</dd></div>
             </dl>
           </div>
           <div class="engine-console__pv-board board-shell board-shell--pv" data-board data-fen="{{ opening_info.fen }}" data-moves="">
@@ -37,7 +38,7 @@
           </div>
           <section class="engine-console__eval-card" aria-label="Black evaluation">
             <span>Eval</span>
-            <strong>{{ black_data.eval }}</strong>
+            <strong data-live-black-eval>{{ black_data.eval }}</strong>
           </section>
         </article>
 
@@ -47,18 +48,18 @@
               <div>
                 <span>White</span>
                 {% if viewer_game %}
-                  <strong><a href="/engines/{{ viewer_game.white_engine_id }}">{{ engine_name(engines, viewer_game.white_engine_id) }}</a></strong>
+                  <strong><a data-live-white-link href="/engines/{{ viewer_game.white_engine_id }}"><span data-live-white-name>{{ engine_name(engines, viewer_game.white_engine_id) }}</span></a></strong>
                 {% else %}
-                  <strong>White</strong>
+                  <strong data-live-white-name>White</strong>
                 {% endif %}
               </div>
-              <time>--:--</time>
+              <time data-live-white-clock>{{ clock_data.white }}</time>
             </header>
             <dl class="engine-console__feature-list">
-              <div><dt>Depth</dt><dd>{{ white_data.depth }}</dd></div>
-              <div><dt>Nodes</dt><dd>{{ white_data.nodes }}</dd></div>
-              <div><dt>NPS</dt><dd>{{ white_data.nps }}</dd></div>
-              <div class="engine-console__feature-item--pv"><dt>PV</dt><dd>{{ white_data.pv }}</dd></div>
+              <div><dt>Depth</dt><dd data-live-white-depth>{{ white_data.depth }}</dd></div>
+              <div><dt>Nodes</dt><dd data-live-white-nodes>{{ white_data.nodes }}</dd></div>
+              <div><dt>NPS</dt><dd data-live-white-nps>{{ white_data.nps }}</dd></div>
+              <div class="engine-console__feature-item--pv"><dt>PV</dt><dd data-live-white-pv>{{ white_data.pv }}</dd></div>
             </dl>
           </div>
           <div class="engine-console__pv-board board-shell board-shell--pv" data-board data-fen="{{ opening_info.fen }}" data-moves="">
@@ -66,13 +67,13 @@
           </div>
           <section class="engine-console__eval-card" aria-label="White evaluation">
             <span>Eval</span>
-            <strong>{{ white_data.eval }}</strong>
+            <strong data-live-white-eval>{{ white_data.eval }}</strong>
           </section>
         </article>
       </div>
 
       <div class="arena__board">
-        <section class="board-shell board-shell--arena" data-board data-board-coordinates="true" data-fen="{{ opening_info.fen }}" data-moves="{{ viewer_moves | map(attribute='uci') | join(' ') if viewer_game else '' }}">
+        <section class="board-shell board-shell--arena" data-board data-live-board data-game-id="{{ viewer_game.id if viewer_game else '' }}" data-board-coordinates="true" data-fen="{{ opening_info.fen }}" data-moves="{{ viewer_moves | map(attribute='uci') | join(' ') if viewer_game else '' }}">
           <div class="board" data-board-grid></div>
           <div class="board-footer">
             <div class="board-controls">
@@ -83,7 +84,7 @@
               <button type="button" class="button button--ghost" data-board-last title="Last move">&#8677;</button>
             </div>
             <div class="board-meta">
-              <button type="button" data-copy="{{ opening_info.name }}{% if opening_info.fen != 'startpos' %} | {{ opening_info.fen }}{% endif %}">
+              <button type="button" data-live-opening data-copy="{{ opening_info.name }}{% if opening_info.fen != 'startpos' %} | {{ opening_info.fen }}{% endif %}">
                 <span>Opening</span>
                 <strong>{{ opening_info.name }}</strong>
               </button>
@@ -135,7 +136,7 @@
               <th>Played</th>
             </tr>
           </thead>
-          <tbody>
+          <tbody data-live-standings>
             {% for row in standings %}
               <tr data-href="/engines/{{ row.engine_id }}">
                 <td class="col-narrow">{{ loop.index }}</td>
@@ -154,7 +155,7 @@
     <section class="panel" id="games" data-tab-panel="games" hidden>
       <h2>All games</h2>
       {% if games %}
-        {{ games_table(games, engines) }}
+        {{ games_table(games, engines, tbody_attr='data-live-games') }}
       {% else %}
         <p class="empty">No games scheduled yet.</p>
       {% endif %}

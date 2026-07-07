@@ -302,20 +302,24 @@ function boardToFen(board) {
 function initBoard(shell, Chessground) {
   const grid = shell.querySelector("[data-board-grid]");
   if (!grid) return;
-  const moves = (shell.dataset.moves || "").split(/\s+/).filter(Boolean);
-  const initialFen = shell.dataset.fen || "startpos";
-  const initialSide = fenSideToMove(initialFen);
-  const initialFullmove = fenFullmove(initialFen);
+  let moves = (shell.dataset.moves || "").split(/\s+/).filter(Boolean);
+  let initialFen = shell.dataset.fen || "startpos";
+  let initialSide = fenSideToMove(initialFen);
+  let initialFullmove = fenFullmove(initialFen);
   const currentFen = shell.querySelector("[data-current-fen]");
 
-  let position = positionFromFen(initialFen);
-  const fens = [boardToFen(position)];
-  moves.forEach((uci) => {
-    position = position.map((rank) => rank.slice());
-    applyUciMove(position, uci);
-    fens.push(boardToFen(position));
-  });
+  function buildFens(fen, uciMoves) {
+    let position = positionFromFen(fen);
+    const nextFens = [boardToFen(position)];
+    uciMoves.forEach((uci) => {
+      position = position.map((rank) => rank.slice());
+      applyUciMove(position, uci);
+      nextFens.push(boardToFen(position));
+    });
+    return nextFens;
+  }
 
+  let fens = buildFens(initialFen, moves);
   let ply = fens.length - 1;
   const status = shell.querySelector("[data-board-status]");
 
@@ -355,6 +359,21 @@ function initBoard(shell, Chessground) {
     render();
   }
 
+  function updatePosition(nextFen, nextMoves, options = {}) {
+    const wasFollowing = ply === fens.length - 1;
+    const oldFen = initialFen;
+    initialFen = nextFen || "startpos";
+    initialSide = fenSideToMove(initialFen);
+    initialFullmove = fenFullmove(initialFen);
+    moves = nextMoves.slice();
+    fens = buildFens(initialFen, moves);
+
+    if (options.forceLatest || oldFen !== initialFen || wasFollowing || ply >= fens.length) {
+      ply = fens.length - 1;
+    }
+    render();
+  }
+
   shell.querySelector("[data-board-first]")?.addEventListener("click", () => step(0));
   shell.querySelector("[data-board-prev]")?.addEventListener("click", () => step(ply - 1));
   shell.querySelector("[data-board-next]")?.addEventListener("click", () => step(ply + 1));
@@ -367,6 +386,7 @@ function initBoard(shell, Chessground) {
   });
 
   render();
+  shell.copeBoard = { updatePosition };
 }
 
 const boardShells = document.querySelectorAll("[data-board]");
@@ -375,6 +395,162 @@ if (boardShells.length) {
     boardShells.forEach((shell) => initBoard(shell, Chessground));
   });
 }
+
+document.querySelectorAll("[data-tournament-live]").forEach((arena) => {
+  const tournamentId = arena.dataset.tournamentId;
+  if (!tournamentId) return;
+
+  const liveBoard = arena.querySelector("[data-live-board]");
+  const openingButton = arena.querySelector("[data-live-opening]");
+  let lastGameId = null;
+  let lastMoveKey = "";
+  let stopped = false;
+
+  function setText(selector, value) {
+    const element = arena.querySelector(selector);
+    if (element) element.textContent = value;
+  }
+
+  function setLiveText(key, value) {
+    setText(`[data-live-${key}]`, value);
+  }
+
+  function setEngine(side, game) {
+    const id = game ? game[`${side}_engine_id`] : null;
+    const name = game ? game[`${side}_name`] : side[0].toUpperCase() + side.slice(1);
+    setLiveText(`${side}-name`, name);
+    const link = arena.querySelector(`[data-live-${side}-link]`);
+    if (link && id !== null) link.href = `/engines/${id}`;
+  }
+
+  function setEngineData(side, data) {
+    const values = data || {};
+    ["depth", "nodes", "nps", "eval"].forEach((name) => {
+      setLiveText(`${side}-${name}`, values[name] || "-");
+    });
+    setLiveText(`${side}-pv`, values.pv || "not recorded");
+  }
+
+  function setClocks(clocks) {
+    const values = clocks || {};
+    ["white", "black"].forEach((side) => {
+      setLiveText(`${side}-clock`, values[side] || "--:--");
+    });
+  }
+
+  function linkedRow(href) {
+    const row = document.createElement("tr");
+    row.dataset.href = href;
+    row.addEventListener("click", (event) => {
+      if (event.target.closest("a, button, form, input, select, label")) return;
+      window.location.href = href;
+    });
+    return row;
+  }
+
+  function appendCell(row, value, className) {
+    const cell = document.createElement("td");
+    if (className) cell.className = className;
+    cell.textContent = value;
+    row.append(cell);
+    return cell;
+  }
+
+  function statusBadge(status) {
+    const badge = document.createElement("span");
+    badge.className = `badge badge--${status}`;
+    badge.textContent = status;
+    return badge;
+  }
+
+  function resultText(result) {
+    return result || "-";
+  }
+
+  function renderStandings(standings) {
+    const body = document.querySelector("[data-live-standings]");
+    if (!body || !Array.isArray(standings)) return;
+
+    body.replaceChildren(...standings.map((standing, index) => {
+      const row = linkedRow(`/engines/${standing.engine_id}`);
+      appendCell(row, String(index + 1), "col-narrow");
+      appendCell(row, standing.name || `Engine ${standing.engine_id}`);
+      appendCell(row, String(standing.points ?? 0));
+      appendCell(row, String(standing.played ?? 0));
+      return row;
+    }));
+  }
+
+  function renderGames(games) {
+    const body = document.querySelector("[data-live-games]");
+    if (!body || !Array.isArray(games)) return;
+
+    body.replaceChildren(...games.map((game) => {
+      const row = linkedRow(`/games/${game.id}`);
+      appendCell(row, String(game.round), "col-narrow");
+      appendCell(row, game.white_name || "White");
+      appendCell(row, game.black_name || "Black");
+      const statusCell = document.createElement("td");
+      statusCell.append(statusBadge(game.status || "pending"));
+      row.append(statusCell);
+      appendCell(row, resultText(game.result), "col-result");
+      return row;
+    }));
+  }
+
+  function applyLivePayload(payload) {
+    if (!payload || stopped) return;
+    const game = payload.game || null;
+    const opening = payload.opening || { name: "Start position", fen: "startpos" };
+    const moves = Array.isArray(payload.moves) ? payload.moves.map((move) => move.uci) : [];
+    const moveKey = moves.join(" ");
+    const gameChanged = (game ? game.id : null) !== lastGameId;
+
+    setEngine("white", game);
+    setEngine("black", game);
+    setEngineData("white", payload.engine_data?.white);
+    setEngineData("black", payload.engine_data?.black);
+    setClocks(payload.clocks);
+    renderStandings(payload.standings);
+    renderGames(payload.games);
+
+    if (openingButton) {
+      const name = opening.name || "Start position";
+      const fen = opening.fen || "startpos";
+      openingButton.dataset.copy = fen === "startpos" ? name : `${name} | ${fen}`;
+      const value = openingButton.querySelector("strong");
+      if (value) value.textContent = name;
+    }
+
+    const boardNeedsUpdate = gameChanged || moveKey !== lastMoveKey;
+    if (liveBoard && !liveBoard.copeBoard && boardNeedsUpdate) {
+      return;
+    }
+
+    if (liveBoard?.copeBoard && boardNeedsUpdate) {
+      liveBoard.dataset.gameId = game ? game.id : "";
+      liveBoard.dataset.fen = opening.fen || "startpos";
+      liveBoard.dataset.moves = moveKey;
+      liveBoard.copeBoard.updatePosition(opening.fen || "startpos", moves, {
+        forceLatest: gameChanged,
+      });
+    }
+
+    lastGameId = game ? game.id : null;
+    lastMoveKey = moveKey;
+    if (!game && ["finished", "aborted"].includes(payload.tournament?.status)) {
+      stopped = true;
+    }
+  }
+
+  const events = new EventSource(`/tournaments/${tournamentId}/events`);
+  events.addEventListener("snapshot", (event) => {
+    try {
+      applyLivePayload(JSON.parse(event.data));
+    } catch {
+    }
+  });
+});
 
 document.querySelectorAll("[data-copy]").forEach((element) => {
   element.addEventListener("click", async () => {

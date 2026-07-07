@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS engines (
   author TEXT NOT NULL DEFAULT '',
   version TEXT NOT NULL DEFAULT '',
   git_url TEXT NOT NULL,
+  branch TEXT NOT NULL DEFAULT '',
   commit_hash TEXT NOT NULL,
   build_cmd TEXT NOT NULL,
   binary_path TEXT NOT NULL,
@@ -80,8 +81,8 @@ CREATE TABLE IF NOT EXISTS game_assignments (
   game_id INTEGER NOT NULL UNIQUE REFERENCES games(id) ON DELETE CASCADE,
   assignment_key TEXT NOT NULL UNIQUE,
   hardware_mode TEXT NOT NULL CHECK (hardware_mode IN ('shared', 'paired')),
-  white_worker_id INTEGER REFERENCES workers(id),
-  black_worker_id INTEGER REFERENCES workers(id),
+  white_worker_id INTEGER REFERENCES workers(id) ON DELETE SET NULL,
+  black_worker_id INTEGER REFERENCES workers(id) ON DELETE SET NULL,
   status TEXT NOT NULL DEFAULT 'assigned'
     CHECK (status IN ('assigned', 'acked', 'live', 'finished', 'abandoned', 'expired')),
   sent_at TEXT,

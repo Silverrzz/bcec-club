@@ -50,6 +50,12 @@ def initialize_connection(connection: sqlite3.Connection) -> None:
         "version",
         "TEXT NOT NULL DEFAULT ''",
     )
+    _ensure_column(
+        connection,
+        "engines",
+        "branch",
+        "TEXT NOT NULL DEFAULT ''",
+    )
 
 
 def _ensure_column(

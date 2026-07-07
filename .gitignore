@@ -1,7 +1,10 @@
 *.pyc
+*.pyc.*
 
 /tmp/
+/.cope-worker/
 
 *.db
+*.db*
 
 *.egg-info/

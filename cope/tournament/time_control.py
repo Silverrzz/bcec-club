@@ -83,7 +83,7 @@ class RuntimeTimeControl:
 class TimeOutError(Exception):
     pass
 
-class TimeManager():
+class TimeManager:
     def __init__(self, time_control: RuntimeTimeControl):
         self._time_control = time_control
         self._chess_clock = ChessClock()
@@ -151,11 +151,8 @@ class TimeManager():
             self._remaining_time = round(self._remaining_time + self._time_control.get_increment())
             
         elif category is TimeControlCategory.MOVETIME:
-            self._remaining_move_time -= elapsed_time
-
-            self._raise_if_timed_out(self._remaining_move_time)
-
-            self._remaining_move_time = round(self._remaining_move_time)
+            remaining_move_time = self._remaining_move_time - elapsed_time
+            self._raise_if_timed_out(remaining_move_time)
             
         elif category is TimeControlCategory.MOVESTOGO:
             
@@ -176,7 +173,7 @@ class TimeManager():
         if remaining_time <= 0:
             raise TimeOutError()
 
-class ChessClock():
+class ChessClock:
     def __init__(self, start_time: float = 0, running: bool = False):
         self._start_time = start_time
         self._running = running

@@ -1,0 +1,127 @@
+{% extends "admin/base.html" %}
+{% from "_macros.html" import status_badge, flash %}
+
+{% block title %}{{ worker.label }} - COPE Admin{% endblock %}
+
+{% block content %}
+  <header class="admin-page-title">
+    <div>
+      <h1>{{ worker.label }}</h1>
+      <p class="muted">Worker #{{ worker.id }} &middot; {{ worker.last_seen or "never seen" }}</p>
+    </div>
+    <a class="button button--ghost" href="/admin/workers">&larr; All workers</a>
+  </header>
+
+  {{ flash(notice, error, errors) }}
+
+  <section class="panel">
+    <h2>Current work</h2>
+    <p>
+      {% if row.work.href %}
+        <a href="{{ row.work.href }}">{{ row.work.summary }}</a>
+      {% else %}
+        <strong>{{ row.work.summary }}</strong>
+      {% endif %}
+    </p>
+    <p class="muted">{{ row.work.detail }}</p>
+    {% if row.work.meta %}<p class="muted">{{ row.work.meta }}</p>{% endif %}
+  </section>
+
+  <div class="admin-columns">
+    <section class="panel">
+      <h2>Identity</h2>
+      <form method="post" action="/admin/workers/{{ worker.id }}/label">
+        <input type="hidden" name="next" value="/admin/workers/{{ worker.id }}">
+        <div class="field">
+          <label for="label">Label</label>
+          <input class="input" id="label" name="label" value="{{ worker.label }}" required>
+        </div>
+        <button class="button button--primary" type="submit">Save label</button>
+      </form>
+    </section>
+
+    <section class="panel">
+      <h2>State</h2>
+      <dl class="worker-facts">
+        <div>
+          <dt>Status</dt>
+          <dd>{{ status_badge(row.status) }}</dd>
+        </div>
+        <div>
+          <dt>Machine</dt>
+          <dd><span class="worker-state worker-state--{{ row.machine.status }}">{{ row.machine.label }}</span></dd>
+        </div>
+        <div>
+          <dt>Session</dt>
+          <dd><span class="worker-state worker-state--{{ row.session.status }}">{{ row.session.label }}</span></dd>
+        </div>
+        <div>
+          <dt>Token</dt>
+          <dd><span class="worker-state worker-state--{{ row.token.status }}">{{ row.token.label }}</span></dd>
+        </div>
+      </dl>
+    </section>
+
+    <section class="panel">
+      <h2>Hardware</h2>
+      {% if worker.hw %}
+        <dl class="worker-facts">
+          <div>
+            <dt>CPU</dt>
+            <dd>{{ worker.hw.cpu_model }}</dd>
+          </div>
+          <div>
+            <dt>Cores</dt>
+            <dd>{{ worker.hw.physical_cores }}P / {{ worker.hw.logical_cores }}T</dd>
+          </div>
+          <div>
+            <dt>RAM</dt>
+            <dd>{{ worker.hw.ram_gb }}GB</dd>
+          </div>
+        </dl>
+      {% else %}
+        <p class="empty">This worker has not reported hardware yet.</p>
+      {% endif %}
+    </section>
+
+    <section class="panel">
+      <h2>Access</h2>
+      <dl class="worker-facts">
+        <div>
+          <dt>Token</dt>
+          <dd>{{ row.token.detail }}</dd>
+        </div>
+        <div>
+          <dt>Session</dt>
+          <dd>
+            {{ row.session.detail }}
+            {% if worker.session_id %}
+              <button class="button button--small" type="button" data-copy="{{ worker.session_id }}">Copy session id</button>
+            {% endif %}
+          </dd>
+        </div>
+        <div>
+          <dt>Connection</dt>
+          <dd>{{ row.machine.detail }}</dd>
+        </div>
+      </dl>
+    </section>
+  </div>
+
+  <section class="panel">
+    <h2>Actions</h2>
+    <div class="action-bar">
+      {% if worker.status != "revoked" %}
+        <form method="post" action="/admin/workers/{{ worker.id }}/revoke">
+          <input type="hidden" name="next" value="/admin/workers/{{ worker.id }}">
+          <button class="button" type="submit"
+                  data-confirm="Revoke worker '{{ worker.label }}'? It will not be able to reconnect.">Revoke worker</button>
+        </form>
+      {% endif %}
+      <form method="post" action="/admin/workers/{{ worker.id }}/delete">
+        <button class="button button--danger" type="submit"
+                data-confirm="Delete worker '{{ worker.label }}'?">Delete worker</button>
+      </form>
+    </div>
+  </section>
+{% endblock %}

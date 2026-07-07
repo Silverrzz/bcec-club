@@ -72,6 +72,21 @@ class MoveRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class GameAssignmentRecord:
+    id: int
+    game_id: int
+    assignment_key: str
+    hardware_mode: str
+    white_worker_id: int | None
+    black_worker_id: int | None
+    status: str
+    sent_at: str | None
+    acked_at: str | None
+    finished_at: str | None
+    last_error: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class WorkerRecord:
     id: int
     label: str
@@ -91,6 +106,7 @@ class EngineRecord:
     author: str
     version: str
     git_url: str
+    branch: str
     commit: str
     build_cmd: str
     binary_path: str
@@ -167,10 +183,10 @@ def create_engine(
     connection.execute(
         """
         INSERT INTO engines (
-          id, name, author, version, git_url, commit_hash, build_cmd, binary_path,
+          id, name, author, version, git_url, branch, commit_hash, build_cmd, binary_path,
           uci_options, active
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             spec.engine_id,
@@ -178,6 +194,7 @@ def create_engine(
             author,
             spec.version,
             spec.git_url,
+            spec.branch,
             spec.commit,
             spec.build_cmd,
             spec.binary_path,
@@ -200,6 +217,7 @@ def update_engine(
     name: str,
     author: str = "",
     git_url: str,
+    branch: str = "",
     commit: str,
     build_cmd: str,
     binary_path: str,
@@ -210,7 +228,7 @@ def update_engine(
     connection.execute(
         """
         UPDATE engines
-        SET name = ?, author = ?, version = ?, git_url = ?, commit_hash = ?, build_cmd = ?,
+        SET name = ?, author = ?, version = ?, git_url = ?, branch = ?, commit_hash = ?, build_cmd = ?,
             binary_path = ?, uci_options = ?, active = ?
         WHERE id = ?
         """,
@@ -219,6 +237,7 @@ def update_engine(
             author,
             version,
             git_url,
+            branch,
             commit,
             build_cmd,
             binary_path,
@@ -690,6 +709,138 @@ def create_game_assignment(
     return int(cursor.lastrowid)
 
 
+def get_game_assignment(
+    connection: sqlite3.Connection,
+    assignment_id: int,
+) -> GameAssignmentRecord | None:
+    return _get_game_assignment(connection, "id", assignment_id)
+
+
+def get_game_assignment_for_game(
+    connection: sqlite3.Connection,
+    game_id: int,
+) -> GameAssignmentRecord | None:
+    return _get_game_assignment(connection, "game_id", game_id)
+
+
+def _get_game_assignment(
+    connection: sqlite3.Connection,
+    column: str,
+    value: int,
+) -> GameAssignmentRecord | None:
+    row = connection.execute(
+        f"SELECT * FROM game_assignments WHERE {column} = ?",
+        (value,),
+    ).fetchone()
+    if row is None:
+        return None
+    return _game_assignment_from_row(row)
+
+
+def assign_game_to_worker(
+    connection: sqlite3.Connection,
+    *,
+    game_id: int,
+    assignment_key: str,
+    hardware_mode: str,
+    worker_id: int,
+) -> GameAssignmentRecord:
+    now = utc_now()
+    connection.execute(
+        """
+        INSERT INTO game_assignments (
+          game_id, assignment_key, hardware_mode, white_worker_id, black_worker_id,
+          status, sent_at, acked_at, finished_at, last_error
+        )
+        VALUES (?, ?, ?, ?, ?, 'assigned', ?, NULL, NULL, NULL)
+        ON CONFLICT(game_id) DO UPDATE SET
+          assignment_key = excluded.assignment_key,
+          hardware_mode = excluded.hardware_mode,
+          white_worker_id = excluded.white_worker_id,
+          black_worker_id = excluded.black_worker_id,
+          status = 'assigned',
+          sent_at = excluded.sent_at,
+          acked_at = NULL,
+          finished_at = NULL,
+          last_error = NULL
+        """,
+        (
+            game_id,
+            assignment_key,
+            hardware_mode,
+            worker_id,
+            worker_id,
+            now,
+        ),
+    )
+    connection.execute(
+        """
+        UPDATE games
+        SET status = 'assigned'
+        WHERE id = ? AND status IN ('pending', 'assigned')
+        """,
+        (game_id,),
+    )
+    assignment = get_game_assignment_for_game(connection, game_id)
+    if assignment is None:
+        raise RuntimeError(f"failed to assign game {game_id}")
+    return assignment
+
+
+def mark_game_assignment_live(
+    connection: sqlite3.Connection,
+    assignment_id: int,
+) -> None:
+    connection.execute(
+        """
+        UPDATE game_assignments
+        SET status = 'live', acked_at = COALESCE(acked_at, ?)
+        WHERE id = ? AND status IN ('assigned', 'acked', 'live')
+        """,
+        (utc_now(), assignment_id),
+    )
+
+
+def finish_game_assignment(
+    connection: sqlite3.Connection,
+    assignment_id: int,
+) -> None:
+    connection.execute(
+        """
+        UPDATE game_assignments
+        SET status = 'finished', finished_at = ?
+        WHERE id = ?
+        """,
+        (utc_now(), assignment_id),
+    )
+
+
+def fail_game_assignment(
+    connection: sqlite3.Connection,
+    assignment_id: int,
+    error: str,
+) -> None:
+    assignment = get_game_assignment(connection, assignment_id)
+    connection.execute(
+        """
+        UPDATE game_assignments
+        SET status = 'abandoned', finished_at = ?, last_error = ?
+        WHERE id = ? AND status IN ('assigned', 'acked', 'live')
+        """,
+        (utc_now(), error[:500], assignment_id),
+    )
+    if assignment is None:
+        return
+    connection.execute(
+        """
+        UPDATE games
+        SET status = 'pending'
+        WHERE id = ? AND status IN ('assigned', 'live')
+        """,
+        (assignment.game_id,),
+    )
+
+
 def mint_worker_token(
     connection: sqlite3.Connection,
     *,
@@ -828,6 +979,21 @@ def update_worker_label(
     )
 
 
+def update_worker_status(
+    connection: sqlite3.Connection,
+    worker_id: int,
+    status: str,
+) -> None:
+    connection.execute(
+        """
+        UPDATE workers
+        SET status = ?, last_seen = ?
+        WHERE id = ? AND status != 'revoked'
+        """,
+        (status, utc_now(), worker_id),
+    )
+
+
 def revoke_worker(connection: sqlite3.Connection, worker_id: int) -> None:
     connection.execute(
         """
@@ -840,16 +1006,38 @@ def revoke_worker(connection: sqlite3.Connection, worker_id: int) -> None:
 
 
 def delete_worker(connection: sqlite3.Connection, worker_id: int) -> None:
-    """Delete a worker. Raises ValueError if game assignments reference it."""
-    row = connection.execute(
+    """Delete a worker and return its active assignments to the pending pool."""
+    connection.execute(
         """
-        SELECT COUNT(*) AS count FROM game_assignments
-        WHERE white_worker_id = ? OR black_worker_id = ?
+        UPDATE games
+        SET status = 'pending'
+        WHERE status IN ('assigned', 'live')
+          AND id IN (
+            SELECT game_id
+            FROM game_assignments
+            WHERE (white_worker_id = ? OR black_worker_id = ?)
+              AND status IN ('assigned', 'acked', 'live')
+          )
         """,
         (worker_id, worker_id),
-    ).fetchone()
-    if int(row["count"]) > 0:
-        raise ValueError("worker has game assignments; revoke it instead of deleting")
+    )
+    connection.execute(
+        """
+        UPDATE game_assignments
+        SET status = CASE
+              WHEN status IN ('assigned', 'acked', 'live') THEN 'expired'
+              ELSE status
+            END,
+            finished_at = CASE
+              WHEN status IN ('assigned', 'acked', 'live') THEN ?
+              ELSE finished_at
+            END,
+            white_worker_id = CASE WHEN white_worker_id = ? THEN NULL ELSE white_worker_id END,
+            black_worker_id = CASE WHEN black_worker_id = ? THEN NULL ELSE black_worker_id END
+        WHERE white_worker_id = ? OR black_worker_id = ?
+        """,
+        (utc_now(), worker_id, worker_id, worker_id, worker_id),
+    )
     connection.execute("DELETE FROM workers WHERE id = ?", (worker_id,))
 
 
@@ -1093,6 +1281,7 @@ def _engine_from_row(row: sqlite3.Row) -> EngineSpec:
         name=row["name"],
         version=row["version"],
         git_url=row["git_url"],
+        branch=row["branch"],
         commit=row["commit_hash"],
         build_cmd=row["build_cmd"],
         binary_path=row["binary_path"],
@@ -1107,6 +1296,7 @@ def _engine_record_from_row(row: sqlite3.Row) -> EngineRecord:
         author=row["author"],
         version=row["version"],
         git_url=row["git_url"],
+        branch=row["branch"],
         commit=row["commit_hash"],
         build_cmd=row["build_cmd"],
         binary_path=row["binary_path"],
@@ -1207,6 +1397,22 @@ def _move_from_row(row: sqlite3.Row) -> MoveRecord:
         nodes=row["nodes"],
         time_ms=row["time_ms"],
         clock_after_ms=row["clock_after_ms"],
+    )
+
+
+def _game_assignment_from_row(row: sqlite3.Row) -> GameAssignmentRecord:
+    return GameAssignmentRecord(
+        id=row["id"],
+        game_id=row["game_id"],
+        assignment_key=row["assignment_key"],
+        hardware_mode=row["hardware_mode"],
+        white_worker_id=row["white_worker_id"],
+        black_worker_id=row["black_worker_id"],
+        status=row["status"],
+        sent_at=row["sent_at"],
+        acked_at=row["acked_at"],
+        finished_at=row["finished_at"],
+        last_error=row["last_error"],
     )
 
 

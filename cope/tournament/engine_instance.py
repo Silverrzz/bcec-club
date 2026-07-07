@@ -1,17 +1,54 @@
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 import shlex
 import subprocess
 import threading
 import time
 import select
 import os
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from typing import Protocol, runtime_checkable
 
 import chess
 
 from .uci import position_command, setoption_command
 
-class EngineInstance():
+
+@dataclass(frozen=True, slots=True)
+class EngineSearchResult:
+    bestmove: chess.Move
+    eval_cp: int | None = None
+    eval_mate: int | None = None
+    depth: int | None = None
+    nodes: int | None = None
+    nps: int | None = None
+    time_ms: int = 0
+    pv: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class EngineSearchInfo:
+    eval_cp: int | None = None
+    eval_mate: int | None = None
+    depth: int | None = None
+    nodes: int | None = None
+    nps: int | None = None
+    time_ms: int = 0
+    pv: str | None = None
+
+
+@runtime_checkable
+class EngineCommandTransport(Protocol):
+    def execute_engine_command(
+        self,
+        engine_id: int,
+        command: str,
+        info_handler: Callable[[str], None] | None = None,
+    ) -> list[str]:
+        ...
+
+
+class EngineInstance:
     def __init__(self, id, host, options: dict[str, str | int | bool] | None = None):
         self._name = id
         self._host = host
@@ -22,6 +59,8 @@ class EngineInstance():
         self._started = False
         self._search_executor = ThreadPoolExecutor(max_workers=1)
         self._search_future: Future | None = None
+        self._last_search_result: EngineSearchResult | None = None
+        self._current_search_info: EngineSearchInfo | None = None
 
     def get_name(self):
         return self._name
@@ -42,6 +81,14 @@ class EngineInstance():
         self._options = dict(options)
 
     def start_new_game(self):
+        if self._is_remote():
+            self._ensure_engine_started()
+            for name, value in self._options.items():
+                self._send_remote_command(setoption_command(name, value))
+            self._send_remote_command("ucinewgame")
+            self._read_remote_until_token("isready", "readyok")
+            return
+
         self._ensure_engine_started()
         for name, value in self._options.items():
             self._send_uci_command(setoption_command(name, value))
@@ -51,26 +98,68 @@ class EngineInstance():
         self._read_until_token("readyok")
 
     def get_move(self, board: chess.Board, go_command_arg: str) -> chess.Move:
+        return self.get_search_result(board, go_command_arg).bestmove
+
+    def get_search_result(self, board: chess.Board, go_command_arg: str) -> EngineSearchResult:
         self._ensure_engine_started()
+        self._current_search_info = None
+
+        if self._is_remote():
+            lines: list[str] = []
+            lines.extend(self._send_remote_command(position_command(board)))
+            lines.extend(self._send_remote_command(go_command_arg, self._record_info_line))
+            result = _parse_search_result(lines, board, self._name)
+            self._last_search_result = result
+            return result
+
         self._send_uci_command(position_command(board))
         self._send_uci_command(go_command_arg)
 
+        lines: list[str] = []
         while True:
             line = self._read_line(timeout=None)
+            lines.append(line)
+            self._record_info_line(line)
             if line.startswith("bestmove"):
-                parts = line.split()
-                if len(parts) < 2 or parts[1] == "(none)":
-                    raise RuntimeError(f"{self._name} returned invalid bestmove: {line}")
-                try:
-                    return chess.Move.from_uci(parts[1])
-                except ValueError as exc:
-                    raise RuntimeError(f"{self._name} returned malformed bestmove: {line}") from exc
+                result = _parse_search_result(lines, board, self._name)
+                self._last_search_result = result
+                return result
 
     def start_search(self, board: chess.Board, go_command_arg: str = "go"):
         if self.is_searching():
             raise RuntimeError(f"{self._name} is already searching")
 
-        self._search_future = self._search_executor.submit(self.get_move, board.copy(), go_command_arg)
+        self._search_future = self._search_executor.submit(
+            self.get_search_result,
+            board.copy(),
+            go_command_arg,
+        )
+
+    def get_last_search_result(self) -> EngineSearchResult | None:
+        return self._last_search_result
+
+    def get_current_search_info(self) -> EngineSearchInfo | None:
+        return self._current_search_info
+
+    def _is_remote(self) -> bool:
+        return isinstance(self._host, EngineCommandTransport)
+
+    def _send_remote_command(
+        self,
+        command: str,
+        info_handler: Callable[[str], None] | None = None,
+    ) -> list[str]:
+        return self._host.execute_engine_command(int(self._name), command, info_handler)
+
+    def _record_info_line(self, line: str) -> None:
+        info = _parse_info_line(line, self._current_search_info)
+        if info is not None:
+            self._current_search_info = info
+
+    def _read_remote_until_token(self, command: str, token: str):
+        lines = self._send_remote_command(command)
+        if token not in lines:
+            raise RuntimeError(f"{self._name} timed out waiting for {token}")
 
     def _send_uci_command(self, command: str):
         process = self._ensure_process()
@@ -83,6 +172,14 @@ class EngineInstance():
             raise RuntimeError(f"{self._name} engine pipe broke while sending {command!r}") from exc
 
     def _ensure_engine_started(self):
+        if self._is_remote():
+            if self._started:
+                return
+            self._send_remote_command("uci")
+            self._read_remote_until_token("isready", "readyok")
+            self._started = True
+            return
+
         with self._io_lock:
             process = self._ensure_process()
             if self._started:
@@ -161,10 +258,23 @@ class EngineInstance():
 
         search_future = self._search_future
         self._search_future = None
-        return search_future.result()
+        result = search_future.result()
+        self._last_search_result = result
+        return result.bestmove
 
     def stop_search(self):
         if self._search_future is None:
+            return
+
+        if self._is_remote():
+            try:
+                self._send_remote_command("stop")
+            except Exception:
+                pass
+            self._search_future.cancel()
+            self._search_executor.shutdown(wait=False, cancel_futures=True)
+            self._search_executor = ThreadPoolExecutor(max_workers=1)
+            self._search_future = None
             return
 
         try:
@@ -206,6 +316,14 @@ class EngineInstance():
                 pass
 
     def close(self):
+        if self._is_remote():
+            try:
+                if self._started:
+                    self._send_remote_command("quit")
+            finally:
+                self._started = False
+            return
+
         process = self._process
         self._search_future = None
         self._search_executor.shutdown(wait=False, cancel_futures=True)
@@ -237,3 +355,91 @@ class EngineInstance():
             self.close()
         except Exception:
             pass
+
+
+def _parse_search_result(
+    lines: list[str],
+    board: chess.Board,
+    engine_name: str,
+) -> EngineSearchResult:
+    bestmove: chess.Move | None = None
+    search_info = EngineSearchInfo()
+
+    for line in lines:
+        info = _parse_info_line(line, search_info)
+        if info is not None:
+            search_info = info
+            continue
+
+        parts = line.split()
+        if parts and parts[0] == "bestmove" and len(parts) >= 2:
+            if parts[1] == "(none)":
+                raise RuntimeError(f"{engine_name} returned invalid bestmove: {line}")
+            try:
+                bestmove = chess.Move.from_uci(parts[1])
+            except ValueError as exc:
+                raise RuntimeError(f"{engine_name} returned malformed bestmove: {line}") from exc
+
+    if bestmove is None:
+        raise RuntimeError(f"{engine_name} did not return bestmove")
+    if bestmove not in board.legal_moves:
+        raise RuntimeError(f"{engine_name} returned illegal bestmove: {bestmove.uci()}")
+
+    return EngineSearchResult(
+        bestmove=bestmove,
+        eval_cp=search_info.eval_cp,
+        eval_mate=search_info.eval_mate,
+        depth=search_info.depth,
+        nodes=search_info.nodes,
+        nps=search_info.nps,
+        time_ms=search_info.time_ms,
+        pv=search_info.pv,
+    )
+
+
+def _parse_info_line(line: str, previous: EngineSearchInfo | None) -> EngineSearchInfo | None:
+    parts = line.split()
+    if not parts or parts[0] != "info":
+        return None
+
+    previous = previous or EngineSearchInfo()
+    eval_cp = previous.eval_cp
+    eval_mate = previous.eval_mate
+    depth = _int_after(parts, "depth", previous.depth)
+    nodes = _int_after(parts, "nodes", previous.nodes)
+    nps = _int_after(parts, "nps", previous.nps)
+    time_ms = _int_after(parts, "time", previous.time_ms) or 0
+    pv = previous.pv
+
+    if "score" in parts:
+        score_index = parts.index("score")
+        if score_index + 2 < len(parts) and parts[score_index + 1] == "cp":
+            eval_cp = int(parts[score_index + 2])
+            eval_mate = None
+        elif score_index + 2 < len(parts) and parts[score_index + 1] == "mate":
+            eval_mate = int(parts[score_index + 2])
+            eval_cp = None
+
+    if "pv" in parts:
+        pv_index = parts.index("pv")
+        if pv_index + 1 < len(parts):
+            pv = " ".join(parts[pv_index + 1 :])
+
+    return EngineSearchInfo(
+        eval_cp=eval_cp,
+        eval_mate=eval_mate,
+        depth=depth,
+        nodes=nodes,
+        nps=nps,
+        time_ms=time_ms,
+        pv=pv,
+    )
+
+
+def _int_after(parts: list[str], key: str, default: int | None) -> int | None:
+    if key not in parts:
+        return default
+    index = parts.index(key)
+    if index + 1 >= len(parts):
+        return default
+    return int(parts[index + 1])

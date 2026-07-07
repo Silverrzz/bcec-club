@@ -1,19 +1,25 @@
 import chess
 import time
+from collections.abc import Callable
 
 from .engine_instance import EngineInstance
 from .game_state import GameState
-from .time_control import TimeControlCategory
+from .time_control import TimeControlCategory, TimeManager, TimeOutError
 from .tournament import Game
 from .uci import go_command
-from .time_control import TimeManager, TimeOutError
 
 
-class GameRunner():
-    def __init__(self, game: Game, clock_probe_interval: float = 0.001):
+class GameRunner:
+    def __init__(
+        self,
+        game: Game,
+        clock_probe_interval: float = 0.001,
+        on_tick: Callable[[chess.Color, int | None], None] | None = None,
+    ):
         self._game = game
         self._clock_probe_interval = clock_probe_interval
         self._game_started = False
+        self._on_tick = on_tick
 
     def get_game(self) -> Game:
         return self._game
@@ -43,7 +49,9 @@ class GameRunner():
 
         try:
             while engine.is_searching():
-                clock.probe_clock()
+                remaining = clock.probe_clock()
+                if self._on_tick is not None:
+                    self._on_tick(side_to_move, remaining)
                 time.sleep(self._clock_probe_interval)
 
             move = engine.get_search_move()

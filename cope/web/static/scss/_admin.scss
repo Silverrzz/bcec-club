@@ -184,33 +184,13 @@ $admin-topbar-height: 46px;
   }
 }
 
+.admin-title-action {
+  margin: 0;
+}
+
 .workers-page {
   display: grid;
   gap: $gap;
-}
-
-.worker-token-panel {
-  display: grid;
-  grid-template-columns: minmax(220px, 0.35fr) minmax(0, 1fr);
-  gap: 16px 24px;
-  align-items: end;
-
-  h2,
-  p {
-    grid-column: 1;
-  }
-}
-
-.worker-token-form {
-  display: grid;
-  grid-template-columns: minmax(220px, 1fr) 180px auto;
-  gap: 14px;
-  align-items: end;
-
-  .field,
-  .form-actions {
-    margin: 0;
-  }
 }
 
 .workers-panel {
@@ -218,45 +198,132 @@ $admin-topbar-height: 46px;
   overflow: hidden;
 }
 
-.worker-list {
-  display: grid;
+.worker-state {
+  font-weight: 600;
+
+  &--connected,
+  &--ready,
+  &--busy,
+  &--consumed,
+  &--active {
+    color: $success;
+  }
+
+  &--minted,
+  &--pending,
+  &--building {
+    color: $warning;
+  }
+
+  &--offline,
+  &--stale,
+  &--expired,
+  &--inactive {
+    color: $muted;
+  }
+
+  &--revoked {
+    color: $danger;
+  }
 }
 
-.worker-card {
-  display: grid;
-  grid-template-columns: 240px minmax(0, 1fr) auto;
-  gap: 24px;
+.worker-table {
+  table-layout: fixed;
+
+  th,
+  td {
+    vertical-align: top;
+  }
+
+  th:nth-child(1) {
+    width: 210px;
+  }
+
+  th:nth-child(2) {
+    width: 120px;
+  }
+
+  th:nth-child(4),
+  th:nth-child(5) {
+    width: 160px;
+  }
+
+  .badge {
+    white-space: nowrap;
+  }
+}
+
+.worker-row--abnormal {
+  box-shadow: inset 3px 0 0 $danger;
+}
+
+.worker-label-form {
   align-items: center;
-  padding: 16px 18px;
-  border-bottom: 1px solid $line;
 
-  &:last-child {
-    border-bottom: none;
+  .input {
+    max-width: 150px;
   }
 }
 
-.worker-card__main {
-  display: grid;
-  gap: 8px;
-  align-content: center;
+.worker-table__identity,
+.worker-table__work,
+.worker-table__state,
+.worker-table__hardware {
+  min-width: 0;
+
+  > * + * {
+    margin-top: 5px;
+  }
 }
 
-.worker-card__actions {
+.worker-table__primary {
   display: flex;
-  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
 
-  form {
-    margin: 0;
+  a,
+  strong {
+    min-width: 0;
+    overflow-wrap: anywhere;
+    font-weight: 700;
   }
+}
+
+.worker-table__work,
+.worker-table__hardware {
+  span,
+  small,
+  strong {
+    overflow-wrap: anywhere;
+  }
+
+  span,
+  small {
+    color: $muted;
+    font-size: 12px;
+  }
+}
+
+.worker-table__state {
+  span {
+    display: block;
+  }
+}
+
+.worker-table__subtle {
+  color: $muted;
+  font-size: 12px;
 }
 
 .worker-facts {
   display: grid;
-  grid-template-columns: minmax(320px, 1.6fr) 90px 100px minmax(220px, 1fr);
-  gap: 18px;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 12px 18px;
   margin: 0;
 
-  div {
+  > div {
     min-width: 0;
   }
 
@@ -265,14 +332,15 @@ $admin-topbar-height: 46px;
     color: $muted;
     font-size: 11px;
     font-weight: 700;
+    letter-spacing: 0;
     text-transform: uppercase;
-    letter-spacing: 0.05em;
   }
 
   dd {
     margin: 0;
-    color: $text;
+    min-width: 0;
     overflow-wrap: anywhere;
+    color: $text;
   }
 }
 
@@ -300,16 +368,48 @@ $admin-topbar-height: 46px;
     grid-template-columns: 1fr;
   }
 
-  .worker-card {
-    grid-template-columns: 1fr;
-  }
+  .worker-table {
+    display: block;
 
-  .worker-token-panel,
-  .worker-token-form {
-    grid-template-columns: 1fr;
-  }
+    thead {
+      display: none;
+    }
 
-  .worker-facts {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    tbody,
+    tr,
+    td {
+      display: block;
+      width: 100%;
+    }
+
+    tr {
+      padding: 14px 16px;
+      border-bottom: 1px solid $line;
+    }
+
+    td {
+      display: grid;
+      grid-template-columns: 110px minmax(0, 1fr);
+      gap: 12px;
+      padding: 8px 0;
+      border-bottom: none;
+    }
+
+    td::before {
+      content: attr(data-label);
+      color: $muted;
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    .worker-table__identity,
+    .worker-table__work,
+    .worker-table__state,
+    .worker-table__hardware {
+      align-items: start;
+    }
+
   }
 }

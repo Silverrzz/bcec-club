@@ -45,7 +45,7 @@ def decode_message(
     message_type: str,
     data_type: Any,
 ) -> Any:
-    envelope = _decode_envelope(payload)
+    envelope = decode_envelope(payload)
     if envelope.type != message_type:
         raise ProtocolValidationError(
             f"expected {message_type} message, got {envelope.type}"
@@ -57,7 +57,7 @@ def decode_message(
         raise ProtocolValidationError(str(error)) from error
 
 
-def _decode_envelope(payload: str | bytes | bytearray) -> Envelope:
+def decode_envelope(payload: str | bytes | bytearray) -> Envelope:
     try:
         return Envelope.model_validate_json(payload)
     except ValidationError as error:

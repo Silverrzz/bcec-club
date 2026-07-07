@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import sqlite3
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import ValidationError
@@ -83,11 +86,48 @@ TOURNAMENT_ACTIONS: dict[str, dict[str, str]] = {
     "running": {"pause": "paused", "abort": "aborted"},
     "paused": {"resume": "scheduled", "abort": "aborted"},
 }
+CONNECTED_WORKER_STATUSES = {"connected", "building", "ready", "busy"}
+WORKER_RECENT_SECONDS = 60
+
+
+class TournamentEventHub:
+    def __init__(self) -> None:
+        self._subscribers: dict[int, set[asyncio.Queue[None]]] = {}
+        self._live: dict[int, dict[str, Any]] = {}
+
+    def subscribe(self, tournament_id: int) -> asyncio.Queue[None]:
+        queue: asyncio.Queue[None] = asyncio.Queue(maxsize=16)
+        self._subscribers.setdefault(tournament_id, set()).add(queue)
+        return queue
+
+    def unsubscribe(self, tournament_id: int, queue: asyncio.Queue[None]) -> None:
+        queues = self._subscribers.get(tournament_id)
+        if queues is None:
+            return
+        queues.discard(queue)
+        if not queues:
+            self._subscribers.pop(tournament_id, None)
+
+    def publish(self, tournament_id: int, live: dict[str, Any] | None = None) -> None:
+        if live is not None:
+            if live.get("clear"):
+                self._live.pop(tournament_id, None)
+            else:
+                self._live[tournament_id] = live
+        for queue in tuple(self._subscribers.get(tournament_id, ())):
+            if queue.full():
+                with contextlib.suppress(asyncio.QueueEmpty):
+                    queue.get_nowait()
+            queue.put_nowait(None)
+
+    def live(self, tournament_id: int) -> dict[str, Any] | None:
+        return self._live.get(tournament_id)
 
 
 def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> FastAPI:
     app = FastAPI(title="COPE Chess")
     app.state.db_path = Path(db_path)
+    app.state.tournament_events = TournamentEventHub()
     app.mount(
         "/static",
         StaticFiles(directory=str(PACKAGE_DIR / "static")),
@@ -181,6 +221,7 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> FastAPI:
                 "viewer_game": viewer_game,
                 "viewer_moves": viewer_moves,
                 "engine_data": _engine_data(viewer_game, viewer_moves),
+                "clocks": _clock_data(viewer_moves),
                 "standings": _standings(tournament, games, engines),
                 "settings": _settings_view(connection, tournament),
                 "engine_hardware": _engine_hardware_view(connection, tournament),
@@ -188,6 +229,62 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> FastAPI:
                 "opening": _opening_view(connection, viewer_game.opening_id) if viewer_game else None,
             },
         )
+
+    @app.get("/tournaments/{tournament_id}/live.json")
+    def tournament_live_snapshot(
+        tournament_id: int,
+        connection: sqlite3.Connection = Depends(_database),
+    ):
+        tournament = get_tournament(connection, tournament_id)
+        if tournament is None:
+            raise HTTPException(status_code=404, detail="tournament not found")
+
+        return JSONResponse(_tournament_live_payload(connection, tournament))
+
+    @app.get("/tournaments/{tournament_id}/events")
+    async def tournament_events(tournament_id: int, request: Request):
+        hub: TournamentEventHub = request.app.state.tournament_events
+
+        def snapshot() -> dict[str, Any]:
+            connection = connect_database(request.app.state.db_path)
+            try:
+                tournament = get_tournament(connection, tournament_id)
+                if tournament is None:
+                    return {"error": "tournament not found"}
+                live = request.app.state.tournament_events.live(tournament_id)
+                return _tournament_live_payload(connection, tournament, live)
+            finally:
+                connection.close()
+
+        async def stream():
+            queue = hub.subscribe(tournament_id)
+            try:
+                while True:
+                    yield _sse_event("snapshot", snapshot())
+                    with contextlib.suppress(TimeoutError):
+                        await asyncio.wait_for(queue.get(), timeout=15)
+            finally:
+                hub.unsubscribe(tournament_id, queue)
+
+        return StreamingResponse(
+            stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    @app.post("/internal/tournament-events")
+    async def publish_tournament_event(request: Request):
+        if request.client is not None and request.client.host not in {"127.0.0.1", "::1"}:
+            raise HTTPException(status_code=403, detail="local event publisher required")
+
+        payload = await request.json()
+        tournament_id = int(payload["tournament_id"])
+        live = payload.get("live")
+        request.app.state.tournament_events.publish(tournament_id, live)
+        return JSONResponse({"ok": True})
 
     @app.get("/games/{game_id}")
     def game_detail(
@@ -562,6 +659,7 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> FastAPI:
                     name=values["name"],
                     version=values["version"],
                     git_url=values["git_url"],
+                    branch=values["branch"],
                     commit=values["commit"],
                     build_cmd=values["build_cmd"],
                     binary_path=values["binary_path"],
@@ -617,6 +715,7 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> FastAPI:
                     "author": engine.author,
                     "version": engine.version,
                     "git_url": engine.git_url,
+                    "branch": engine.branch,
                     "commit": engine.commit,
                     "build_cmd": engine.build_cmd,
                     "binary_path": engine.binary_path,
@@ -647,6 +746,7 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> FastAPI:
                     name=values["name"],
                     version=values["version"],
                     git_url=values["git_url"],
+                    branch=values["branch"],
                     commit=values["commit"],
                     build_cmd=values["build_cmd"],
                     binary_path=values["binary_path"],
@@ -659,6 +759,7 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> FastAPI:
                     author=values["author"],
                     version=values["version"],
                     git_url=values["git_url"],
+                    branch=values["branch"],
                     commit=values["commit"],
                     build_cmd=values["build_cmd"],
                     binary_path=values["binary_path"],
@@ -1019,7 +1120,32 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> FastAPI:
         return templates.TemplateResponse(
             request,
             "admin/workers.html",
-            _admin_context(request, "workers", workers=list_workers(connection), minted=None),
+            _admin_context(
+                request,
+                "workers",
+                worker_rows=_worker_admin_rows(connection),
+                minted=None,
+            ),
+        )
+
+    @app.get("/admin/workers/{worker_id:int}")
+    def admin_worker_detail(
+        worker_id: int,
+        request: Request,
+        connection: sqlite3.Connection = Depends(_database),
+    ):
+        row = _worker_admin_row(connection, worker_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="worker not found")
+        return templates.TemplateResponse(
+            request,
+            "admin/worker_detail.html",
+            _admin_context(
+                request,
+                "workers",
+                row=row,
+                worker=row["worker"],
+            ),
         )
 
     @app.post("/admin/workers/mint")
@@ -1033,15 +1159,13 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> FastAPI:
         ttl_seconds = int(raw_ttl) if raw_ttl.isdigit() and int(raw_ttl) > 0 else 7200
         minted = mint_worker_token(connection, label=label, ttl_seconds=ttl_seconds)
         connection.commit()
-        # The token is only shown once, so render the page directly instead of
-        # redirecting.
         return templates.TemplateResponse(
             request,
             "admin/workers.html",
             _admin_context(
                 request,
                 "workers",
-                workers=list_workers(connection),
+                worker_rows=_worker_admin_rows(connection),
                 minted=minted,
                 notice="Worker token minted. Copy it now - it will not be shown again.",
             ),
@@ -1060,22 +1184,26 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> FastAPI:
         if label:
             update_worker_label(connection, worker_id, label)
             connection.commit()
+        next_url = _safe_redirect_target(form_value(form, "next"), "/admin/workers")
         return RedirectResponse(
-            url="/admin/workers?notice=" + quote("Worker renamed."),
+            url=f"{next_url}?notice=" + quote("Worker renamed."),
             status_code=303,
         )
 
     @app.post("/admin/workers/{worker_id}/revoke")
-    def admin_revoke_worker(
+    async def admin_revoke_worker(
         worker_id: int,
+        request: Request,
         connection: sqlite3.Connection = Depends(_database),
     ):
         if get_worker(connection, worker_id) is None:
             raise HTTPException(status_code=404, detail="worker not found")
+        form = await read_form(request)
         revoke_worker(connection, worker_id)
         connection.commit()
+        next_url = _safe_redirect_target(form_value(form, "next"), "/admin/workers")
         return RedirectResponse(
-            url="/admin/workers?notice=" + quote("Worker revoked."),
+            url=f"{next_url}?notice=" + quote("Worker revoked."),
             status_code=303,
         )
 
@@ -1180,6 +1308,195 @@ def _admin_context(request: Request, section: str, **extra: Any) -> dict[str, An
     }
     context.update(extra)
     return context
+
+
+def _worker_admin_rows(connection: sqlite3.Connection) -> list[dict[str, Any]]:
+    engines = _engine_names(connection)
+    return [_worker_admin_view(connection, worker, engines) for worker in list_workers(connection)]
+
+
+def _worker_admin_row(connection: sqlite3.Connection, worker_id: int) -> dict[str, Any] | None:
+    worker = get_worker(connection, worker_id)
+    if worker is None:
+        return None
+    return _worker_admin_view(connection, worker, _engine_names(connection))
+
+
+def _worker_admin_view(
+    connection: sqlite3.Connection,
+    worker,
+    engines: dict[int, str],
+) -> dict[str, Any]:
+    effective_status = _worker_effective_status(worker)
+    activity = _worker_activity(connection, worker.id, engines)
+    return {
+        "worker": worker,
+        "status": effective_status,
+        "token": _worker_token_view(worker),
+        "session": _worker_session_view(worker),
+        "machine": _worker_machine_view(worker, effective_status),
+        "work": activity or _worker_idle_activity(worker, effective_status),
+    }
+
+
+def _state_view(status: str, label: str, detail: str) -> dict[str, str]:
+    return {"status": status, "label": label, "detail": detail}
+
+
+def _worker_token_view(worker) -> dict[str, str]:
+    if worker.token_expires_at is None:
+        if worker.status == "revoked":
+            return _state_view("revoked", "Revoked", "Token removed")
+        return _state_view("consumed", "Consumed", "Registration complete")
+
+    expires_at = _parse_utc_datetime(worker.token_expires_at)
+    if expires_at is not None and expires_at <= datetime.now(UTC):
+        return _state_view("expired", "Expired", f"Expired {worker.token_expires_at}")
+
+    return _state_view("minted", "Minted", f"Expires {worker.token_expires_at}")
+
+
+def _worker_session_view(worker) -> dict[str, str]:
+    if worker.session_id:
+        return _state_view("active", "Issued", _short_secret(worker.session_id))
+    if worker.status == "minted":
+        return _state_view("pending", "None", "Waiting for token use")
+    return _state_view("inactive", "None", "No reconnect session")
+
+
+def _worker_effective_status(worker) -> str:
+    if worker.status in CONNECTED_WORKER_STATUSES and not _worker_seen_recently(worker):
+        return "stale"
+    return worker.status
+
+
+def _worker_seen_recently(worker) -> bool:
+    if worker.last_seen is None:
+        return False
+    last_seen = _parse_utc_datetime(worker.last_seen)
+    if last_seen is None:
+        return False
+    age = datetime.now(UTC) - last_seen
+    return 0 <= age.total_seconds() <= WORKER_RECENT_SECONDS
+
+
+def _worker_machine_view(worker, effective_status: str) -> dict[str, str]:
+    seen_detail = f"Last worker event {worker.last_seen or 'unknown'}"
+    if effective_status in CONNECTED_WORKER_STATUSES:
+        return _state_view(effective_status, "Connected", seen_detail)
+    states = {
+        "stale": ("No active connection", seen_detail),
+        "offline": ("Offline", f"Disconnected {worker.last_seen or 'unknown'}"),
+        "minted": ("Not registered", "No machine yet"),
+        "revoked": ("Revoked", "Cannot reconnect"),
+    }
+    label, detail = states.get(effective_status, (effective_status.title(), worker.last_seen or ""))
+    return _state_view(effective_status, label, detail)
+
+
+def _worker_activity(
+    connection: sqlite3.Connection,
+    worker_id: int,
+    engines: dict[int, str],
+) -> dict[str, Any] | None:
+    row = connection.execute(
+        """
+        SELECT
+          game_assignments.status AS assignment_status,
+          games.id AS game_id,
+          games.round,
+          games.white_engine_id,
+          games.black_engine_id,
+          tournaments.id AS tournament_id,
+          tournaments.name AS tournament_name,
+          COUNT(moves.ply) AS plies
+        FROM game_assignments
+        JOIN games ON games.id = game_assignments.game_id
+        JOIN tournaments ON tournaments.id = games.tournament_id
+        LEFT JOIN moves ON moves.game_id = games.id
+        WHERE (game_assignments.white_worker_id = ? OR game_assignments.black_worker_id = ?)
+          AND game_assignments.status IN ('assigned', 'acked', 'live')
+          AND games.status IN ('assigned', 'live')
+        GROUP BY game_assignments.id
+        ORDER BY game_assignments.sent_at DESC, game_assignments.id DESC
+        LIMIT 1
+        """,
+        (worker_id, worker_id),
+    ).fetchone()
+    if row is None:
+        return None
+
+    status = row["assignment_status"]
+    verb = "Playing" if status == "live" else "Assigned"
+    white = engines.get(row["white_engine_id"], f"Engine {row['white_engine_id']}")
+    black = engines.get(row["black_engine_id"], f"Engine {row['black_engine_id']}")
+    return _activity_view(
+        status,
+        verb,
+        f"Game #{row['game_id']} in round {row['round']}",
+        f"{row['tournament_name']}: {white} vs {black}",
+        href=f"/admin/tournaments/{row['tournament_id']}",
+        meta=f"{row['plies']} plies recorded",
+    )
+
+
+def _worker_idle_activity(worker, effective_status: str) -> dict[str, Any]:
+    states = {
+        "minted": ("pending", "Awaiting registration", "Token has not been used", "No worker process has connected with this token.", False),
+        "ready": ("ready", "Idle", "Waiting for an eligible game", "The worker server is polling for tournament work.", False),
+        "connected": ("connected", "Connected", "Preparing to accept work", "The machine is connected but has not started a game.", False),
+        "building": ("building", "Building", "Preparing to accept work", "The machine is connected but has not started a game.", False),
+        "stale": ("stale", "Stale", "No active machine connection", "The worker has not reported a recent connection event.", True),
+        "busy": ("busy", "Busy", "Marked busy with no active assignment", "This can indicate a stale worker state after an interruption.", True),
+        "offline": ("offline", "Offline", "Worker process is not connected", "The reconnect session remains issued unless the worker is revoked.", bool(worker.session_id)),
+        "revoked": ("revoked", "Revoked", "Worker cannot reconnect", "Token and session credentials have been removed.", False),
+    }
+    if effective_status in states:
+        status, label, summary, detail, abnormal = states[effective_status]
+        return _activity_view(status, label, summary, detail, abnormal=abnormal)
+    return _activity_view(
+        effective_status,
+        effective_status.title(),
+        "No active assignment",
+        "",
+    )
+
+
+def _activity_view(
+    status: str,
+    label: str,
+    summary: str,
+    detail: str,
+    *,
+    href: str = "",
+    meta: str = "",
+    abnormal: bool = False,
+) -> dict[str, Any]:
+    return {
+        "status": status,
+        "label": label,
+        "summary": summary,
+        "detail": detail,
+        "meta": meta,
+        "href": href,
+        "abnormal": abnormal,
+    }
+
+
+def _parse_utc_datetime(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _short_secret(value: str) -> str:
+    if len(value) <= 12:
+        return value
+    return f"{value[:6]}...{value[-6:]}"
 
 
 def _tournament_form_context(
@@ -1287,6 +1604,7 @@ def _engine_form_values(
         "author": form_value(form, "author"),
         "version": form_value(form, "version"),
         "git_url": form_value(form, "git_url"),
+        "branch": form_value(form, "branch"),
         "commit": form_value(form, "commit").lower(),
         "build_cmd": form_value(form, "build_cmd"),
         "binary_path": form_value(form, "binary_path"),
@@ -1450,19 +1768,17 @@ def _upcoming_rows(
     pending_games = _upcoming_games(connection, limit=limit)
     tournament_names = _tournament_names(connection)
     rows: list[dict[str, str]] = []
-    active_tournament_ids = {game.tournament_id for game in _active_games(connection)}
     for tournament in list_tournaments(connection):
-        if tournament.status not in {"scheduled", "paused"}:
+        if tournament.status not in {"scheduled", "running", "paused"}:
             continue
-        if tournament.id in active_tournament_ids:
-            continue
+        summary = _summarize_games(list_games(connection, tournament.id))
         rows.append(
             {
                 "href": f"/tournaments/{tournament.id}",
                 "tournament": tournament.name,
-                "round": "-",
+                "round": str(tournament.current_round or "-"),
                 "white": "Tournament page",
-                "black": "-",
+                "black": f"{summary['finished']} / {summary['total']} complete",
                 "status": tournament.status,
             }
         )
@@ -1496,11 +1812,140 @@ def _upcoming_games(connection: sqlite3.Connection, *, limit: int) -> tuple[Game
 
 
 def _tournament_viewer_game(games: tuple[GameRecord, ...]) -> GameRecord | None:
-    for status in ("live", "assigned", "pending", "finished"):
+    for status in ("live", "assigned", "pending"):
         for game in games:
             if game.status == status:
                 return game
-    return games[0] if games else None
+    return None
+
+
+def _game_payload(
+    game: GameRecord,
+    engines: dict[int, str],
+    *,
+    live: bool = False,
+) -> dict[str, Any]:
+    payload = {
+        "id": game.id,
+        "round": game.round,
+        "status": game.status,
+        "result": game.result,
+        "white_name": engines.get(game.white_engine_id, f"Engine {game.white_engine_id}"),
+        "black_name": engines.get(game.black_engine_id, f"Engine {game.black_engine_id}"),
+    }
+    if live:
+        payload.update(
+            {
+                "termination": game.termination,
+                "white_engine_id": game.white_engine_id,
+                "black_engine_id": game.black_engine_id,
+            }
+        )
+    return payload
+
+
+def _move_payload(move: MoveRecord) -> dict[str, Any]:
+    return {
+        "ply": move.ply,
+        "uci": move.uci,
+        "san": move.san,
+        "eval_cp": move.eval_cp,
+        "eval_mate": move.eval_mate,
+        "depth": move.depth,
+        "nodes": move.nodes,
+        "time_ms": move.time_ms,
+        "clock_after_ms": move.clock_after_ms,
+    }
+
+
+def _tournament_live_payload(
+    connection: sqlite3.Connection,
+    tournament: TournamentRecord,
+    live: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    engines = _engine_names(connection)
+    games = list_games(connection, tournament.id)
+    viewer_game = _tournament_viewer_game(games)
+    viewer_moves = list_moves(connection, viewer_game.id) if viewer_game else ()
+    opening = _opening_view(connection, viewer_game.opening_id) if viewer_game else None
+    engine_data = _engine_data(viewer_game, viewer_moves)
+    clocks = _clock_data(viewer_moves)
+    if live is not None and viewer_game is not None and live.get("game_id") == viewer_game.id:
+        engine_data = _merge_engine_data(engine_data, live.get("engine_data"))
+        clocks = _merge_clock_data(clocks, live.get("clocks"))
+    return {
+        "tournament": {
+            "id": tournament.id,
+            "status": tournament.status,
+            "current_round": tournament.current_round,
+        },
+        "game": _game_payload(viewer_game, engines, live=True) if viewer_game else None,
+        "opening": opening or {"name": "Start position", "fen": "startpos"},
+        "moves": [_move_payload(move) for move in viewer_moves],
+        "engine_data": engine_data,
+        "clocks": clocks,
+        "standings": _standings(tournament, games, engines),
+        "games": [_game_payload(game, engines) for game in games],
+    }
+
+
+def _merge_engine_data(
+    engine_data: dict[str, dict[str, str]],
+    live_data: Any,
+) -> dict[str, dict[str, str]]:
+    if not isinstance(live_data, dict):
+        return engine_data
+    merged = {
+        "white": dict(engine_data["white"]),
+        "black": dict(engine_data["black"]),
+    }
+    for side in ("white", "black"):
+        if isinstance(live_data.get(side), dict):
+            merged[side].update(
+                {
+                    key: str(value)
+                    for key, value in live_data[side].items()
+                    if key in {"depth", "nps", "nodes", "eval", "pv"}
+                }
+            )
+    return merged
+
+
+def _merge_clock_data(
+    clocks: dict[str, str],
+    live_clocks: Any,
+) -> dict[str, str]:
+    if not isinstance(live_clocks, dict):
+        return clocks
+    merged = dict(clocks)
+    for side in ("white", "black"):
+        if side in live_clocks:
+            merged[side] = _clock_label(live_clocks[side])
+    return merged
+
+
+def _clock_data(moves: tuple[MoveRecord, ...]) -> dict[str, str]:
+    clocks = {"white": "--:--", "black": "--:--"}
+    for move in moves:
+        side = "white" if move.ply % 2 == 1 else "black"
+        clocks[side] = _clock_label(move.clock_after_ms)
+    return clocks
+
+
+def _clock_label(value: Any) -> str:
+    if value is None:
+        return "--:--"
+    try:
+        milliseconds = max(0, int(value))
+    except (TypeError, ValueError):
+        return "--:--"
+    total_seconds = milliseconds // 1000
+    minutes, seconds = divmod(total_seconds, 60)
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def _sse_event(event: str, data: dict[str, Any]) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, separators=(',', ':'))}\n\n"
 
 
 def _engine_data(
@@ -1790,6 +2235,7 @@ def _engine_spec_from_row(row: sqlite3.Row) -> EngineSpec:
         engine_id=row["id"],
         name=row["name"],
         git_url=row["git_url"],
+        branch=row["branch"],
         commit=row["commit_hash"],
         build_cmd=row["build_cmd"],
         binary_path=row["binary_path"],

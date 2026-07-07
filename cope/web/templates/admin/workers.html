@@ -6,13 +6,17 @@
 {% block content %}
   <header class="admin-page-title">
     <h1>Workers</h1>
+    <form class="admin-title-action" method="post" action="/admin/workers/mint">
+      <input type="hidden" name="ttl_seconds" value="7200">
+      <button class="button" type="submit">New worker</button>
+    </form>
   </header>
 
   {{ flash(notice, error, errors) }}
 
   {% if minted %}
     <section class="panel panel--highlight">
-      <h2>New worker token</h2>
+      <h2>Worker registration token</h2>
       <p>Worker <strong>#{{ minted.worker_id }}</strong> &middot; expires {{ minted.expires_at }}</p>
       <pre class="token-block">{{ minted.token }}</pre>
       <p class="field-help">Start the worker with:
@@ -21,73 +25,58 @@
   {% endif %}
 
   <div class="workers-page">
-    <section class="panel worker-token-panel">
-      <h2>Mint worker token</h2>
-      <p class="field-help">A worker uses this one-time token to register itself with the runner.</p>
-      <form class="worker-token-form" method="post" action="/admin/workers/mint">
-        <div class="field">
-          <label for="label">Label</label>
-          <input class="input" id="label" name="label" required placeholder="e.g. basement-ryzen">
-        </div>
-        <div class="field">
-          <label for="ttl_seconds">Token lifetime (seconds)</label>
-          <input class="input input--small" id="ttl_seconds" type="number" min="60" name="ttl_seconds" value="7200">
-        </div>
-        <div class="form-actions">
-          <button class="button button--primary" type="submit">Mint token</button>
-        </div>
-      </form>
-    </section>
-
     <section class="panel workers-panel">
-      {% if workers %}
-        <div class="worker-list">
-          {% for worker in workers %}
-            <article class="worker-card">
-              <div class="worker-card__main">
-                <form class="rename-form" method="post" action="/admin/workers/{{ worker.id }}/label">
-                  <input class="input input--inline" name="label" value="{{ worker.label }}" aria-label="Worker label">
-                  <button class="button button--small button--ghost" type="submit" title="Rename">&#10003;</button>
-                </form>
-                {{ status_badge(worker.status) }}
-              </div>
-
-              <dl class="worker-facts">
-                <div>
-                  <dt>CPU</dt>
-                  <dd>{% if worker.hw %}{{ worker.hw.cpu_model }}{% else %}-{% endif %}</dd>
-                </div>
-                <div>
-                  <dt>Cores</dt>
-                  <dd>{% if worker.hw %}{{ worker.hw.physical_cores }}{% else %}-{% endif %}</dd>
-                </div>
-                <div>
-                  <dt>RAM</dt>
-                  <dd>{% if worker.hw %}{{ worker.hw.ram_gb }}GB{% else %}-{% endif %}</dd>
-                </div>
-                <div>
-                  <dt>Last seen</dt>
-                  <dd>{{ worker.last_seen or "never" }}</dd>
-                </div>
-              </dl>
-
-              <div class="worker-card__actions">
-                {% if worker.status != "revoked" %}
-                  <form method="post" action="/admin/workers/{{ worker.id }}/revoke">
-                    <button class="button button--small" type="submit"
-                            data-confirm="Revoke worker '{{ worker.label }}'? It will not be able to reconnect.">Revoke</button>
+      {% if worker_rows %}
+        <table class="data-table worker-table">
+          <thead>
+            <tr>
+              <th>Worker</th>
+              <th>Status</th>
+              <th>Work</th>
+              <th>Machine</th>
+              <th>Hardware</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in worker_rows %}
+              {% set worker = row.worker %}
+              <tr class="{% if row.work.abnormal %}worker-row--abnormal{% endif %}" data-href="/admin/workers/{{ worker.id }}">
+                <td class="worker-table__identity" data-label="Worker">
+                  <form class="rename-form worker-label-form" method="post" action="/admin/workers/{{ worker.id }}/label">
+                    <input class="input input--inline" name="label" value="{{ worker.label }}" aria-label="Worker label">
+                    <button class="button button--small button--ghost" type="submit" title="Rename">&#10003;</button>
                   </form>
-                {% endif %}
-                <form method="post" action="/admin/workers/{{ worker.id }}/delete">
-                  <button class="button button--small button--danger" type="submit"
-                          data-confirm="Delete worker '{{ worker.label }}'?">Delete</button>
-                </form>
-              </div>
-            </article>
-          {% endfor %}
-        </div>
+                  <a class="worker-table__subtle" href="/admin/workers/{{ worker.id }}">#{{ worker.id }}</a>
+                </td>
+                <td data-label="Status">{{ status_badge(row.status) }}</td>
+                <td class="worker-table__work" data-label="Work">
+                  <div class="worker-table__primary">
+                    {% if row.work.href %}
+                      <a href="{{ row.work.href }}">{{ row.work.summary }}</a>
+                    {% else %}
+                      <strong>{{ row.work.summary }}</strong>
+                    {% endif %}
+                  </div>
+                  <span>{{ row.work.detail }}</span>
+                  {% if row.work.meta %}<small>{{ row.work.meta }}</small>{% endif %}
+                </td>
+                <td class="worker-table__state" data-label="Machine">
+                  <span class="worker-state worker-state--{{ row.machine.status }}">{{ row.machine.label }}</span>
+                </td>
+                <td class="worker-table__hardware" data-label="Hardware">
+                  {% if worker.hw %}
+                    <strong>{{ worker.hw.physical_cores }} cores</strong>
+                    <small>{{ worker.hw.ram_gb }}GB RAM</small>
+                  {% else %}
+                    <span class="worker-table__subtle">Not reported</span>
+                  {% endif %}
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
       {% else %}
-        <p class="empty">No workers yet. Mint a token to register one.</p>
+        <p class="empty">No workers yet. Use New worker to create a registration token.</p>
       {% endif %}
     </section>
   </div>

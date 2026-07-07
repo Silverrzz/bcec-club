@@ -39,6 +39,7 @@ $status-colors: (
   "ready": $success,
   "busy": $link,
   "offline": $muted,
+  "stale": $muted,
   "revoked": $danger,
   "applied": $success,
   "claimed": $warning,

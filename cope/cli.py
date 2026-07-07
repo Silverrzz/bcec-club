@@ -2,13 +2,22 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import os
 from pathlib import Path
 
 from .prototype import run_prototype_tournament
 
 
+LOG = logging.getLogger("cope.cli")
+
+
 def main(argv: list[str] | None = None) -> int:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
     parser = argparse.ArgumentParser(prog="python -m cope")
     subparsers = parser.add_subparsers(dest="role", required=True)
 
@@ -76,6 +85,17 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="run the in-memory prototype tournament",
     )
+    runner_parser.add_argument(
+        "--poll-interval-s",
+        type=float,
+        default=2.0,
+        help="seconds to wait between idle tournament scans",
+    )
+    runner_parser.add_argument(
+        "--once",
+        action="store_true",
+        help="run one scheduler/execution pass and exit",
+    )
 
     worker_parser = subparsers.add_parser("worker", help="start a worker client")
     worker_parser.add_argument("--server-url", default="ws://127.0.0.1:8702/worker")
@@ -128,8 +148,13 @@ def main(argv: list[str] | None = None) -> int:
                 port=args.worker_port,
                 db_path=args.db_path,
                 expected_app_commit=args.app_commit,
+                assignment_poll_interval_s=args.poll_interval_s,
             )
-            asyncio.run(run_worker_server(config))
+            try:
+                asyncio.run(run_worker_server(config))
+            except KeyboardInterrupt:
+                LOG.info("runner stopped")
+                return 130
             return 0
 
         if args.prototype:
@@ -137,32 +162,39 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         from .db import connect_database, initialize_database
-        from .runner import prepare_scheduled_tournaments
+        from .runner import (
+            RunnerServiceConfig,
+            print_runner_report,
+            run_tournament_matches,
+            run_tournament_service,
+        )
 
         db_path = Path(args.db_path)
         initialize_database(db_path)
+        if not args.once:
+            config = RunnerServiceConfig(
+                db_path=db_path,
+                poll_interval_s=args.poll_interval_s,
+            )
+            try:
+                run_tournament_service(config)
+            except KeyboardInterrupt:
+                LOG.info("runner stopped")
+                return 130
+            return 0
+
         connection = connect_database(db_path)
         try:
-            prepared = prepare_scheduled_tournaments(connection)
-            connection.commit()
+            report = run_tournament_matches(connection)
         finally:
             connection.close()
 
-        if not prepared:
-            print("no scheduled tournaments to prepare")
+        print_runner_report(report)
+
+        if not report.prepared and report.tournaments_finished == 0 and not report.errors:
+            LOG.info("no scheduled tournaments to prepare")
             return 0
 
-        for result in prepared:
-            if result.skipped_reason is None:
-                print(
-                    f"prepared tournament {result.tournament_id} "
-                    f"({result.tournament_name}): {result.created_games} games"
-                )
-            else:
-                print(
-                    f"skipped tournament {result.tournament_id} "
-                    f"({result.tournament_name}): {result.skipped_reason}"
-                )
         return 0
 
     if args.role == "web":
