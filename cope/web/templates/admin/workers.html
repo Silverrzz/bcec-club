@@ -6,41 +6,32 @@
 {% block content %}
   <header class="admin-page-title">
     <h1>Workers</h1>
-    <form class="admin-title-action" method="post" action="/admin/workers/mint">
-      <input type="hidden" name="ttl_seconds" value="7200">
+    <form class="admin-title-action" method="post" action="/admin/workers">
       <button class="button" type="submit">New worker</button>
     </form>
   </header>
 
   {{ flash(notice, error, errors) }}
 
-  {% if minted %}
-    <section class="panel panel--highlight">
-      <h2>Worker registration token</h2>
-      <p>Worker <strong>#{{ minted.worker_id }}</strong> &middot; expires {{ minted.expires_at }}</p>
-      <pre class="token-block">{{ minted.token }}</pre>
-      <p class="field-help">Start the worker with:
-        <code>cope worker --token {{ minted.token }}</code></p>
-    </section>
-  {% endif %}
-
   <div class="workers-page">
-    <section class="panel workers-panel">
+    <section class="panel workers-panel" data-worker-monitor>
       {% if worker_rows %}
         <table class="data-table worker-table">
           <thead>
             <tr>
               <th>Worker</th>
               <th>Status</th>
-              <th>Work</th>
+              <th>Doing</th>
               <th>Machine</th>
-              <th>Hardware</th>
+              <th>Cores</th>
+              <th>Memory</th>
+              <th class="col-actions"></th>
             </tr>
           </thead>
-          <tbody>
+          <tbody data-worker-rows>
             {% for row in worker_rows %}
               {% set worker = row.worker %}
-              <tr class="{% if row.work.abnormal %}worker-row--abnormal{% endif %}" data-href="/admin/workers/{{ worker.id }}">
+              <tr class="{% if row.work.abnormal %}worker-row--abnormal{% endif %}" data-worker-row="{{ worker.id }}" data-href="/admin/workers/{{ worker.id }}">
                 <td class="worker-table__identity" data-label="Worker">
                   <form class="rename-form worker-label-form" method="post" action="/admin/workers/{{ worker.id }}/label">
                     <input class="input input--inline" name="label" value="{{ worker.label }}" aria-label="Worker label">
@@ -48,28 +39,41 @@
                   </form>
                   <a class="worker-table__subtle" href="/admin/workers/{{ worker.id }}">#{{ worker.id }}</a>
                 </td>
-                <td data-label="Status">{{ status_badge(row.status) }}</td>
-                <td class="worker-table__work" data-label="Work">
-                  <div class="worker-table__primary">
+                <td data-label="Status" data-worker-status>{{ status_badge(row.status) }}</td>
+                <td class="worker-table__work" data-label="Doing" data-worker-work>
+                  <div class="worker-table__primary" data-worker-work-summary>
+                    <span class="worker-state worker-state--{{ row.work.status }}" data-worker-work-label>{{ row.work.label }}</span>
                     {% if row.work.href %}
                       <a href="{{ row.work.href }}">{{ row.work.summary }}</a>
                     {% else %}
                       <strong>{{ row.work.summary }}</strong>
                     {% endif %}
                   </div>
-                  <span>{{ row.work.detail }}</span>
-                  {% if row.work.meta %}<small>{{ row.work.meta }}</small>{% endif %}
+                  <span data-worker-work-detail>{{ row.work.detail }}</span>
+                  <small data-worker-work-meta {% if not row.work.meta %}hidden{% endif %}>{{ row.work.meta }}</small>
                 </td>
                 <td class="worker-table__state" data-label="Machine">
-                  <span class="worker-state worker-state--{{ row.machine.status }}">{{ row.machine.label }}</span>
+                  <span class="worker-state worker-state--{{ row.machine.status }}" data-worker-machine>{{ row.machine.label }}</span>
                 </td>
-                <td class="worker-table__hardware" data-label="Hardware">
+                <td class="worker-table__cores" data-label="Cores" data-worker-cores>
                   {% if worker.hw %}
-                    <strong>{{ worker.hw.physical_cores }} cores</strong>
-                    <small>{{ worker.hw.ram_gb }}GB RAM</small>
+                    <strong>{{ worker.hw.physical_cores }}</strong>
                   {% else %}
-                    <span class="worker-table__subtle">Not reported</span>
+                    <span class="worker-table__subtle">-</span>
                   {% endif %}
+                </td>
+                <td class="worker-table__memory" data-label="Memory" data-worker-memory>
+                  {% if worker.hw %}
+                    <strong>{{ worker.hw.ram_gb }}GB</strong>
+                  {% else %}
+                    <span class="worker-table__subtle">-</span>
+                  {% endif %}
+                </td>
+                <td class="col-actions worker-table__actions" data-label="Actions">
+                  <form method="post" action="/admin/workers/{{ worker.id }}/delete">
+                    <button class="button button--small button--danger" type="submit"
+                            data-confirm="Delete worker '{{ worker.label }}'?">Delete</button>
+                  </form>
                 </td>
               </tr>
             {% endfor %}

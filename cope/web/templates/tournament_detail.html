@@ -4,13 +4,14 @@
 {% block title %}{{ tournament.name }} - COPE Chess{% endblock %}
 
 {% block content %}
-  {% set empty_engine = {"eval": "-", "depth": "-", "nodes": "-", "nps": "-", "pv": "not recorded"} %}
+  {% set empty_engine = {"eval": "-", "depth": "-", "nodes": "-", "nps": "-", "info": "not recorded", "pv": "not recorded"} %}
   {% set black_data = engine_data.black if engine_data is defined and engine_data.black is defined else empty_engine %}
   {% set white_data = engine_data.white if engine_data is defined and engine_data.white is defined else empty_engine %}
   {% set clock_data = clocks if clocks is defined else {"white": "--:--", "black": "--:--"} %}
   {% set chat_message_list = chat_messages if chat_messages is defined else [] %}
   {% set opening_info = opening if opening is defined and opening else {"name": "Start position", "fen": "startpos"} %}
-  <section class="arena" data-tournament-live data-tournament-id="{{ tournament.id }}">
+  <section class="arena" data-tournament-live data-tournament-id="{{ tournament.id }}" {% if viewer_locked %}data-viewer-locked="true"{% endif %}>
+    <script type="application/json" data-viewer-moves>{{ viewer_move_payloads | tojson }}</script>
     <div class="arena__grid">
       <div class="arena__analysis">
         <article class="engine-console engine-console--black">
@@ -30,10 +31,10 @@
               <div><dt>Depth</dt><dd data-live-black-depth>{{ black_data.depth }}</dd></div>
               <div><dt>Nodes</dt><dd data-live-black-nodes>{{ black_data.nodes }}</dd></div>
               <div><dt>NPS</dt><dd data-live-black-nps>{{ black_data.nps }}</dd></div>
-              <div class="engine-console__feature-item--pv"><dt>PV</dt><dd data-live-black-pv>{{ black_data.pv }}</dd></div>
+              <div class="engine-console__feature-item--pv"><dt>Info</dt><dd data-live-black-info>{{ black_data.info }}</dd></div>
             </dl>
           </div>
-          <div class="engine-console__pv-board board-shell board-shell--pv" data-board data-fen="{{ opening_info.fen }}" data-moves="">
+          <div class="engine-console__pv-board board-shell board-shell--pv" data-board data-live-black-pv-board data-fen="{{ opening_info.fen }}" data-moves="">
             <div class="board board--pv" data-board-grid></div>
           </div>
           <section class="engine-console__eval-card" aria-label="Black evaluation">
@@ -59,10 +60,10 @@
               <div><dt>Depth</dt><dd data-live-white-depth>{{ white_data.depth }}</dd></div>
               <div><dt>Nodes</dt><dd data-live-white-nodes>{{ white_data.nodes }}</dd></div>
               <div><dt>NPS</dt><dd data-live-white-nps>{{ white_data.nps }}</dd></div>
-              <div class="engine-console__feature-item--pv"><dt>PV</dt><dd data-live-white-pv>{{ white_data.pv }}</dd></div>
+              <div class="engine-console__feature-item--pv"><dt>Info</dt><dd data-live-white-info>{{ white_data.info }}</dd></div>
             </dl>
           </div>
-          <div class="engine-console__pv-board board-shell board-shell--pv" data-board data-fen="{{ opening_info.fen }}" data-moves="">
+          <div class="engine-console__pv-board board-shell board-shell--pv" data-board data-live-white-pv-board data-fen="{{ opening_info.fen }}" data-moves="">
             <div class="board board--pv" data-board-grid></div>
           </div>
           <section class="engine-console__eval-card" aria-label="White evaluation">
@@ -76,12 +77,17 @@
         <section class="board-shell board-shell--arena" data-board data-live-board data-game-id="{{ viewer_game.id if viewer_game else '' }}" data-board-coordinates="true" data-fen="{{ opening_info.fen }}" data-moves="{{ viewer_moves | map(attribute='uci') | join(' ') if viewer_game else '' }}">
           <div class="board" data-board-grid></div>
           <div class="board-footer">
-            <div class="board-controls">
-              <button type="button" class="button button--ghost" data-board-first title="First move">&#8676;</button>
-              <button type="button" class="button button--ghost" data-board-prev title="Previous move">&#8592;</button>
-              <span class="board-controls__status" data-board-status></span>
-              <button type="button" class="button button--ghost" data-board-next title="Next move">&#8594;</button>
-              <button type="button" class="button button--ghost" data-board-last title="Last move">&#8677;</button>
+            <div class="board-footer__primary">
+              <div class="board-controls">
+                <button type="button" class="button button--ghost" data-board-first title="First move">&#8676;</button>
+                <button type="button" class="button button--ghost" data-board-prev title="Previous move">&#8592;</button>
+                <span class="board-controls__status" data-board-status></span>
+                <button type="button" class="button button--ghost" data-board-next title="Next move">&#8594;</button>
+                <button type="button" class="button button--ghost" data-board-last title="Last move">&#8677;</button>
+              </div>
+              <div class="board-material" data-material-counters aria-label="Material count">
+                <span>Material</span>
+              </div>
             </div>
             <div class="board-meta">
               <button type="button" data-live-opening data-copy="{{ opening_info.name }}{% if opening_info.fen != 'startpos' %} | {{ opening_info.fen }}{% endif %}">
@@ -106,10 +112,10 @@
               <p class="muted">No chat.</p>
             {% endfor %}
           </div>
-          <form class="arena-chat__form" method="post" action="/chat" data-chat-form>
+          <form class="arena-chat__form" method="post" action="/chat" autocomplete="off" data-chat-form>
             <input type="hidden" name="next" value="/tournaments/{{ tournament.id }}#chat">
-            <input class="input" type="text" name="display_name" maxlength="40" placeholder="Name" data-chat-display-name>
-            <input class="input" type="text" name="text" maxlength="500" placeholder="Message" required>
+            <input class="input" type="text" name="display_name" maxlength="40" placeholder="Name" autocomplete="off" data-chat-display-name>
+            <input class="input" type="text" name="text" maxlength="500" placeholder="Message" autocomplete="off" required>
             <button class="button" type="submit">Send</button>
           </form>
         </section>

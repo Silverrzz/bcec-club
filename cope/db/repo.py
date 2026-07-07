@@ -67,6 +67,9 @@ class MoveRecord:
     eval_mate: int | None
     depth: int | None
     nodes: int | None
+    nps: int | None
+    pv: str | None
+    info_line: str | None
     time_ms: int
     clock_after_ms: int
 
@@ -481,6 +484,58 @@ def set_tournament_status(
         f"UPDATE tournaments SET status = ?{started_at_sql}{finished_at_sql} WHERE id = ?",
         params,
     )
+    if status == "aborted":
+        _abandon_tournament_games(connection, tournament_id, now)
+
+
+def set_tournament_current_round_at_least(
+    connection: sqlite3.Connection,
+    tournament_id: int,
+    round_number: int,
+) -> None:
+    connection.execute(
+        """
+        UPDATE tournaments
+        SET current_round = ?
+        WHERE id = ? AND current_round < ?
+        """,
+        (round_number, tournament_id, round_number),
+    )
+
+
+def _abandon_tournament_games(
+    connection: sqlite3.Connection,
+    tournament_id: int,
+    now: str,
+) -> None:
+    reason = "tournament aborted"
+    connection.execute(
+        """
+        UPDATE game_assignments
+        SET status = 'abandoned',
+            finished_at = COALESCE(finished_at, ?),
+            last_error = COALESCE(last_error, ?)
+        WHERE status IN ('assigned', 'acked', 'live')
+          AND game_id IN (
+            SELECT id
+            FROM games
+            WHERE tournament_id = ?
+              AND status != 'finished'
+          )
+        """,
+        (now, reason, tournament_id),
+    )
+    connection.execute(
+        """
+        UPDATE games
+        SET status = 'abandoned',
+            termination = COALESCE(termination, ?),
+            finished_at = COALESCE(finished_at, ?)
+        WHERE tournament_id = ?
+          AND status != 'finished'
+        """,
+        (reason, now, tournament_id),
+    )
 
 
 def update_tournament(
@@ -649,6 +704,9 @@ def record_move(
     eval_mate: int | None = None,
     depth: int | None = None,
     nodes: int | None = None,
+    nps: int | None = None,
+    pv: str | None = None,
+    info_line: str | None = None,
     time_ms: int = 0,
     clock_after_ms: int = 0,
 ) -> None:
@@ -656,9 +714,9 @@ def record_move(
         """
         INSERT INTO moves (
           game_id, ply, uci, san, is_book, eval_cp, eval_mate, depth,
-          nodes, time_ms, clock_after_ms
+          nodes, nps, pv, info_line, time_ms, clock_after_ms
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             game_id,
@@ -670,6 +728,9 @@ def record_move(
             eval_mate,
             depth,
             nodes,
+            nps,
+            pv,
+            info_line,
             time_ms,
             clock_after_ms,
         ),
@@ -841,10 +902,39 @@ def fail_game_assignment(
     )
 
 
+def create_worker(
+    connection: sqlite3.Connection,
+    *,
+    label: str,
+) -> int:
+    cursor = connection.execute(
+        """
+        INSERT INTO workers (label, status)
+        VALUES (?, 'minted')
+        """,
+        (label,),
+    )
+    return int(cursor.lastrowid)
+
+
 def mint_worker_token(
     connection: sqlite3.Connection,
     *,
     label: str,
+    ttl_seconds: int = 7200,
+) -> WorkerToken:
+    worker_id = create_worker(connection, label=label)
+    return mint_worker_token_for_worker(
+        connection,
+        worker_id=worker_id,
+        ttl_seconds=ttl_seconds,
+    )
+
+
+def mint_worker_token_for_worker(
+    connection: sqlite3.Connection,
+    *,
+    worker_id: int,
     ttl_seconds: int = 7200,
 ) -> WorkerToken:
     token = secrets.token_urlsafe(32)
@@ -853,13 +943,20 @@ def mint_worker_token(
     )
     cursor = connection.execute(
         """
-        INSERT INTO workers (label, token_hash, token_expires_at, status)
-        VALUES (?, ?, ?, 'minted')
+        UPDATE workers
+        SET token_hash = ?,
+            token_expires_at = ?,
+            status = 'minted'
+        WHERE id = ?
+          AND status != 'revoked'
+          AND session_id IS NULL
         """,
-        (label, hash_worker_token(token), expires_at),
+        (hash_worker_token(token), expires_at, worker_id),
     )
+    if cursor.rowcount == 0:
+        raise ValueError("worker cannot receive a registration token")
     return WorkerToken(
-        worker_id=int(cursor.lastrowid),
+        worker_id=worker_id,
         token=token,
         expires_at=expires_at,
     )
@@ -936,6 +1033,7 @@ def upsert_worker_connection(
           protocol_version = excluded.protocol_version,
           hw = excluded.hw,
           last_seen = excluded.last_seen
+        WHERE status != 'revoked'
         """,
         (
             worker_id,
@@ -983,25 +1081,151 @@ def update_worker_status(
     connection: sqlite3.Connection,
     worker_id: int,
     status: str,
-) -> None:
-    connection.execute(
+    *,
+    session_id: str | None = None,
+) -> bool:
+    cursor = connection.execute(
         """
         UPDATE workers
         SET status = ?, last_seen = ?
         WHERE id = ? AND status != 'revoked'
+          AND (? IS NULL OR session_id = ?)
         """,
-        (status, utc_now(), worker_id),
+        (status, utc_now(), worker_id, session_id, session_id),
     )
+    return cursor.rowcount > 0
 
 
-def revoke_worker(connection: sqlite3.Connection, worker_id: int) -> None:
+def touch_worker_seen(
+    connection: sqlite3.Connection,
+    worker_id: int,
+    *,
+    session_id: str | None = None,
+) -> bool:
+    cursor = connection.execute(
+        """
+        UPDATE workers
+        SET last_seen = ?
+        WHERE id = ?
+          AND status IN ('connected', 'building', 'ready', 'busy')
+          AND (? IS NULL OR session_id = ?)
+        """,
+        (utc_now(), worker_id, session_id, session_id),
+    )
+    return cursor.rowcount > 0
+
+
+def disconnect_worker(
+    connection: sqlite3.Connection,
+    worker_id: int,
+    *,
+    session_id: str | None = None,
+    reason: str = "worker connection lost",
+) -> tuple[int, ...]:
+    row = connection.execute(
+        "SELECT status, session_id FROM workers WHERE id = ?",
+        (worker_id,),
+    ).fetchone()
+    if row is None or row["status"] == "revoked":
+        return ()
+    if session_id is not None and row["session_id"] != session_id:
+        return ()
+
+    now = utc_now()
+    tournament_ids = _active_worker_tournament_ids(connection, worker_id)
+    _release_worker_active_assignments(
+        connection,
+        worker_id,
+        now=now,
+        reason=reason,
+    )
     connection.execute(
         """
         UPDATE workers
-        SET status = 'revoked', token_hash = NULL, token_expires_at = NULL, session_id = NULL
+        SET status = 'offline', last_seen = ?
+        WHERE id = ? AND status != 'revoked'
+          AND (? IS NULL OR session_id = ?)
+        """,
+        (now, worker_id, session_id, session_id),
+    )
+    return tournament_ids
+
+
+def revoke_worker(connection: sqlite3.Connection, worker_id: int) -> None:
+    now = utc_now()
+    _release_worker_active_assignments(
+        connection,
+        worker_id,
+        now=now,
+        reason="worker revoked",
+    )
+    connection.execute(
+        """
+        UPDATE workers
+        SET status = 'revoked',
+            token_hash = NULL,
+            token_expires_at = NULL,
+            session_id = NULL,
+            last_seen = ?
         WHERE id = ?
         """,
-        (worker_id,),
+        (now, worker_id),
+    )
+
+
+def _active_worker_tournament_ids(
+    connection: sqlite3.Connection,
+    worker_id: int,
+) -> tuple[int, ...]:
+    return tuple(
+        int(row["tournament_id"])
+        for row in connection.execute(
+            """
+            SELECT DISTINCT games.tournament_id
+            FROM game_assignments
+            JOIN games ON games.id = game_assignments.game_id
+            WHERE (game_assignments.white_worker_id = ? OR game_assignments.black_worker_id = ?)
+              AND game_assignments.status IN ('assigned', 'acked', 'live')
+              AND games.status IN ('assigned', 'live')
+            """,
+            (worker_id, worker_id),
+        )
+    )
+
+
+def _release_worker_active_assignments(
+    connection: sqlite3.Connection,
+    worker_id: int,
+    *,
+    now: str,
+    reason: str,
+) -> None:
+    connection.execute(
+        """
+        UPDATE games
+        SET status = 'pending'
+        WHERE status IN ('assigned', 'live')
+          AND id IN (
+            SELECT game_id
+            FROM game_assignments
+            WHERE (white_worker_id = ? OR black_worker_id = ?)
+              AND status IN ('assigned', 'acked', 'live')
+          )
+        """,
+        (worker_id, worker_id),
+    )
+    connection.execute(
+        """
+        UPDATE game_assignments
+        SET status = 'abandoned',
+            finished_at = ?,
+            last_error = ?,
+            white_worker_id = CASE WHEN white_worker_id = ? THEN NULL ELSE white_worker_id END,
+            black_worker_id = CASE WHEN black_worker_id = ? THEN NULL ELSE black_worker_id END
+        WHERE (white_worker_id = ? OR black_worker_id = ?)
+          AND status IN ('assigned', 'acked', 'live')
+        """,
+        (now, reason[:500], worker_id, worker_id, worker_id, worker_id),
     )
 
 
@@ -1395,6 +1619,9 @@ def _move_from_row(row: sqlite3.Row) -> MoveRecord:
         eval_mate=row["eval_mate"],
         depth=row["depth"],
         nodes=row["nodes"],
+        nps=row["nps"],
+        pv=row["pv"],
+        info_line=row["info_line"],
         time_ms=row["time_ms"],
         clock_after_ms=row["clock_after_ms"],
     )

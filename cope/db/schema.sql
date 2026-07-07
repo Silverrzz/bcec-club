@@ -101,6 +101,9 @@ CREATE TABLE IF NOT EXISTS moves (
   eval_mate INTEGER,
   depth INTEGER,
   nodes INTEGER,
+  nps INTEGER,
+  pv TEXT,
+  info_line TEXT,
   time_ms INTEGER NOT NULL DEFAULT 0,
   clock_after_ms INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (game_id, ply)

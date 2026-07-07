@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Admin Login - COPE Chess</title>
+    <link rel="stylesheet" href="{{ url_for('static', path='style.css') }}">
+  </head>
+  <body class="admin-body">
+    <main class="admin-login">
+      <form class="panel settings-form" method="post" action="/admin/login">
+        <h1>Admin Login</h1>
+        {% if error %}
+          <p class="flash flash--error">{{ error }}</p>
+        {% endif %}
+        <label for="token">Admin token</label>
+        <input class="input" id="token" name="token" type="password" autocomplete="current-password" required autofocus>
+        <button class="button button--primary" type="submit">Sign in</button>
+      </form>
+    </main>
+  </body>
+</html>

@@ -14,6 +14,17 @@
 
   {{ flash(notice, error, errors) }}
 
+  {% if minted %}
+    <section class="panel panel--highlight">
+      <h2>Worker registration token</h2>
+      <p>Expires {{ minted.expires_at }}</p>
+      <pre class="token-block">{{ minted.token }}</pre>
+      {% if minted_start_command %}
+        <button class="button button--small" type="button" data-copy="{{ minted_start_command }}">Copy one-time start command</button>
+      {% endif %}
+    </section>
+  {% endif %}
+
   <section class="panel">
     <h2>Current work</h2>
     <p>
@@ -30,13 +41,15 @@
   <div class="admin-columns">
     <section class="panel">
       <h2>Identity</h2>
-      <form method="post" action="/admin/workers/{{ worker.id }}/label">
+      <form class="worker-detail-label-form" method="post" action="/admin/workers/{{ worker.id }}/label">
         <input type="hidden" name="next" value="/admin/workers/{{ worker.id }}">
         <div class="field">
           <label for="label">Label</label>
-          <input class="input" id="label" name="label" value="{{ worker.label }}" required>
+          <div class="worker-detail-label-row">
+            <input class="input" id="label" name="label" value="{{ worker.label }}" required>
+            <button class="button button--primary" type="submit">Save</button>
+          </div>
         </div>
-        <button class="button button--primary" type="submit">Save label</button>
       </form>
     </section>
 
@@ -97,6 +110,23 @@
             {{ row.session.detail }}
             {% if worker.session_id %}
               <button class="button button--small" type="button" data-copy="{{ worker.session_id }}">Copy session id</button>
+            {% endif %}
+          </dd>
+        </div>
+        <div>
+          <dt>Launch</dt>
+          <dd>
+            {% if worker_launch_command %}
+              <button class="button button--small" type="button" data-copy="{{ worker_launch_command }}">Copy start command</button>
+            {% elif worker.status != "revoked" and not worker.session_id %}
+              <form method="post" action="/admin/workers/{{ worker.id }}/token">
+                <input type="hidden" name="ttl_seconds" value="7200">
+                <button class="button button--small" type="submit">
+                  {% if row.token.status == "minted" %}Regenerate one-time token{% else %}Generate one-time token{% endif %}
+                </button>
+              </form>
+            {% else %}
+              No active worker credential
             {% endif %}
           </dd>
         </div>

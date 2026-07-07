@@ -6,6 +6,17 @@ import logging
 import os
 from pathlib import Path
 
+from .network import (
+    default_admin_token,
+    default_web_event_token,
+    default_web_event_timeout_s,
+    default_web_stream_url,
+    default_web_host,
+    default_web_port,
+    default_worker_host,
+    default_worker_port,
+    default_worker_server_url,
+)
 from .prototype import run_prototype_tournament
 
 
@@ -58,8 +69,23 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     web_parser = subparsers.add_parser("web", help="start the web server")
-    web_parser.add_argument("--host", default="127.0.0.1")
-    web_parser.add_argument("--port", type=int, default=8701)
+    web_parser.add_argument("--host", default=default_web_host())
+    web_parser.add_argument("--port", type=int, default=default_web_port())
+    web_parser.add_argument(
+        "--worker-server-url",
+        default=default_worker_server_url(),
+        help="public websocket URL workers should use to reach the runner",
+    )
+    web_parser.add_argument(
+        "--event-token",
+        default=default_web_event_token(),
+        help="shared token required for internal runner streams",
+    )
+    web_parser.add_argument(
+        "--admin-token",
+        default=default_admin_token(),
+        help="admin login token, or COPE_ADMIN_TOKEN",
+    )
     web_parser.add_argument(
         "--db-path",
         default=_default_db_path(),
@@ -72,9 +98,35 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="run only the worker websocket handshake server",
     )
-    runner_parser.add_argument("--worker-host", default="127.0.0.1")
-    runner_parser.add_argument("--worker-port", type=int, default=8702)
+    runner_parser.add_argument(
+        "--worker-host",
+        default=default_worker_host(),
+        help="worker websocket bind host",
+    )
+    runner_parser.add_argument(
+        "--worker-port",
+        type=int,
+        default=default_worker_port(),
+        help="worker websocket bind port",
+    )
     runner_parser.add_argument("--app-commit", default=_default_app_commit())
+    runner_parser.add_argument(
+        "--web-stream-url",
+        dest="web_stream_url",
+        default=default_web_stream_url(),
+        help="web server websocket URL for runner event streams",
+    )
+    runner_parser.add_argument(
+        "--web-event-token",
+        default=default_web_event_token(),
+        help="shared token used for the internal web stream",
+    )
+    runner_parser.add_argument(
+        "--web-event-timeout-s",
+        type=float,
+        default=default_web_event_timeout_s(),
+        help="seconds to wait when opening the internal web stream",
+    )
     runner_parser.add_argument(
         "--db-path",
         default=_default_db_path(),
@@ -89,7 +141,7 @@ def main(argv: list[str] | None = None) -> int:
         "--poll-interval-s",
         type=float,
         default=2.0,
-        help="seconds to wait between idle tournament scans",
+        help="seconds between fallback scans when no stream wake arrives",
     )
     runner_parser.add_argument(
         "--once",
@@ -98,7 +150,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     worker_parser = subparsers.add_parser("worker", help="start a worker client")
-    worker_parser.add_argument("--server-url", default="ws://127.0.0.1:8702/worker")
+    worker_parser.add_argument("--server-url", default=default_worker_server_url())
     worker_parser.add_argument("--token")
     worker_parser.add_argument("--session-id")
     worker_parser.add_argument("--label-hint", default="")
@@ -140,6 +192,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.role == "runner":
+        from .runner.events import configure_event_publisher
+
+        configure_event_publisher(
+            url=args.web_stream_url,
+            token=args.web_event_token,
+            timeout_s=args.web_event_timeout_s,
+        )
+
         if args.worker_server:
             from .runner.worker_server import WorkerServerConfig, run_worker_server
 
@@ -204,7 +264,16 @@ def main(argv: list[str] | None = None) -> int:
         from .web.app import create_app
 
         initialize_database(Path(args.db_path))
-        uvicorn.run(create_app(args.db_path), host=args.host, port=args.port)
+        uvicorn.run(
+            create_app(
+                args.db_path,
+                worker_server_url=args.worker_server_url,
+                event_token=args.event_token,
+                admin_token=args.admin_token,
+            ),
+            host=args.host,
+            port=args.port,
+        )
         return 0
 
     if args.role == "worker":

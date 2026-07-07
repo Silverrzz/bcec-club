@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
+import copy
+import hmac
+import secrets
 import sqlite3
+import threading
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import ValidationError
@@ -22,6 +25,7 @@ from cope.db import (
     GameRecord,
     MoveRecord,
     TournamentRecord,
+    active_engine_hardware_profiles,
     category_tournament_count,
     connect_database,
     create_category,
@@ -29,6 +33,8 @@ from cope.db import (
     create_engine,
     create_opening_suite,
     create_tournament,
+    create_worker,
+    database_stats,
     delete_category,
     delete_chat_message,
     delete_engine,
@@ -40,22 +46,29 @@ from cope.db import (
     get_chat_settings,
     get_engine,
     get_engine_record,
-    get_game,
+    get_opening_position,
     get_opening_suite,
     get_tournament,
     get_tournament_rating_commit,
     get_worker,
+    get_worker_activity,
     list_categories,
     list_chat_messages,
+    list_active_games,
+    list_engine_games,
     list_engine_records,
     list_engines,
+    list_games_by_status,
     list_games,
     list_moves,
     list_opening_suites,
+    list_rating_rows,
     list_suite_openings,
     list_tournaments,
+    list_uncommitted_finished_tournaments,
+    list_upcoming_games,
     list_workers,
-    mint_worker_token,
+    mint_worker_token_for_worker,
     next_engine_id,
     replace_suite_openings,
     request_tournament_rating_commit,
@@ -70,6 +83,21 @@ from cope.db import (
     update_worker_label,
 )
 from cope.core.models import EngineSpec, HardwareInfo
+from cope.core.stream import (
+    StreamEnvelope,
+    StreamProtocolError,
+    decode_stream_event,
+    encode_stream_event,
+    make_stream_event,
+    sse_stream_event,
+)
+from cope.network import (
+    ADMIN_TOKEN_ENV,
+    LOCAL_EVENT_PUBLISHERS,
+    default_admin_token,
+    default_web_event_token,
+    default_worker_server_url,
+)
 from cope.web import forms
 from cope.web.forms import FormError, form_flag, form_value
 from cope.web.openings import parse_opening_uploads, parse_openings
@@ -90,49 +118,300 @@ CONNECTED_WORKER_STATUSES = {"connected", "building", "ready", "busy"}
 WORKER_RECENT_SECONDS = 60
 
 
-class TournamentEventHub:
-    def __init__(self) -> None:
-        self._subscribers: dict[int, set[asyncio.Queue[None]]] = {}
-        self._live: dict[int, dict[str, Any]] = {}
+class StreamBacklogExceeded(RuntimeError):
+    pass
 
-    def subscribe(self, tournament_id: int) -> asyncio.Queue[None]:
-        queue: asyncio.Queue[None] = asyncio.Queue(maxsize=16)
-        self._subscribers.setdefault(tournament_id, set()).add(queue)
+
+class StreamSubscription:
+    def __init__(self, topics: tuple[str, ...], *, max_queue: int) -> None:
+        self.topics = topics
+        self.queue: asyncio.Queue[StreamEnvelope | None] = asyncio.Queue(maxsize=max_queue)
+        self.closed = False
+
+    def enqueue(self, event: StreamEnvelope) -> None:
+        if self.closed:
+            return
+        if self.queue.full():
+            self.closed = True
+            while not self.queue.empty():
+                with contextlib.suppress(asyncio.QueueEmpty):
+                    self.queue.get_nowait()
+            self.queue.put_nowait(None)
+            return
+        self.queue.put_nowait(event)
+
+
+class StreamHub:
+    def __init__(self, *, max_subscribers: int = 256, max_queue: int = 512) -> None:
+        self._lock = threading.Lock()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._seq_by_topic: dict[str, int] = {}
+        self._subscribers: dict[str, set[StreamSubscription]] = {}
+        self._internal_clients: set[asyncio.Queue[StreamEnvelope | None]] = set()
+        self._tournament_live: dict[int, dict[str, Any]] = {}
+        self._max_subscribers = max_subscribers
+        self._max_queue = max_queue
+
+    def bind_loop(self) -> None:
+        loop = asyncio.get_running_loop()
+        with self._lock:
+            self._loop = loop
+
+    def subscribe(self, *topics: str) -> StreamSubscription:
+        with self._lock:
+            count = sum(len(items) for items in self._subscribers.values())
+            if count >= self._max_subscribers:
+                raise StreamBacklogExceeded("too many stream subscribers")
+            subscription = StreamSubscription(tuple(topics), max_queue=self._max_queue)
+            for topic in topics:
+                self._subscribers.setdefault(topic, set()).add(subscription)
+            return subscription
+
+    def unsubscribe(self, subscription: StreamSubscription) -> None:
+        with self._lock:
+            subscription.closed = True
+            for topic in subscription.topics:
+                subscribers = self._subscribers.get(topic)
+                if subscribers is None:
+                    continue
+                subscribers.discard(subscription)
+                if not subscribers:
+                    self._subscribers.pop(topic, None)
+
+    def register_internal_client(self) -> asyncio.Queue[StreamEnvelope | None]:
+        queue: asyncio.Queue[StreamEnvelope | None] = asyncio.Queue(maxsize=self._max_queue)
+        with self._lock:
+            self._internal_clients.add(queue)
         return queue
 
-    def unsubscribe(self, tournament_id: int, queue: asyncio.Queue[None]) -> None:
-        queues = self._subscribers.get(tournament_id)
-        if queues is None:
+    def unregister_internal_client(self, queue: asyncio.Queue[StreamEnvelope | None]) -> None:
+        with self._lock:
+            self._internal_clients.discard(queue)
+
+    def publish(
+        self,
+        topic: str,
+        event_type: str,
+        data: dict[str, Any] | None = None,
+        *,
+        source: str = "web",
+    ) -> StreamEnvelope:
+        with self._lock:
+            seq = self._seq_by_topic.get(topic, 0) + 1
+            self._seq_by_topic[topic] = seq
+            event = make_stream_event(
+                topic,
+                event_type,
+                data,
+                source=source,
+                seq=seq,
+                event_id=f"{topic}:{seq}",
+            )
+            self._record_live_event(event)
+            subscribers = tuple(self._subscribers.get(topic, ()))
+            loop = self._loop
+        if loop is None:
+            return event
+        for subscription in subscribers:
+            loop.call_soon_threadsafe(subscription.enqueue, event)
+        return event
+
+    def make_private_event(
+        self,
+        topic: str,
+        event_type: str,
+        data: dict[str, Any] | None = None,
+        *,
+        source: str = "web",
+    ) -> StreamEnvelope:
+        return make_stream_event(
+            topic,
+            event_type,
+            data,
+            source=source,
+            seq=0,
+            event_id=f"{topic}:0",
+        )
+
+    def publish_to_internal(
+        self,
+        event_type: str,
+        data: dict[str, Any] | None = None,
+    ) -> StreamEnvelope:
+        event = self.publish("runner", event_type, data, source="web")
+        with self._lock:
+            clients = tuple(self._internal_clients)
+            loop = self._loop
+        if loop is None:
+            return event
+        for queue in clients:
+            loop.call_soon_threadsafe(_enqueue_internal_event, queue, event)
+        return event
+
+    def tournament_live(self, tournament_id: int) -> dict[str, Any] | None:
+        with self._lock:
+            live = self._tournament_live.get(tournament_id)
+            if live is None:
+                return None
+            return copy.deepcopy(live)
+
+    def clear_tournament_live(self, tournament_id: int) -> None:
+        with self._lock:
+            self._tournament_live.pop(tournament_id, None)
+
+    def _record_live_event(self, event: StreamEnvelope) -> None:
+        tournament_id = _event_tournament_id(event)
+        if tournament_id is None:
             return
-        queues.discard(queue)
-        if not queues:
-            self._subscribers.pop(tournament_id, None)
+        if event.type == "game.move":
+            self._tournament_live.pop(tournament_id, None)
+            return
+        if event.type == "tournament.live":
+            live = event.data.get("live")
+            if isinstance(live, dict):
+                if live.get("clear"):
+                    self._tournament_live.pop(tournament_id, None)
+                else:
+                    self._tournament_live[tournament_id] = dict(live)
+            return
+        if event.type == "engine.info":
+            side = event.data.get("side")
+            engine_data = event.data.get("engine_data")
+            game_id = event.data.get("game_id")
+            if side not in {"white", "black"} or not isinstance(engine_data, dict):
+                return
+            live = self._tournament_live.setdefault(
+                tournament_id,
+                {"game_id": game_id, "engine_data": {}, "clocks": {}},
+            )
+            live["game_id"] = game_id
+            live.setdefault("engine_data", {})[side] = dict(engine_data)
+            return
+        if event.type == "clock.sync":
+            clocks = event.data.get("clocks_ms")
+            game_id = event.data.get("game_id")
+            if not isinstance(clocks, dict):
+                return
+            live = self._tournament_live.setdefault(
+                tournament_id,
+                {"game_id": game_id, "engine_data": {}, "clocks": {}},
+            )
+            live["game_id"] = game_id
+            live["clocks"] = dict(clocks)
 
-    def publish(self, tournament_id: int, live: dict[str, Any] | None = None) -> None:
-        if live is not None:
-            if live.get("clear"):
-                self._live.pop(tournament_id, None)
-            else:
-                self._live[tournament_id] = live
-        for queue in tuple(self._subscribers.get(tournament_id, ())):
-            if queue.full():
-                with contextlib.suppress(asyncio.QueueEmpty):
-                    queue.get_nowait()
-            queue.put_nowait(None)
 
-    def live(self, tournament_id: int) -> dict[str, Any] | None:
-        return self._live.get(tournament_id)
+def _enqueue_internal_event(
+    queue: asyncio.Queue[StreamEnvelope | None],
+    event: StreamEnvelope,
+) -> None:
+    if queue.full():
+        while not queue.empty():
+            with contextlib.suppress(asyncio.QueueEmpty):
+                queue.get_nowait()
+        queue.put_nowait(None)
+        return
+    queue.put_nowait(event)
 
 
-def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> FastAPI:
+def create_app(
+    db_path: str | Path = DEFAULT_DB_PATH,
+    *,
+    worker_server_url: str | None = None,
+    event_token: str | None = None,
+    admin_token: str | None = None,
+) -> FastAPI:
     app = FastAPI(title="COPE Chess")
     app.state.db_path = Path(db_path)
-    app.state.tournament_events = TournamentEventHub()
+    app.state.worker_server_url = worker_server_url or default_worker_server_url()
+    app.state.event_token = event_token or default_web_event_token()
+    app.state.admin_token = admin_token or default_admin_token()
+    app.state.stream_hub = StreamHub()
     app.mount(
         "/static",
         StaticFiles(directory=str(PACKAGE_DIR / "static")),
         name="static",
     )
+
+    @app.middleware("http")
+    async def admin_security(request: Request, call_next):
+        path = request.url.path
+        if not path.startswith("/admin") or path == "/admin/login":
+            return await call_next(request)
+        token = _admin_token(request)
+        if not token:
+            return HTMLResponse(
+                f"Admin access requires {ADMIN_TOKEN_ENV}.",
+                status_code=503,
+            )
+        if not _request_is_secure_or_local(request):
+            return HTMLResponse("Admin access requires HTTPS.", status_code=403)
+        if not _admin_session_valid(request, token):
+            if request.method == "GET":
+                return RedirectResponse(url="/admin/login", status_code=303)
+            return HTMLResponse("Admin session required.", status_code=403)
+        if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+            await request.body()
+            form = await request.form()
+            supplied = str(form.get("csrf_token") or "")
+            if not _csrf_token_valid(request, token, supplied):
+                return HTMLResponse("CSRF validation failed.", status_code=403)
+        response = await call_next(request)
+        if request.method == "POST" and 200 <= response.status_code < 400:
+            _publish_admin_post_streams(request)
+        return response
+
+    @app.get("/admin/login")
+    def admin_login(request: Request):
+        token = _admin_token(request)
+        if not token:
+            return HTMLResponse(
+                f"Admin access requires {ADMIN_TOKEN_ENV}.",
+                status_code=503,
+            )
+        if not _request_is_secure_or_local(request):
+            return HTMLResponse("Admin access requires HTTPS.", status_code=403)
+        if _admin_session_valid(request, token):
+            return RedirectResponse(url="/admin", status_code=303)
+        return templates.TemplateResponse(
+            request,
+            "admin/login.html",
+            {
+                "error": request.query_params.get("error"),
+            },
+        )
+
+    @app.post("/admin/login")
+    async def admin_login_submit(request: Request):
+        token = _admin_token(request)
+        if not token:
+            return HTMLResponse(
+                f"Admin access requires {ADMIN_TOKEN_ENV}.",
+                status_code=503,
+            )
+        if not _request_is_secure_or_local(request):
+            return HTMLResponse("Admin access requires HTTPS.", status_code=403)
+        form = await read_form(request)
+        if not hmac.compare_digest(form_value(form, "token"), token):
+            return RedirectResponse(
+                url="/admin/login?error=" + quote("Invalid admin token."),
+                status_code=303,
+            )
+        response = RedirectResponse(url="/admin", status_code=303)
+        nonce = secrets.token_urlsafe(32)
+        response.set_cookie(
+            "cope_admin_session",
+            _signed_value(token, nonce),
+            httponly=True,
+            secure=_request_is_secure(request),
+            samesite="lax",
+        )
+        return response
+
+    @app.post("/admin/logout")
+    def admin_logout():
+        response = RedirectResponse(url="/admin/login", status_code=303)
+        response.delete_cookie("cope_admin_session")
+        return response
 
     # ------------------------------------------------------------------
     # Public site
@@ -189,7 +468,7 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> FastAPI:
                 "active_nav": None,
                 "live_games": _home_game_cards(connection, engines),
                 "upcoming_rows": _upcoming_rows(connection, engines, limit=16),
-                "recent_games": _games_by_status(connection, "finished", limit=16),
+                "recent_games": list_games_by_status(connection, "finished", limit=16),
                 "engines": engines,
                 "tournament_names": _tournament_names(connection),
             },
@@ -207,8 +486,13 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> FastAPI:
 
         engines = _engine_names(connection)
         games = list_games(connection, tournament.id)
-        viewer_game = _tournament_viewer_game(games)
+        viewer_game = _selected_viewer_game(request, games)
         viewer_moves = list_moves(connection, viewer_game.id) if viewer_game else ()
+        viewer_locked = (
+            request.query_params.get("game_id") is not None
+            and viewer_game is not None
+            and viewer_game.status not in {"assigned", "live"}
+        )
         chat_messages = list_chat_messages(connection, limit=30)
         return templates.TemplateResponse(
             request,
@@ -220,6 +504,8 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> FastAPI:
                 "engines": engines,
                 "viewer_game": viewer_game,
                 "viewer_moves": viewer_moves,
+                "viewer_move_payloads": [_move_payload(move) for move in viewer_moves],
+                "viewer_locked": viewer_locked,
                 "engine_data": _engine_data(viewer_game, viewer_moves),
                 "clocks": _clock_data(viewer_moves),
                 "standings": _standings(tournament, games, engines),
@@ -233,17 +519,22 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> FastAPI:
     @app.get("/tournaments/{tournament_id}/live.json")
     def tournament_live_snapshot(
         tournament_id: int,
+        request: Request,
         connection: sqlite3.Connection = Depends(_database),
     ):
         tournament = get_tournament(connection, tournament_id)
         if tournament is None:
             raise HTTPException(status_code=404, detail="tournament not found")
 
-        return JSONResponse(_tournament_live_payload(connection, tournament))
+        hub: StreamHub = request.app.state.stream_hub
+        return JSONResponse(
+            _tournament_live_payload(connection, tournament, hub.tournament_live(tournament_id))
+        )
 
     @app.get("/tournaments/{tournament_id}/events")
     async def tournament_events(tournament_id: int, request: Request):
-        hub: TournamentEventHub = request.app.state.tournament_events
+        hub: StreamHub = request.app.state.stream_hub
+        hub.bind_loop()
 
         def snapshot() -> dict[str, Any]:
             connection = connect_database(request.app.state.db_path)
@@ -251,20 +542,30 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> FastAPI:
                 tournament = get_tournament(connection, tournament_id)
                 if tournament is None:
                     return {"error": "tournament not found"}
-                live = request.app.state.tournament_events.live(tournament_id)
+                live = hub.tournament_live(tournament_id)
                 return _tournament_live_payload(connection, tournament, live)
             finally:
                 connection.close()
 
         async def stream():
-            queue = hub.subscribe(tournament_id)
+            topic = f"tournament.{tournament_id}"
+            subscription = hub.subscribe(topic)
             try:
+                yield sse_stream_event(
+                    hub.make_private_event(
+                        topic,
+                        "tournament.snapshot",
+                        snapshot(),
+                        source="web",
+                    )
+                )
                 while True:
-                    yield _sse_event("snapshot", snapshot())
-                    with contextlib.suppress(TimeoutError):
-                        await asyncio.wait_for(queue.get(), timeout=15)
+                    event = await subscription.queue.get()
+                    if event is None:
+                        break
+                    yield sse_stream_event(event)
             finally:
-                hub.unsubscribe(tournament_id, queue)
+                hub.unsubscribe(subscription)
 
         return StreamingResponse(
             stream(),
@@ -275,43 +576,42 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> FastAPI:
             },
         )
 
-    @app.post("/internal/tournament-events")
-    async def publish_tournament_event(request: Request):
-        if request.client is not None and request.client.host not in {"127.0.0.1", "::1"}:
-            raise HTTPException(status_code=403, detail="local event publisher required")
+    @app.websocket("/internal/stream")
+    async def internal_stream(websocket: WebSocket):
+        await websocket.accept()
+        if not _internal_stream_peer_allowed(websocket):
+            await websocket.close(code=4003, reason="stream peer not allowed")
+            return
 
-        payload = await request.json()
-        tournament_id = int(payload["tournament_id"])
-        live = payload.get("live")
-        request.app.state.tournament_events.publish(tournament_id, live)
-        return JSONResponse({"ok": True})
-
-    @app.get("/games/{game_id}")
-    def game_detail(
-        game_id: int,
-        request: Request,
-        connection: sqlite3.Connection = Depends(_database),
-    ):
-        game = get_game(connection, game_id)
-        if game is None:
-            raise HTTPException(status_code=404, detail="game not found")
-
-        tournament = get_tournament(connection, game.tournament_id)
-        moves = list_moves(connection, game.id)
-        opening = _opening_view(connection, game.opening_id)
-        return templates.TemplateResponse(
-            request,
-            "game_detail.html",
-            {
-                "active_nav": "archive",
-                "game": game,
-                "tournament": tournament,
-                "moves": moves,
-                "uci_moves": " ".join(move.uci for move in moves),
-                "engines": _engine_names(connection),
-                "opening": opening,
-            },
-        )
+        hub: StreamHub = websocket.app.state.stream_hub
+        hub.bind_loop()
+        queue: asyncio.Queue[StreamEnvelope | None] | None = None
+        try:
+            hello = decode_stream_event(await websocket.receive_text())
+            if hello.type != "stream.hello" or not _stream_hello_authorized(websocket, hello):
+                await websocket.close(code=4003, reason="stream auth failed")
+                return
+            queue = hub.register_internal_client()
+            await websocket.send_text(
+                _stream_text(
+                    make_stream_event("internal", "stream.ready", source="web")
+                )
+            )
+            receiver = asyncio.create_task(_receive_internal_stream(websocket, hub))
+            sender = asyncio.create_task(_send_internal_stream(websocket, queue))
+            done, pending = await asyncio.wait(
+                {receiver, sender},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            for task in done:
+                task.result()
+        except (StreamProtocolError, WebSocketDisconnect):
+            return
+        finally:
+            if queue is not None:
+                hub.unregister_internal_client(queue)
 
     @app.get("/ratings")
     def ratings(
@@ -328,7 +628,7 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> FastAPI:
                 "active_nav": "ratings",
                 "category": category,
                 "categories": categories,
-                "ratings": _rating_rows(connection, category.id) if category else [],
+                "ratings": list_rating_rows(connection, category.id) if category else [],
             },
         )
 
@@ -342,7 +642,7 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> FastAPI:
         if engine is None:
             raise HTTPException(status_code=404, detail="engine not found")
 
-        games = _engine_games(connection, engine_id)
+        games = list_engine_games(connection, engine_id)
         return templates.TemplateResponse(
             request,
             "engine_detail.html",
@@ -372,7 +672,7 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> FastAPI:
             {
                 "active_nav": "archive",
                 "tournaments": tournaments,
-                "games": _games_by_status(connection, "finished", limit=50),
+                "games": list_games_by_status(connection, "finished", limit=50),
                 "engines": engines,
             },
         )
@@ -393,13 +693,13 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> FastAPI:
             _admin_context(
                 request,
                 "dashboard",
-                workers=list_workers(connection),
-                live_games=_games_by_status(connection, "live", limit=8),
+                workers=_worker_admin_rows(connection),
+                live_games=list_games_by_status(connection, "live", limit=8),
                 engines=_engine_names(connection),
-                db_stats=_db_stats(connection),
+                db_stats=database_stats(connection),
                 running_tournaments=[t for t in tournaments if t.status in {"scheduled", "running", "paused"}],
-                complete_tournaments=_complete_uncommitted_tournaments(connection),
-                recent_games=_games_by_status(connection, "finished", limit=6),
+                complete_tournaments=list_uncommitted_finished_tournaments(connection),
+                recent_games=list_games_by_status(connection, "finished", limit=6),
             ),
         )
 
@@ -1125,7 +1425,56 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> FastAPI:
                 "workers",
                 worker_rows=_worker_admin_rows(connection),
                 minted=None,
+                minted_start_command=None,
             ),
+        )
+
+    @app.get("/admin/workers.json")
+    def admin_workers_json(
+        connection: sqlite3.Connection = Depends(_database),
+    ):
+        return JSONResponse(
+            {
+                "workers": [
+                    _worker_admin_payload(row)
+                    for row in _worker_admin_rows(connection)
+                ]
+            }
+        )
+
+    @app.get("/admin/workers/events")
+    async def admin_workers_events(request: Request):
+        hub: StreamHub = request.app.state.stream_hub
+        hub.bind_loop()
+
+        def snapshot() -> dict[str, Any]:
+            connection = connect_database(request.app.state.db_path)
+            try:
+                return _workers_snapshot_payload(connection)
+            finally:
+                connection.close()
+
+        async def stream():
+            subscription = hub.subscribe("workers")
+            try:
+                yield sse_stream_event(
+                    hub.make_private_event("workers", "workers.snapshot", snapshot(), source="web")
+                )
+                while True:
+                    event = await subscription.queue.get()
+                    if event is None:
+                        break
+                    yield sse_stream_event(event)
+            finally:
+                hub.unsubscribe(subscription)
+
+        return StreamingResponse(
+            stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
         )
 
     @app.get("/admin/workers/{worker_id:int}")
@@ -1145,31 +1494,82 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> FastAPI:
                 "workers",
                 row=row,
                 worker=row["worker"],
+                minted=None,
+                minted_start_command=None,
+                worker_launch_command=_worker_launch_command(
+                    row["worker"],
+                    request.app.state.worker_server_url,
+                ),
             ),
         )
 
-    @app.post("/admin/workers/mint")
-    async def admin_mint_worker(
+    @app.post("/admin/workers")
+    async def admin_create_worker(
         request: Request,
         connection: sqlite3.Connection = Depends(_database),
     ):
         form = await read_form(request)
         label = form_value(form, "label") or "worker"
+        worker_id = create_worker(connection, label=label)
+        connection.commit()
+        return RedirectResponse(
+            url=f"/admin/workers/{worker_id}?notice=" + quote("Worker created."),
+            status_code=303,
+        )
+
+    @app.get("/admin/workers/{worker_id:int}/token")
+    def admin_worker_token_get(worker_id: int):
+        return RedirectResponse(
+            url=f"/admin/workers/{worker_id}?error="
+            + quote("Use Generate one-time token from the worker page."),
+            status_code=303,
+        )
+
+    @app.post("/admin/workers/{worker_id:int}/token")
+    async def admin_generate_worker_token(
+        worker_id: int,
+        request: Request,
+        connection: sqlite3.Connection = Depends(_database),
+    ):
+        worker = get_worker(connection, worker_id)
+        if worker is None:
+            raise HTTPException(status_code=404, detail="worker not found")
+        form = await read_form(request)
         raw_ttl = form_value(form, "ttl_seconds")
         ttl_seconds = int(raw_ttl) if raw_ttl.isdigit() and int(raw_ttl) > 0 else 7200
-        minted = mint_worker_token(connection, label=label, ttl_seconds=ttl_seconds)
+        try:
+            minted = mint_worker_token_for_worker(
+                connection,
+                worker_id=worker_id,
+                ttl_seconds=ttl_seconds,
+            )
+        except ValueError as exc:
+            return RedirectResponse(
+                url=f"/admin/workers/{worker_id}?error=" + quote(str(exc)),
+                status_code=303,
+            )
         connection.commit()
-        return templates.TemplateResponse(
+        row = _worker_admin_row(connection, worker_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="worker not found")
+        response = templates.TemplateResponse(
             request,
-            "admin/workers.html",
+            "admin/worker_detail.html",
             _admin_context(
                 request,
                 "workers",
-                worker_rows=_worker_admin_rows(connection),
+                row=row,
+                worker=row["worker"],
                 minted=minted,
-                notice="Worker token minted. Copy it now - it will not be shown again.",
+                minted_start_command=(
+                    f"cope worker --server-url {_command_arg(request.app.state.worker_server_url)} "
+                    f"--token {_command_arg(minted.token)}"
+                ),
+                worker_launch_command=None,
             ),
         )
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
     @app.post("/admin/workers/{worker_id}/label")
     async def admin_update_worker_label(
@@ -1298,16 +1698,234 @@ def _database(request: Request) -> Iterator[sqlite3.Connection]:
         connection.close()
 
 
+async def _receive_internal_stream(websocket: WebSocket, hub: StreamHub) -> None:
+    while True:
+        event = decode_stream_event(await websocket.receive_text())
+        await _dispatch_internal_stream_event(websocket.app, event)
+
+
+async def _send_internal_stream(
+    websocket: WebSocket,
+    queue: asyncio.Queue[StreamEnvelope | None],
+) -> None:
+    while True:
+        event = await queue.get()
+        if event is None:
+            await websocket.close(code=4008, reason="stream client backlog exceeded")
+            return
+        await websocket.send_text(_stream_text(event))
+
+
+async def _dispatch_internal_stream_event(app: FastAPI, event: StreamEnvelope) -> None:
+    hub: StreamHub = app.state.stream_hub
+    if event.topic == "workers" or event.type.startswith("worker"):
+        connection = connect_database(app.state.db_path)
+        try:
+            payload = _workers_snapshot_payload(connection)
+        finally:
+            connection.close()
+        hub.publish("workers", "workers.snapshot", payload, source=event.source)
+        return
+
+    tournament_id = _event_tournament_id(event)
+    if tournament_id is None:
+        hub.publish(event.topic, event.type, event.data, source=event.source)
+        return
+
+    topic = f"tournament.{tournament_id}"
+    if event.type in {"engine.info", "clock.sync"}:
+        hub.publish(topic, event.type, event.data, source=event.source)
+        return
+
+    if event.type == "tournament.live":
+        hub.publish(topic, event.type, event.data, source=event.source)
+        hub.publish(
+            topic,
+            "tournament.snapshot",
+            _tournament_snapshot(app, tournament_id),
+            source="web",
+        )
+        return
+
+    if event.type == "game.move":
+        hub.publish(topic, "game.move", event.data, source=event.source)
+
+    hub.publish(
+        topic,
+        "tournament.snapshot",
+        _tournament_snapshot(app, tournament_id),
+        source="web",
+    )
+
+
+def _tournament_snapshot(app: FastAPI, tournament_id: int) -> dict[str, Any]:
+    hub: StreamHub = app.state.stream_hub
+    connection = connect_database(app.state.db_path)
+    try:
+        tournament = get_tournament(connection, tournament_id)
+        if tournament is None:
+            return {"error": "tournament not found"}
+        return _tournament_live_payload(connection, tournament, hub.tournament_live(tournament_id))
+    finally:
+        connection.close()
+
+
+def _stream_text(event: StreamEnvelope) -> str:
+    return encode_stream_event(event)
+
+
+def _event_tournament_id(event: StreamEnvelope) -> int | None:
+    value = event.data.get("tournament_id")
+    if value is None and event.topic.startswith("tournament."):
+        value = event.topic.removeprefix("tournament.")
+    try:
+        tournament_id = int(value)
+    except (TypeError, ValueError):
+        return None
+    return tournament_id if tournament_id > 0 else None
+
+
+def _workers_snapshot_payload(connection: sqlite3.Connection) -> dict[str, Any]:
+    return {
+        "workers": [
+            _worker_admin_payload(row)
+            for row in _worker_admin_rows(connection)
+        ]
+    }
+
+
+def _publish_admin_post_streams(request: Request) -> None:
+    hub: StreamHub = request.app.state.stream_hub
+    path = request.url.path
+    hub.publish_to_internal("runner.wake", {"reason": path})
+
+    connection = connect_database(request.app.state.db_path)
+    try:
+        if path.startswith("/admin/workers"):
+            hub.publish("workers", "workers.snapshot", _workers_snapshot_payload(connection), source="web")
+        tournament_id = _admin_tournament_path_id(path)
+        if tournament_id is not None:
+            tournament = get_tournament(connection, tournament_id)
+            payload = (
+                _tournament_live_payload(
+                    connection,
+                    tournament,
+                    hub.tournament_live(tournament_id),
+                )
+                if tournament is not None
+                else {"error": "tournament not found"}
+            )
+            hub.publish(
+                f"tournament.{tournament_id}",
+                "tournament.snapshot",
+                payload,
+                source="web",
+            )
+    finally:
+        connection.close()
+
+
+def _admin_tournament_path_id(path: str) -> int | None:
+    parts = path.strip("/").split("/")
+    if len(parts) < 3 or parts[0] != "admin" or parts[1] != "tournaments":
+        return None
+    try:
+        value = int(parts[2])
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
 def _admin_context(request: Request, section: str, **extra: Any) -> dict[str, Any]:
+    token = _admin_token(request)
     context: dict[str, Any] = {
         "active_nav": "admin",
         "admin_section": section,
         "notice": request.query_params.get("notice"),
         "error": request.query_params.get("error"),
         "errors": [],
+        "csrf_token": _csrf_token(request, token) if token else "",
     }
     context.update(extra)
     return context
+
+
+def _admin_token(request: Request) -> str | None:
+    return getattr(request.app.state, "admin_token", None) or None
+
+
+def _admin_session_valid(request: Request, token: str) -> bool:
+    value = request.cookies.get("cope_admin_session", "")
+    if not value:
+        return False
+    nonce = _signed_value_nonce(token, value)
+    return nonce is not None
+
+
+def _csrf_token(request: Request, token: str | None) -> str:
+    if token is None:
+        return ""
+    nonce = _signed_value_nonce(token, request.cookies.get("cope_admin_session", ""))
+    if nonce is None:
+        return ""
+    return _csrf_for_nonce(token, nonce)
+
+
+def _csrf_token_valid(request: Request, token: str, supplied: str) -> bool:
+    expected = _csrf_token(request, token)
+    return bool(expected and supplied and hmac.compare_digest(supplied, expected))
+
+
+def _signed_value(token: str, nonce: str) -> str:
+    signature = hmac.digest(token.encode("utf-8"), nonce.encode("utf-8"), "sha256").hex()
+    return f"{nonce}.{signature}"
+
+
+def _signed_value_nonce(token: str, value: str) -> str | None:
+    if "." not in value:
+        return None
+    nonce, supplied = value.rsplit(".", 1)
+    if not nonce or not supplied:
+        return None
+    expected = _signed_value(token, nonce).rsplit(".", 1)[1]
+    if not hmac.compare_digest(supplied, expected):
+        return None
+    return nonce
+
+
+def _csrf_for_nonce(token: str, nonce: str) -> str:
+    return hmac.digest(
+        token.encode("utf-8"),
+        f"csrf:{nonce}".encode("utf-8"),
+        "sha256",
+    ).hex()
+
+
+def _request_is_secure(request: Request) -> bool:
+    forwarded = request.headers.get("x-forwarded-proto", "")
+    return request.url.scheme == "https" or forwarded.split(",", 1)[0].strip() == "https"
+
+
+def _request_is_secure_or_local(request: Request) -> bool:
+    if _request_is_secure(request):
+        return True
+    if request.client is None:
+        return True
+    return request.client.host in LOCAL_EVENT_PUBLISHERS
+
+
+def _internal_stream_peer_allowed(websocket: WebSocket) -> bool:
+    if getattr(websocket.app.state, "event_token", None):
+        return True
+    return websocket.client is None or websocket.client.host in LOCAL_EVENT_PUBLISHERS
+
+
+def _stream_hello_authorized(websocket: WebSocket, hello: StreamEnvelope) -> bool:
+    expected = getattr(websocket.app.state, "event_token", None)
+    if not expected:
+        return websocket.client is None or websocket.client.host in LOCAL_EVENT_PUBLISHERS
+    supplied = str(hello.data.get("token") or "")
+    return bool(supplied and hmac.compare_digest(supplied, expected))
 
 
 def _worker_admin_rows(connection: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -1339,6 +1957,30 @@ def _worker_admin_view(
     }
 
 
+def _worker_admin_payload(row: dict[str, Any]) -> dict[str, Any]:
+    worker = row["worker"]
+    hardware = {
+        "reported": False,
+        "summary": "Not reported",
+        "detail": "",
+    }
+    if worker.hw is not None:
+        hardware = {
+            "reported": True,
+            "summary": f"{worker.hw.physical_cores} cores",
+            "detail": f"{worker.hw.ram_gb}GB RAM",
+            "cores": str(worker.hw.physical_cores),
+            "memory": f"{worker.hw.ram_gb}GB",
+        }
+    return {
+        "id": worker.id,
+        "status": row["status"],
+        "work": row["work"],
+        "machine": row["machine"],
+        "hardware": hardware,
+    }
+
+
 def _state_view(status: str, label: str, detail: str) -> dict[str, str]:
     return {"status": status, "label": label, "detail": detail}
 
@@ -1347,6 +1989,8 @@ def _worker_token_view(worker) -> dict[str, str]:
     if worker.token_expires_at is None:
         if worker.status == "revoked":
             return _state_view("revoked", "Revoked", "Token removed")
+        if worker.status == "minted":
+            return _state_view("pending", "Not generated", "Generate a token to register")
         return _state_view("consumed", "Consumed", "Registration complete")
 
     expires_at = _parse_utc_datetime(worker.token_expires_at)
@@ -1362,6 +2006,20 @@ def _worker_session_view(worker) -> dict[str, str]:
     if worker.status == "minted":
         return _state_view("pending", "None", "Waiting for token use")
     return _state_view("inactive", "None", "No reconnect session")
+
+
+def _worker_launch_command(worker, worker_server_url: str) -> str | None:
+    if worker.session_id:
+        return (
+            f"cope worker --server-url {_command_arg(worker_server_url)} "
+            f"--session-id {_command_arg(worker.session_id)}"
+        )
+
+    return None
+
+
+def _command_arg(value: str) -> str:
+    return '"' + value.replace('"', '\\"') + '"'
 
 
 def _worker_effective_status(worker) -> str:
@@ -1399,51 +2057,36 @@ def _worker_activity(
     worker_id: int,
     engines: dict[int, str],
 ) -> dict[str, Any] | None:
-    row = connection.execute(
-        """
-        SELECT
-          game_assignments.status AS assignment_status,
-          games.id AS game_id,
-          games.round,
-          games.white_engine_id,
-          games.black_engine_id,
-          tournaments.id AS tournament_id,
-          tournaments.name AS tournament_name,
-          COUNT(moves.ply) AS plies
-        FROM game_assignments
-        JOIN games ON games.id = game_assignments.game_id
-        JOIN tournaments ON tournaments.id = games.tournament_id
-        LEFT JOIN moves ON moves.game_id = games.id
-        WHERE (game_assignments.white_worker_id = ? OR game_assignments.black_worker_id = ?)
-          AND game_assignments.status IN ('assigned', 'acked', 'live')
-          AND games.status IN ('assigned', 'live')
-        GROUP BY game_assignments.id
-        ORDER BY game_assignments.sent_at DESC, game_assignments.id DESC
-        LIMIT 1
-        """,
-        (worker_id, worker_id),
-    ).fetchone()
-    if row is None:
+    activity = get_worker_activity(connection, worker_id)
+    if activity is None:
         return None
 
-    status = row["assignment_status"]
+    status = activity.assignment_status
     verb = "Playing" if status == "live" else "Assigned"
-    white = engines.get(row["white_engine_id"], f"Engine {row['white_engine_id']}")
-    black = engines.get(row["black_engine_id"], f"Engine {row['black_engine_id']}")
+    white = engines.get(activity.white_engine_id, f"Engine {activity.white_engine_id}")
+    black = engines.get(activity.black_engine_id, f"Engine {activity.black_engine_id}")
     return _activity_view(
         status,
         verb,
-        f"Game #{row['game_id']} in round {row['round']}",
-        f"{row['tournament_name']}: {white} vs {black}",
-        href=f"/admin/tournaments/{row['tournament_id']}",
-        meta=f"{row['plies']} plies recorded",
+        f"Game #{activity.game_id} in round {activity.round}",
+        f"{activity.tournament_name}: {white} vs {black}",
+        href=f"/admin/tournaments/{activity.tournament_id}",
+        meta=f"{activity.plies} plies recorded",
     )
 
 
 def _worker_idle_activity(worker, effective_status: str) -> dict[str, Any]:
+    if effective_status == "minted" and worker.token_expires_at is None:
+        return _activity_view(
+            "pending",
+            "Needs token",
+            "Awaiting token generation",
+            "Generate a one-time token before starting the worker process.",
+        )
+
     states = {
         "minted": ("pending", "Awaiting registration", "Token has not been used", "No worker process has connected with this token.", False),
-        "ready": ("ready", "Idle", "Waiting for an eligible game", "The worker server is polling for tournament work.", False),
+        "ready": ("ready", "Idle", "Waiting for an eligible game", "The worker server is waiting for stream wake events or the next fallback scan.", False),
         "connected": ("connected", "Connected", "Preparing to accept work", "The machine is connected but has not started a game.", False),
         "building": ("building", "Building", "Preparing to accept work", "The machine is connected but has not started a game.", False),
         "stale": ("stale", "Stale", "No active machine connection", "The worker has not reported a recent connection event.", True),
@@ -1720,12 +2363,27 @@ def _selected_category_id(request: Request, categories: tuple[Any, ...]) -> int 
     return categories[0].id
 
 
+def _selected_viewer_game(request: Request, games: tuple[GameRecord, ...]) -> GameRecord | None:
+    raw_game_id = request.query_params.get("game_id")
+    if raw_game_id is not None:
+        try:
+            game_id = int(raw_game_id)
+        except ValueError:
+            raise HTTPException(status_code=404, detail="game not found") from None
+        for game in games:
+            if game.id == game_id:
+                return game
+        raise HTTPException(status_code=404, detail="game not found")
+
+    return _tournament_viewer_game(games)
+
+
 def _home_game_cards(
     connection: sqlite3.Connection,
     engines: dict[int, str],
 ) -> list[dict[str, Any]]:
     cards: list[dict[str, Any]] = []
-    for game in _active_games(connection):
+    for game in list_active_games(connection):
         tournament = get_tournament(connection, game.tournament_id)
         if tournament is None:
             continue
@@ -1748,24 +2406,13 @@ def _home_game_cards(
     return cards
 
 
-def _active_games(connection: sqlite3.Connection) -> tuple[GameRecord, ...]:
-    rows = connection.execute(
-        """
-        SELECT * FROM games
-        WHERE status IN ('live', 'assigned')
-        ORDER BY CASE status WHEN 'live' THEN 0 ELSE 1 END, id DESC
-        """
-    )
-    return tuple(_game_from_row(row) for row in rows)
-
-
 def _upcoming_rows(
     connection: sqlite3.Connection,
     engines: dict[int, str],
     *,
     limit: int,
 ) -> list[dict[str, str]]:
-    pending_games = _upcoming_games(connection, limit=limit)
+    pending_games = list_upcoming_games(connection, limit=limit)
     tournament_names = _tournament_names(connection)
     rows: list[dict[str, str]] = []
     for tournament in list_tournaments(connection):
@@ -1785,7 +2432,7 @@ def _upcoming_rows(
 
     rows.extend(
         {
-            "href": f"/games/{game.id}",
+            "href": f"/tournaments/{game.tournament_id}?game_id={game.id}",
             "tournament": tournament_names.get(game.tournament_id, f"Tournament {game.tournament_id}"),
             "round": str(game.round),
             "white": engines.get(game.white_engine_id, f"Engine {game.white_engine_id}"),
@@ -1796,19 +2443,6 @@ def _upcoming_rows(
     )
 
     return rows[:limit]
-
-
-def _upcoming_games(connection: sqlite3.Connection, *, limit: int) -> tuple[GameRecord, ...]:
-    rows = connection.execute(
-        """
-        SELECT * FROM games
-        WHERE status = 'pending'
-        ORDER BY id ASC
-        LIMIT ?
-        """,
-        (limit,),
-    )
-    return tuple(_game_from_row(row) for row in rows)
 
 
 def _tournament_viewer_game(games: tuple[GameRecord, ...]) -> GameRecord | None:
@@ -1827,6 +2461,7 @@ def _game_payload(
 ) -> dict[str, Any]:
     payload = {
         "id": game.id,
+        "tournament_id": game.tournament_id,
         "round": game.round,
         "status": game.status,
         "result": game.result,
@@ -1853,6 +2488,9 @@ def _move_payload(move: MoveRecord) -> dict[str, Any]:
         "eval_mate": move.eval_mate,
         "depth": move.depth,
         "nodes": move.nodes,
+        "nps": move.nps,
+        "pv": move.pv,
+        "info_line": move.info_line,
         "time_ms": move.time_ms,
         "clock_after_ms": move.clock_after_ms,
     }
@@ -1905,7 +2543,7 @@ def _merge_engine_data(
                 {
                     key: str(value)
                     for key, value in live_data[side].items()
-                    if key in {"depth", "nps", "nodes", "eval", "pv"}
+                    if key in {"depth", "nps", "nodes", "eval", "pv", "info", "root_fen"}
                 }
             )
     return merged
@@ -1944,10 +2582,6 @@ def _clock_label(value: Any) -> str:
     return f"{minutes:02d}:{seconds:02d}"
 
 
-def _sse_event(event: str, data: dict[str, Any]) -> str:
-    return f"event: {event}\ndata: {json.dumps(data, separators=(',', ':'))}\n\n"
-
-
 def _engine_data(
     game: GameRecord | None,
     moves: tuple[MoveRecord, ...],
@@ -1979,11 +2613,12 @@ def _engine_data_for_move(move: MoveRecord | None) -> dict[str, str]:
             "nps": "-",
             "nodes": "-",
             "eval": "-",
+            "info": "not recorded",
             "pv": "not recorded",
         }
 
-    nps = "-"
-    if move.nodes is not None and move.time_ms > 0:
+    nps = f"{move.nps:,}" if move.nps is not None else "-"
+    if move.nps is None and move.nodes is not None and move.time_ms > 0:
         nps = f"{int(move.nodes / (move.time_ms / 1000)):,}"
 
     return {
@@ -1991,7 +2626,8 @@ def _engine_data_for_move(move: MoveRecord | None) -> dict[str, str]:
         "nps": nps,
         "nodes": f"{move.nodes:,}" if move.nodes is not None else "-",
         "eval": _eval_label(move),
-        "pv": "not recorded",
+        "info": move.info_line or move.pv or "not recorded",
+        "pv": move.pv or "not recorded",
     }
 
 
@@ -2004,77 +2640,13 @@ def _eval_label(move: MoveRecord) -> str:
 
 
 def _opening_view(connection: sqlite3.Connection, opening_id: int | None) -> dict[str, str] | None:
-    if opening_id is None:
-        return None
-    row = connection.execute(
-        "SELECT name, fen FROM openings WHERE id = ?",
-        (opening_id,),
-    ).fetchone()
-    if row is None:
+    opening = get_opening_position(connection, opening_id)
+    if opening is None:
         return None
     return {
-        "name": row["name"] or "Opening",
-        "fen": row["fen"],
+        "name": opening.name,
+        "fen": opening.fen,
     }
-
-
-def _games_by_status(
-    connection: sqlite3.Connection,
-    status: str,
-    *,
-    limit: int,
-) -> tuple[GameRecord, ...]:
-    rows = connection.execute(
-        """
-        SELECT * FROM games
-        WHERE status = ?
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        (status, limit),
-    )
-    return tuple(_game_from_row(row) for row in rows)
-
-
-def _engine_games(
-    connection: sqlite3.Connection,
-    engine_id: int,
-) -> tuple[GameRecord, ...]:
-    rows = connection.execute(
-        """
-        SELECT * FROM games
-        WHERE white_engine_id = ? OR black_engine_id = ?
-        ORDER BY id DESC
-        LIMIT 50
-        """,
-        (engine_id, engine_id),
-    )
-    return tuple(_game_from_row(row) for row in rows)
-
-
-def _rating_rows(connection: sqlite3.Connection, category_id: int) -> list[dict[str, Any]]:
-    if not _table_exists(connection, "ratings"):
-        return []
-
-    rows = connection.execute(
-        """
-        SELECT engines.*, ratings.elo, ratings.games_played, ratings.updated_at
-        FROM ratings
-        JOIN engines ON engines.id = ratings.engine_id
-        WHERE ratings.category_id = ?
-        ORDER BY ratings.elo DESC, engines.name
-        """,
-        (category_id,),
-    )
-    return [
-        {
-            "engine": _engine_spec_from_row(row),
-            "elo": row["elo"],
-            "games_played": row["games_played"],
-            "updated_at": row["updated_at"],
-        }
-        for row in rows
-    ]
 
 
 def _engine_record_summary(games: tuple[GameRecord, ...], engine_id: int) -> dict[str, int]:
@@ -2158,31 +2730,6 @@ def _standings(
     return rows
 
 
-def _db_stats(connection: sqlite3.Connection) -> dict[str, int]:
-    return {
-        "categories": _count_rows(connection, "categories"),
-        "engines": _count_rows(connection, "engines"),
-        "tournaments": _count_rows(connection, "tournaments"),
-        "games": _count_rows(connection, "games"),
-        "workers": _count_rows(connection, "workers"),
-        "opening_suites": _count_rows(connection, "opening_suites"),
-    }
-
-
-def _complete_uncommitted_tournaments(
-    connection: sqlite3.Connection,
-) -> tuple[TournamentRecord, ...]:
-    committed_ids = {
-        row["tournament_id"]
-        for row in connection.execute("SELECT tournament_id FROM tournament_rating_commits")
-    }
-    return tuple(
-        tournament
-        for tournament in list_tournaments(connection)
-        if tournament.status == "finished" and tournament.id not in committed_ids
-    )
-
-
 def _tournaments_for_category(
     connection: sqlite3.Connection,
     category_id: int,
@@ -2191,55 +2738,6 @@ def _tournaments_for_category(
         tournament
         for tournament in list_tournaments(connection)
         if tournament.category_id == category_id
-    )
-
-
-def _table_exists(connection: sqlite3.Connection, table_name: str) -> bool:
-    row = connection.execute(
-        """
-        SELECT 1 FROM sqlite_master
-        WHERE type = 'table' AND name = ?
-        """,
-        (table_name,),
-    ).fetchone()
-    return row is not None
-
-
-def _count_rows(connection: sqlite3.Connection, table_name: str) -> int:
-    if not _table_exists(connection, table_name):
-        return 0
-    row = connection.execute(f"SELECT COUNT(*) AS count FROM {table_name}").fetchone()
-    return int(row["count"])
-
-
-def _game_from_row(row: sqlite3.Row) -> GameRecord:
-    return GameRecord(
-        id=row["id"],
-        tournament_id=row["tournament_id"],
-        round=row["round"],
-        pair_index=row["pair_index"],
-        white_engine_id=row["white_engine_id"],
-        black_engine_id=row["black_engine_id"],
-        opening_id=row["opening_id"],
-        status=row["status"],
-        result=row["result"],
-        termination=row["termination"],
-        pgn=row["pgn"],
-        started_at=row["started_at"],
-        finished_at=row["finished_at"],
-    )
-
-
-def _engine_spec_from_row(row: sqlite3.Row) -> EngineSpec:
-    return EngineSpec(
-        engine_id=row["id"],
-        name=row["name"],
-        git_url=row["git_url"],
-        branch=row["branch"],
-        commit=row["commit_hash"],
-        build_cmd=row["build_cmd"],
-        binary_path=row["binary_path"],
-        uci_options=json.loads(row["uci_options"]),
     )
 
 
@@ -2359,7 +2857,7 @@ def _engine_hardware_view(
     tournament: TournamentRecord,
 ) -> list[dict[str, str]]:
     engine_records = {engine.id: engine for engine in list_engine_records(connection)}
-    active_hardware = _active_engine_hardware(connection, tournament.id)
+    active_hardware = active_engine_hardware_profiles(connection, tournament.id)
     rows: list[dict[str, str]] = []
 
     for engine_id in tournament.config.participants:
@@ -2376,71 +2874,6 @@ def _engine_hardware_view(
         )
 
     return rows
-
-
-def _active_engine_hardware(
-    connection: sqlite3.Connection,
-    tournament_id: int,
-) -> dict[int, tuple[HardwareInfo, ...]]:
-    rows = connection.execute(
-        """
-        SELECT
-          games.white_engine_id,
-          games.black_engine_id,
-          game_assignments.hardware_mode,
-          white_workers.hw AS white_hw,
-          black_workers.hw AS black_hw
-        FROM game_assignments
-        JOIN games ON games.id = game_assignments.game_id
-        LEFT JOIN workers AS white_workers
-          ON white_workers.id = game_assignments.white_worker_id
-          AND white_workers.status IN ('connected', 'building', 'ready', 'busy')
-        LEFT JOIN workers AS black_workers
-          ON black_workers.id = game_assignments.black_worker_id
-          AND black_workers.status IN ('connected', 'building', 'ready', 'busy')
-        WHERE games.tournament_id = ?
-          AND games.status IN ('assigned', 'live')
-          AND game_assignments.status IN ('assigned', 'acked', 'live')
-        """,
-        (tournament_id,),
-    )
-
-    hardware_by_engine: dict[int, list[HardwareInfo]] = {}
-    seen: dict[int, set[str]] = {}
-    for row in rows:
-        white_hw = _hardware_from_json(row["white_hw"])
-        black_hw = _hardware_from_json(row["black_hw"])
-
-        if row["hardware_mode"] == "shared":
-            white_hw = white_hw or black_hw
-            black_hw = black_hw or white_hw
-
-        for engine_id, hw in (
-            (row["white_engine_id"], white_hw),
-            (row["black_engine_id"], black_hw),
-        ):
-            if hw is None:
-                continue
-            profile_key = hw.model_dump_json()
-            engine_seen = seen.setdefault(engine_id, set())
-            if profile_key in engine_seen:
-                continue
-            engine_seen.add(profile_key)
-            hardware_by_engine.setdefault(engine_id, []).append(hw)
-
-    return {
-        engine_id: tuple(profiles)
-        for engine_id, profiles in hardware_by_engine.items()
-    }
-
-
-def _hardware_from_json(value: str | None) -> HardwareInfo | None:
-    if value is None:
-        return None
-    try:
-        return HardwareInfo.model_validate_json(value)
-    except ValueError:
-        return None
 
 
 def _hardware_profiles_label(profiles: tuple[HardwareInfo, ...]) -> str:

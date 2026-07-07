@@ -15,11 +15,13 @@ class GameRunner:
         game: Game,
         clock_probe_interval: float = 0.001,
         on_tick: Callable[[chess.Color, int | None], None] | None = None,
+        on_clock_sync: Callable[[chess.Color, bool, int | None], None] | None = None,
     ):
         self._game = game
         self._clock_probe_interval = clock_probe_interval
         self._game_started = False
         self._on_tick = on_tick
+        self._on_clock_sync = on_clock_sync
 
     def get_game(self) -> Game:
         return self._game
@@ -46,6 +48,8 @@ class GameRunner:
 
         engine.start_search(board, self._build_go_command(clock))
         clock.start_clock()
+        if self._on_clock_sync is not None:
+            self._on_clock_sync(side_to_move, True, _clock_remaining_ms(clock))
 
         try:
             while engine.is_searching():
@@ -59,18 +63,26 @@ class GameRunner:
             engine.stop_search()
             clock.stop_clock_after_timeout()
             self._get_game_state().record_timeout(side_to_move)
+            if self._on_clock_sync is not None:
+                self._on_clock_sync(side_to_move, False, 0)
             return None
         except Exception as error:
             engine.stop_search()
             clock.stop_clock_after_timeout()
             self._get_game_state().record_engine_error(side_to_move, error)
+            if self._on_clock_sync is not None:
+                self._on_clock_sync(side_to_move, False, _clock_remaining_ms(clock))
             return None
         finally:
             if not self._get_game_state().is_finished():
                 try:
                     clock.stop_clock()
+                    if self._on_clock_sync is not None:
+                        self._on_clock_sync(side_to_move, False, _clock_remaining_ms(clock))
                 except TimeOutError:
                     self._get_game_state().record_timeout(side_to_move)
+                    if self._on_clock_sync is not None:
+                        self._on_clock_sync(side_to_move, False, 0)
 
         if self._get_game_state().is_finished():
             return None
@@ -142,3 +154,10 @@ class GameRunner:
 
         board.push(move)
         return True
+
+
+def _clock_remaining_ms(clock: TimeManager) -> int | None:
+    remaining_time = clock.get_remaining_time()
+    if remaining_time is not None:
+        return remaining_time
+    return clock.get_remaining_move_time()

@@ -14,6 +14,19 @@ document.querySelectorAll("[data-confirm]").forEach((button) => {
 });
 
 (() => {
+  const token = document.querySelector('meta[name="cope-csrf"]')?.content || "";
+  if (!token) return;
+  document.querySelectorAll('form[method="post"][action^="/admin"]').forEach((form) => {
+    if (form.querySelector('input[name="csrf_token"]')) return;
+    const field = document.createElement("input");
+    field.type = "hidden";
+    field.name = "csrf_token";
+    field.value = token;
+    form.prepend(field);
+  });
+})();
+
+(() => {
   const storageKey = "cope.chat.displayName";
   const fields = document.querySelectorAll("[data-chat-display-name]");
   if (!fields.length) return;
@@ -233,6 +246,85 @@ function fenFullmove(fen) {
   return Number.isInteger(fullmove) && fullmove > 0 ? fullmove : 1;
 }
 
+const MATERIAL_VALUES = {
+  P: 1,
+  N: 3,
+  B: 3,
+  R: 5,
+  Q: 9,
+};
+
+function materialScoreFromFen(fen) {
+  const placement = (fen || "").split(/\s+/, 1)[0];
+  let white = 0;
+  let black = 0;
+
+  for (const piece of placement) {
+    const value = MATERIAL_VALUES[piece.toUpperCase()] || 0;
+    if (!value) continue;
+    if (piece === piece.toUpperCase()) {
+      white += value;
+    } else {
+      black += value;
+    }
+  }
+
+  return white - black;
+}
+
+function createMaterialCounters(shell, grid) {
+  if (!shell.querySelector("[data-board-status]")) return null;
+
+  const dock = shell.querySelector("[data-material-counters]");
+  const blackRow = shell.querySelector(".player-row--black");
+  const whiteRow = shell.querySelector(".player-row--white");
+  const black = document.createElement("span");
+  black.className = "material-counter material-counter--black";
+  black.hidden = true;
+
+  const white = document.createElement("span");
+  white.className = "material-counter material-counter--white";
+  white.hidden = true;
+
+  if (dock) {
+    const equal = document.createElement("span");
+    equal.className = "material-counter material-counter--equal";
+    equal.hidden = true;
+    dock.append(white, black, equal);
+    return { black, white, equal };
+  } else if (blackRow && whiteRow) {
+    blackRow.classList.add("player-row--has-material-counter");
+    whiteRow.classList.add("player-row--has-material-counter");
+    blackRow.append(black);
+    whiteRow.append(white);
+  } else {
+    grid.append(black, white);
+  }
+
+  return { black, white };
+}
+
+function updateMaterialCounters(counters, fen) {
+  if (!counters) return;
+
+  const score = materialScoreFromFen(fen);
+  counters.white.hidden = score <= 0;
+  counters.black.hidden = score >= 0;
+  if (counters.equal) counters.equal.hidden = score !== 0;
+
+  if (score > 0) {
+    counters.white.textContent = counters.equal ? `White +${score}` : `+${score}`;
+    counters.white.title = `White is up ${score} material`;
+  } else if (score < 0) {
+    const blackScore = Math.abs(score);
+    counters.black.textContent = counters.equal ? `Black +${blackScore}` : `+${blackScore}`;
+    counters.black.title = `Black is up ${blackScore} material`;
+  } else if (counters.equal) {
+    counters.equal.textContent = "Equal";
+    counters.equal.title = "Material is equal";
+  }
+}
+
 function squareIndex(square) {
   return {
     file: square.charCodeAt(0) - 97,
@@ -329,6 +421,7 @@ function initBoard(shell, Chessground) {
     animation: { duration: 150 },
     drawable: { enabled: false },
   });
+  const materialCounters = createMaterialCounters(shell, grid);
 
   function render() {
     const lastMove = ply > 0 ? moves[ply - 1] : null;
@@ -337,6 +430,7 @@ function initBoard(shell, Chessground) {
       fen,
       lastMove: lastMove ? [lastMove.slice(0, 2), lastMove.slice(2, 4)] : undefined,
     });
+    updateMaterialCounters(materialCounters, fen);
     if (status) {
       status.textContent = moves.length
         ? `move ${ply} / ${moves.length}`
@@ -352,6 +446,9 @@ function initBoard(shell, Chessground) {
       const value = currentFen.querySelector("strong");
       if (value) value.textContent = fullFen;
     }
+    shell.dispatchEvent(new CustomEvent("cope:board-position", {
+      detail: { ply, fen, moves: moves.slice(0, ply) },
+    }));
   }
 
   function step(target) {
@@ -400,11 +497,28 @@ document.querySelectorAll("[data-tournament-live]").forEach((arena) => {
   const tournamentId = arena.dataset.tournamentId;
   if (!tournamentId) return;
 
+  const viewerLocked = arena.dataset.viewerLocked === "true";
   const liveBoard = arena.querySelector("[data-live-board]");
   const openingButton = arena.querySelector("[data-live-opening]");
+  const replayMoves = parseReplayMoves();
+  const pvBoards = {
+    white: arena.querySelector("[data-live-white-pv-board]"),
+    black: arena.querySelector("[data-live-black-pv-board]"),
+  };
+  const engineState = {
+    white: emptyEngineState(),
+    black: emptyEngineState(),
+  };
   let lastGameId = null;
   let lastMoveKey = "";
   let stopped = false;
+  let currentOpening = {
+    name: openingButton?.querySelector("strong")?.textContent || "Start position",
+    fen: liveBoard?.dataset.fen || "startpos",
+  };
+  let currentMoves = [];
+  let clockState = null;
+  let clockFrame = null;
 
   function setText(selector, value) {
     const element = arena.querySelector(selector);
@@ -423,12 +537,87 @@ document.querySelectorAll("[data-tournament-live]").forEach((arena) => {
     if (link && id !== null) link.href = `/engines/${id}`;
   }
 
-  function setEngineData(side, data) {
-    const values = data || {};
-    ["depth", "nodes", "nps", "eval"].forEach((name) => {
-      setLiveText(`${side}-${name}`, values[name] || "-");
+  function emptyEngineState() {
+    return {
+      depth: "-",
+      nodes: "-",
+      nps: "-",
+      eval: "-",
+      info: "not recorded",
+      pv: "not recorded",
+      rootFen: null,
+      rootMoves: [],
+    };
+  }
+
+  function displayValue(value, fallback = "-") {
+    if (value === undefined || value === null || value === "") return fallback;
+    return String(value);
+  }
+
+  function recordedPv(value) {
+    const pv = displayValue(value, "").trim();
+    return pv && pv.toLowerCase() !== "not recorded" ? pv : "";
+  }
+
+  function parsePvMoves(pv) {
+    return recordedPv(pv)
+      .split(/\s+/)
+      .map((move) => move.toLowerCase())
+      .filter((move) => /^[a-h][1-8][a-h][1-8][qrbn]?$/.test(move));
+  }
+
+  function setEngineData(side, data, options = {}) {
+    if (options.gameChanged || options.replace) {
+      engineState[side] = emptyEngineState();
+    }
+
+    const values = data && typeof data === "object" ? data : {};
+    const state = engineState[side];
+    ["depth", "nodes", "nps", "eval", "info"].forEach((name) => {
+      state[name] = displayValue(values[name], name === "info" ? "not recorded" : "-");
+      setLiveText(`${side}-${name}`, state[name]);
     });
-    setLiveText(`${side}-pv`, values.pv || "not recorded");
+
+    const pv = recordedPv(values.pv);
+    if (pv) {
+      state.pv = pv;
+      state.rootFen = displayValue(values.root_fen, "").trim() || null;
+      state.rootMoves = state.rootFen ? [] : (options.gameMoves || []).slice();
+    } else if (options.replace) {
+      state.pv = "not recorded";
+      state.rootFen = null;
+      state.rootMoves = [];
+    }
+    setLiveText(`${side}-pv`, state.pv);
+  }
+
+  function updatePvBoard(side, opening, gameMoves) {
+    const shell = pvBoards[side];
+    if (!shell) return;
+
+    const pvMoves = parsePvMoves(engineState[side].pv);
+    let fen = engineState[side].rootFen;
+    let moves = pvMoves;
+
+    if (!pvMoves.length) {
+      fen = opening.fen || "startpos";
+      moves = [];
+    } else if (!fen) {
+      fen = opening.fen || "startpos";
+      moves = (engineState[side].rootMoves || gameMoves).concat(pvMoves);
+    }
+
+    shell.dataset.fen = fen;
+    shell.dataset.moves = moves.join(" ");
+    if (shell.copeBoard) {
+      shell.copeBoard.updatePosition(fen, moves, { forceLatest: true });
+    }
+  }
+
+  function updatePvBoards(opening, gameMoves) {
+    updatePvBoard("white", opening, gameMoves);
+    updatePvBoard("black", opening, gameMoves);
   }
 
   function setClocks(clocks) {
@@ -436,6 +625,52 @@ document.querySelectorAll("[data-tournament-live]").forEach((arena) => {
     ["white", "black"].forEach((side) => {
       setLiveText(`${side}-clock`, values[side] || "--:--");
     });
+  }
+
+  function clockLabel(milliseconds) {
+    if (milliseconds === undefined || milliseconds === null) return "--:--";
+    const total = Math.max(0, Math.floor(Number(milliseconds) || 0));
+    const seconds = Math.floor(total / 1000);
+    const minutes = Math.floor(seconds / 60);
+    const remainder = seconds % 60;
+    return `${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`;
+  }
+
+  function stopClockRender() {
+    if (clockFrame !== null) {
+      window.cancelAnimationFrame(clockFrame);
+      clockFrame = null;
+    }
+  }
+
+  function renderClockState() {
+    if (!clockState) return;
+    const elapsed = clockState.running
+      ? Math.max(0, Date.now() - clockState.startedAt)
+      : 0;
+    ["white", "black"].forEach((side) => {
+      let value = clockState.clocksMs[side];
+      if (clockState.running && clockState.activeSide === side && value !== null && value !== undefined) {
+        value = Math.max(0, Number(value) - elapsed);
+      }
+      setLiveText(`${side}-clock`, clockLabel(value));
+    });
+    if (clockState.running) {
+      clockFrame = window.requestAnimationFrame(renderClockState);
+    }
+  }
+
+  function applyClockSync(envelope) {
+    const data = envelope?.data || {};
+    const sentAt = Date.parse(envelope.sent_at || "");
+    clockState = {
+      activeSide: data.active_side || null,
+      running: Boolean(data.running),
+      clocksMs: data.clocks_ms || {},
+      startedAt: Number.isFinite(sentAt) ? sentAt : Date.now(),
+    };
+    stopClockRender();
+    renderClockState();
   }
 
   function linkedRow(href) {
@@ -467,6 +702,91 @@ document.querySelectorAll("[data-tournament-live]").forEach((arena) => {
     return result || "-";
   }
 
+  function parseReplayMoves() {
+    const script = arena.querySelector("[data-viewer-moves]");
+    if (!script) return [];
+    try {
+      const moves = JSON.parse(script.textContent || "[]");
+      return Array.isArray(moves) ? moves : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function formatNumber(value) {
+    if (value === undefined || value === null || value === "") return "-";
+    const number = Number(value);
+    return Number.isFinite(number) ? number.toLocaleString() : String(value);
+  }
+
+  function formatEval(move) {
+    if (!move) return "-";
+    if (move.eval_mate !== undefined && move.eval_mate !== null) return `#${move.eval_mate}`;
+    if (move.eval_cp !== undefined && move.eval_cp !== null) {
+      return (Number(move.eval_cp) / 100).toLocaleString(undefined, {
+        signDisplay: "always",
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      });
+    }
+    return "-";
+  }
+
+  function npsForMove(move) {
+    if (!move) return "-";
+    if (move.nps !== undefined && move.nps !== null) return formatNumber(move.nps);
+    const nodes = Number(move.nodes);
+    const timeMs = Number(move.time_ms);
+    if (Number.isFinite(nodes) && Number.isFinite(timeMs) && timeMs > 0) {
+      return Math.floor(nodes / (timeMs / 1000)).toLocaleString();
+    }
+    return "-";
+  }
+
+  function engineDataForMove(move) {
+    if (!move) return emptyEngineState();
+    return {
+      depth: displayValue(move.depth),
+      nodes: formatNumber(move.nodes),
+      nps: npsForMove(move),
+      eval: formatEval(move),
+      info: displayValue(move.info_line || move.pv, "not recorded"),
+      pv: displayValue(move.pv, "not recorded"),
+    };
+  }
+
+  function latestReplayMove(side, ply) {
+    const wantsWhite = side === "white";
+    for (let index = replayMoves.length - 1; index >= 0; index -= 1) {
+      const move = replayMoves[index];
+      if (!move || move.ply > ply) continue;
+      if ((move.ply % 2 === 1) === wantsWhite) return move;
+    }
+    return null;
+  }
+
+  function replayClockLabel(side, ply) {
+    const wantsWhite = side === "white";
+    for (let index = replayMoves.length - 1; index >= 0; index -= 1) {
+      const move = replayMoves[index];
+      if (!move || move.ply > ply) continue;
+      if ((move.ply % 2 === 1) === wantsWhite) return clockLabel(move.clock_after_ms);
+    }
+    return "--:--";
+  }
+
+  function applyReplayPly(ply) {
+    ["white", "black"].forEach((side) => {
+      const move = latestReplayMove(side, ply);
+      setEngineData(side, engineDataForMove(move), {
+        replace: true,
+        gameMoves: move ? currentMoves.slice(0, Math.max(0, move.ply - 1)) : [],
+      });
+      setLiveText(`${side}-clock`, replayClockLabel(side, ply));
+    });
+    updatePvBoards(currentOpening, currentMoves.slice(0, ply));
+  }
+
   function renderStandings(standings) {
     const body = document.querySelector("[data-live-standings]");
     if (!body || !Array.isArray(standings)) return;
@@ -486,7 +806,7 @@ document.querySelectorAll("[data-tournament-live]").forEach((arena) => {
     if (!body || !Array.isArray(games)) return;
 
     body.replaceChildren(...games.map((game) => {
-      const row = linkedRow(`/games/${game.id}`);
+      const row = linkedRow(`/tournaments/${game.tournament_id}?game_id=${game.id}`);
       appendCell(row, String(game.round), "col-narrow");
       appendCell(row, game.white_name || "White");
       appendCell(row, game.black_name || "Black");
@@ -505,11 +825,13 @@ document.querySelectorAll("[data-tournament-live]").forEach((arena) => {
     const moves = Array.isArray(payload.moves) ? payload.moves.map((move) => move.uci) : [];
     const moveKey = moves.join(" ");
     const gameChanged = (game ? game.id : null) !== lastGameId;
+    currentOpening = opening;
+    currentMoves = moves;
 
     setEngine("white", game);
     setEngine("black", game);
-    setEngineData("white", payload.engine_data?.white);
-    setEngineData("black", payload.engine_data?.black);
+    setEngineData("white", payload.engine_data?.white, { gameChanged, gameMoves: moves });
+    setEngineData("black", payload.engine_data?.black, { gameChanged, gameMoves: moves });
     setClocks(payload.clocks);
     renderStandings(payload.standings);
     renderGames(payload.games);
@@ -523,34 +845,189 @@ document.querySelectorAll("[data-tournament-live]").forEach((arena) => {
     }
 
     const boardNeedsUpdate = gameChanged || moveKey !== lastMoveKey;
-    if (liveBoard && !liveBoard.copeBoard && boardNeedsUpdate) {
-      return;
-    }
-
-    if (liveBoard?.copeBoard && boardNeedsUpdate) {
+    if (liveBoard && boardNeedsUpdate) {
       liveBoard.dataset.gameId = game ? game.id : "";
       liveBoard.dataset.fen = opening.fen || "startpos";
       liveBoard.dataset.moves = moveKey;
-      liveBoard.copeBoard.updatePosition(opening.fen || "startpos", moves, {
-        forceLatest: gameChanged,
-      });
+      if (liveBoard.copeBoard) {
+        liveBoard.copeBoard.updatePosition(opening.fen || "startpos", moves, {
+          forceLatest: gameChanged,
+        });
+      }
     }
+    updatePvBoards(opening, moves);
 
     lastGameId = game ? game.id : null;
     lastMoveKey = moveKey;
     if (!game && ["finished", "aborted"].includes(payload.tournament?.status)) {
       stopped = true;
+      stopClockRender();
     }
   }
 
+  if (viewerLocked) {
+    currentMoves = replayMoves.map((move) => move.uci).filter(Boolean);
+    liveBoard?.addEventListener("cope:board-position", (event) => {
+      applyReplayPly(event.detail?.ply || 0);
+    });
+    applyReplayPly(currentMoves.length);
+    return;
+  }
+
   const events = new EventSource(`/tournaments/${tournamentId}/events`);
-  events.addEventListener("snapshot", (event) => {
+
+  function parseEnvelope(event) {
     try {
-      applyLivePayload(JSON.parse(event.data));
+      return JSON.parse(event.data);
     } catch {
+      return null;
     }
+  }
+
+  events.addEventListener("tournament.snapshot", (event) => {
+    const envelope = parseEnvelope(event);
+    if (envelope) applyLivePayload(envelope.data);
   });
+
+  events.addEventListener("engine.info", (event) => {
+    const envelope = parseEnvelope(event);
+    const data = envelope?.data || {};
+    const side = data.side;
+    if (side !== "white" && side !== "black") return;
+    setEngineData(side, data.engine_data || data, { gameMoves: currentMoves });
+    updatePvBoard(side, currentOpening, currentMoves);
+  });
+
+  events.addEventListener("clock.sync", (event) => {
+    const envelope = parseEnvelope(event);
+    if (envelope) applyClockSync(envelope);
+  });
+
+  events.addEventListener("game.move", () => {
+    stopClockRender();
+  });
+
+  events.onerror = () => {
+    if (stopped) {
+      events.close();
+    }
+  };
 });
+
+(() => {
+  const table = document.querySelector("[data-worker-monitor]");
+  if (!table) return;
+
+  function statusBadge(status) {
+    const badge = document.createElement("span");
+    badge.className = `badge badge--${status}`;
+    badge.textContent = status;
+    return badge;
+  }
+
+  function rowIds() {
+    return Array.from(table.querySelectorAll("[data-worker-row]"))
+      .map((row) => row.dataset.workerRow || "")
+      .filter(Boolean);
+  }
+
+  function sameIds(workers) {
+    const current = rowIds();
+    const next = workers.map((worker) => String(worker.id));
+    return current.length === next.length && current.every((id, index) => id === next[index]);
+  }
+
+  function setWork(row, work) {
+    const summary = row.querySelector("[data-worker-work-summary]");
+    const activityLabel = row.querySelector("[data-worker-work-label]");
+    const detail = row.querySelector("[data-worker-work-detail]");
+    const meta = row.querySelector("[data-worker-work-meta]");
+    if (activityLabel) {
+      activityLabel.className = `worker-state worker-state--${work.status || "pending"}`;
+      activityLabel.textContent = work.label || "Pending";
+    }
+    if (summary) {
+      const label = work.summary || "No active assignment";
+      const value = document.createElement(work.href ? "a" : "strong");
+      if (work.href) value.href = work.href;
+      value.textContent = label;
+      if (activityLabel) {
+        summary.replaceChildren(activityLabel, value);
+      } else {
+        summary.replaceChildren(value);
+      }
+    }
+    if (detail) detail.textContent = work.detail || "";
+    if (meta) {
+      meta.textContent = work.meta || "";
+      meta.hidden = !work.meta;
+    }
+  }
+
+  function setMachine(row, machine) {
+    const element = row.querySelector("[data-worker-machine]");
+    if (!element) return;
+    element.className = `worker-state worker-state--${machine.status}`;
+    element.textContent = machine.label || machine.status || "";
+  }
+
+  function setHardware(row, hardware) {
+    const coresCell = row.querySelector("[data-worker-cores]");
+    const memoryCell = row.querySelector("[data-worker-memory]");
+    if (!coresCell || !memoryCell) return;
+    if (hardware.reported) {
+      const coresValue = document.createElement("strong");
+      const memoryValue = document.createElement("strong");
+      coresValue.textContent = hardware.cores || "-";
+      memoryValue.textContent = hardware.memory || "-";
+      coresCell.replaceChildren(coresValue);
+      memoryCell.replaceChildren(memoryValue);
+      return;
+    }
+    const emptyCores = document.createElement("span");
+    const emptyMemory = document.createElement("span");
+    emptyCores.className = "worker-table__subtle";
+    emptyMemory.className = "worker-table__subtle";
+    emptyCores.textContent = "-";
+    emptyMemory.textContent = "-";
+    coresCell.replaceChildren(emptyCores);
+    memoryCell.replaceChildren(emptyMemory);
+  }
+
+  function applyWorker(worker) {
+    const row = table.querySelector(`[data-worker-row="${worker.id}"]`);
+    if (!row) return;
+    const statusCell = row.querySelector("[data-worker-status]");
+    if (statusCell) statusCell.replaceChildren(statusBadge(worker.status || "offline"));
+    row.classList.toggle("worker-row--abnormal", Boolean(worker.work?.abnormal));
+    setWork(row, worker.work || {});
+    setMachine(row, worker.machine || {});
+    setHardware(row, worker.hardware || {});
+  }
+
+  function applyWorkersPayload(payload) {
+    const workers = Array.isArray(payload?.workers) ? payload.workers : [];
+    if (!sameIds(workers)) {
+      window.location.reload();
+      return;
+    }
+    workers.forEach(applyWorker);
+  }
+
+  function parseEnvelope(event) {
+    try {
+      return JSON.parse(event.data);
+    } catch {
+      return null;
+    }
+  }
+
+  const events = new EventSource("/admin/workers/events");
+  events.addEventListener("workers.snapshot", (event) => {
+    const envelope = parseEnvelope(event);
+    if (envelope) applyWorkersPayload(envelope.data);
+  });
+})();
 
 document.querySelectorAll("[data-copy]").forEach((element) => {
   element.addEventListener("click", async () => {

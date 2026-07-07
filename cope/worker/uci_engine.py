@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import queue
 import subprocess
@@ -10,6 +11,10 @@ from collections.abc import Callable
 from pathlib import Path
 
 from cope.core.models import EngineSpec
+from cope.core.stream import clamp_uci_info_line
+
+
+LOG = logging.getLogger("cope.worker.engine")
 
 
 class UciEngineProcess:
@@ -22,6 +27,13 @@ class UciEngineProcess:
         self._stdout_thread: threading.Thread | None = None
         self._io_lock = threading.Lock()
         self._built = False
+        LOG.info(
+            "engine wrapper created engine_id=%s engine=%s source_dir=%s binary=%s",
+            self._spec.engine_id,
+            self._spec.name,
+            self._source_dir,
+            self._binary_path,
+        )
 
     def handle_command(
         self,
@@ -29,7 +41,18 @@ class UciEngineProcess:
         line_callback: Callable[[str], None] | None = None,
     ) -> list[str]:
         with self._io_lock:
+            LOG.info(
+                "engine command handling engine_id=%s engine=%s command=%s",
+                self._spec.engine_id,
+                self._spec.name,
+                command,
+            )
             if command == "quit":
+                LOG.info(
+                    "engine quit command received engine_id=%s engine=%s",
+                    self._spec.engine_id,
+                    self._spec.name,
+                )
                 self.close()
                 return []
 
@@ -52,24 +75,66 @@ class UciEngineProcess:
         process = self._process
         self._process = None
         if process is None:
+            LOG.info(
+                "engine close skipped engine_id=%s engine=%s reason=not_started",
+                self._spec.engine_id,
+                self._spec.name,
+            )
             return
+        LOG.info(
+            "engine closing engine_id=%s engine=%s pid=%s",
+            self._spec.engine_id,
+            self._spec.name,
+            process.pid,
+        )
         try:
             if process.poll() is None and process.stdin is not None:
                 try:
+                    LOG.info(
+                        "engine stdin sending shutdown engine_id=%s engine=%s pid=%s line=%s",
+                        self._spec.engine_id,
+                        self._spec.name,
+                        process.pid,
+                        "quit",
+                    )
                     process.stdin.write("quit\n")
                     process.stdin.flush()
                     process.wait(timeout=2)
                 except Exception:
+                    LOG.exception(
+                        "engine graceful shutdown failed engine_id=%s engine=%s pid=%s",
+                        self._spec.engine_id,
+                        self._spec.name,
+                        process.pid,
+                    )
                     pass
             if process.poll() is None:
+                LOG.warning(
+                    "engine terminating engine_id=%s engine=%s pid=%s",
+                    self._spec.engine_id,
+                    self._spec.name,
+                    process.pid,
+                )
                 process.terminate()
                 process.wait(timeout=2)
         except Exception:
             if process.poll() is None:
                 try:
+                    LOG.warning(
+                        "engine killing engine_id=%s engine=%s pid=%s",
+                        self._spec.engine_id,
+                        self._spec.name,
+                        process.pid,
+                    )
                     process.kill()
                     process.wait(timeout=2)
                 except Exception:
+                    LOG.exception(
+                        "engine kill failed engine_id=%s engine=%s pid=%s",
+                        self._spec.engine_id,
+                        self._spec.name,
+                        process.pid,
+                    )
                     pass
         finally:
             for stream in (process.stdin, process.stdout):
@@ -77,13 +142,33 @@ class UciEngineProcess:
                     if stream is not None:
                         stream.close()
                 except Exception:
+                    LOG.exception(
+                        "engine stream close failed engine_id=%s engine=%s pid=%s",
+                        self._spec.engine_id,
+                        self._spec.name,
+                        process.pid,
+                    )
                     pass
+            LOG.info(
+                "engine closed engine_id=%s engine=%s pid=%s return_code=%s",
+                self._spec.engine_id,
+                self._spec.name,
+                process.pid,
+                process.poll(),
+            )
 
     def _send(self, command: str) -> None:
         process = self._ensure_process()
         if process.stdin is None:
             raise RuntimeError(f"{self._spec.name} stdin is not available")
         try:
+            LOG.debug(
+                "engine stdin engine_id=%s engine=%s pid=%s line=%s",
+                self._spec.engine_id,
+                self._spec.name,
+                process.pid,
+                command,
+            )
             process.stdin.write(command + "\n")
             process.stdin.flush()
         except BrokenPipeError as exc:
@@ -91,8 +176,20 @@ class UciEngineProcess:
 
     def _ensure_process(self) -> subprocess.Popen[str]:
         if self._process is not None and self._process.poll() is None:
+            LOG.debug(
+                "engine process ready engine_id=%s engine=%s pid=%s",
+                self._spec.engine_id,
+                self._spec.name,
+                self._process.pid,
+            )
             return self._process
         if self._process is not None:
+            LOG.error(
+                "engine process exited engine_id=%s engine=%s return_code=%s",
+                self._spec.engine_id,
+                self._spec.name,
+                self._process.returncode,
+            )
             raise RuntimeError(
                 f"{self._spec.name} exited with code {self._process.returncode}"
             )
@@ -102,6 +199,13 @@ class UciEngineProcess:
             raise RuntimeError(f"{self._spec.name} binary does not exist: {self._binary_path}")
 
         try:
+            LOG.info(
+                "engine starting engine_id=%s engine=%s binary=%s cwd=%s",
+                self._spec.engine_id,
+                self._spec.name,
+                self._binary_path,
+                self._source_dir,
+            )
             self._process = subprocess.Popen(
                 [str(self._binary_path)],
                 cwd=self._source_dir,
@@ -114,6 +218,12 @@ class UciEngineProcess:
         except OSError as exc:
             raise RuntimeError(f"{self._spec.name} failed to start {self._binary_path}") from exc
 
+        LOG.info(
+            "engine started engine_id=%s engine=%s pid=%s",
+            self._spec.engine_id,
+            self._spec.name,
+            self._process.pid,
+        )
         self._stdout = queue.Queue()
         self._stdout_thread = threading.Thread(
             target=self._read_stdout,
@@ -125,6 +235,12 @@ class UciEngineProcess:
 
     def _ensure_built(self) -> None:
         if self._built and self._binary_path.exists():
+            LOG.info(
+                "engine build already prepared engine_id=%s engine=%s binary=%s",
+                self._spec.engine_id,
+                self._spec.name,
+                self._binary_path,
+            )
             return
 
         marker = self._source_dir / ".cope-build"
@@ -136,8 +252,22 @@ class UciEngineProcess:
             and self._binary_path.exists()
         ):
             self._built = True
+            LOG.info(
+                "engine build cache hit engine_id=%s engine=%s source_dir=%s commit=%s",
+                self._spec.engine_id,
+                self._spec.name,
+                self._source_dir,
+                self._spec.commit,
+            )
             return
 
+        LOG.info(
+            "engine build preparing engine_id=%s engine=%s source_dir=%s commit=%s",
+            self._spec.engine_id,
+            self._spec.name,
+            self._source_dir,
+            self._spec.commit,
+        )
         self._source_dir.parent.mkdir(parents=True, exist_ok=True)
         if not self._source_dir.exists():
             command = ["git", "clone"]
@@ -160,22 +290,60 @@ class UciEngineProcess:
             )
         marker.write_text(build_key, encoding="utf-8")
         self._built = True
+        LOG.info(
+            "engine build ready engine_id=%s engine=%s binary=%s",
+            self._spec.engine_id,
+            self._spec.name,
+            self._binary_path,
+        )
 
     def _read_stdout(self, process: subprocess.Popen[str]) -> None:
+        LOG.info(
+            "engine stdout reader started engine_id=%s engine=%s pid=%s",
+            self._spec.engine_id,
+            self._spec.name,
+            process.pid,
+        )
         if process.stdout is None:
             self._stdout.put(None)
+            LOG.warning(
+                "engine stdout unavailable engine_id=%s engine=%s pid=%s",
+                self._spec.engine_id,
+                self._spec.name,
+                process.pid,
+            )
             return
         try:
             for line in process.stdout:
-                self._stdout.put(line.rstrip("\r\n"))
+                line = clamp_uci_info_line(line.rstrip("\r\n"))
+                LOG.debug(
+                    "engine stdout engine_id=%s engine=%s pid=%s line=%s",
+                    self._spec.engine_id,
+                    self._spec.name,
+                    process.pid,
+                    line,
+                )
+                self._stdout.put(line)
         finally:
             self._stdout.put(None)
+            LOG.info(
+                "engine stdout reader stopped engine_id=%s engine=%s pid=%s return_code=%s",
+                self._spec.engine_id,
+                self._spec.name,
+                process.pid,
+                process.poll(),
+            )
 
     def _read_until(
         self,
         predicate,
         line_callback: Callable[[str], None] | None = None,
     ) -> list[str]:
+        LOG.debug(
+            "engine output wait started engine_id=%s engine=%s",
+            self._spec.engine_id,
+            self._spec.name,
+        )
         deadline = time.monotonic() + 60.0
         lines: list[str] = []
         while True:
@@ -194,6 +362,13 @@ class UciEngineProcess:
             if line_callback is not None and line.startswith("info"):
                 line_callback(line)
             if predicate(line):
+                LOG.debug(
+                    "engine output wait finished engine_id=%s engine=%s lines=%s terminal_line=%s",
+                    self._spec.engine_id,
+                    self._spec.name,
+                    len(lines),
+                    line,
+                )
                 return lines
 
     def _drain_available(self) -> list[str]:
@@ -202,6 +377,13 @@ class UciEngineProcess:
             try:
                 line = self._stdout.get_nowait()
             except queue.Empty:
+                LOG.debug(
+                    "engine output drained engine_id=%s engine=%s lines=%s%s",
+                    self._spec.engine_id,
+                    self._spec.name,
+                    len(lines),
+                    _line_sample(lines),
+                )
                 return lines
             if line is None:
                 process = self._process
@@ -229,6 +411,12 @@ def _build_key(spec: EngineSpec) -> str:
 
 
 def _run_checked(command, *, cwd: Path | None, shell: bool = False) -> None:
+    LOG.info(
+        "worker command started cwd=%s shell=%s command=%s",
+        cwd,
+        shell,
+        _format_command(command),
+    )
     try:
         completed = subprocess.run(
             command,
@@ -242,10 +430,38 @@ def _run_checked(command, *, cwd: Path | None, shell: bool = False) -> None:
     except OSError as exc:
         raise RuntimeError(f"failed to run command: {command}") from exc
 
+    output = (completed.stdout or "").strip()
+    if output:
+        LOG.debug(
+            "worker command output cwd=%s command=%s output=%s",
+            cwd,
+            _format_command(command),
+            output,
+        )
+    LOG.info(
+        "worker command finished cwd=%s exit_code=%s command=%s",
+        cwd,
+        completed.returncode,
+        _format_command(command),
+    )
     if completed.returncode != 0:
-        output = (completed.stdout or "").strip()
         if len(output) > 2000:
             output = output[-2000:]
         raise RuntimeError(
             f"command failed with exit code {completed.returncode}: {command}\n{output}"
         )
+
+
+def _format_command(command) -> str:
+    if isinstance(command, str):
+        return command
+    return " ".join(str(part) for part in command)
+
+
+def _line_sample(lines: list[str]) -> str:
+    if not lines:
+        return ""
+    line = lines[-1]
+    if len(line) > 200:
+        line = f"{line[:197]}..."
+    return f" last_line={line!r}"

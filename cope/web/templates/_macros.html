@@ -27,7 +27,7 @@
   {% endif %}
 {% endmacro %}
 
-{% macro games_table(games, engines, show_round=true, link_prefix="/games/", tbody_attr="") %}
+{% macro games_table(games, engines, show_round=true, tbody_attr="") %}
   <table class="data-table">
     <thead>
       <tr>
@@ -40,7 +40,7 @@
     </thead>
     <tbody {{ tbody_attr }}>
       {% for game in games %}
-        <tr data-href="{{ link_prefix }}{{ game.id }}">
+        <tr data-href="/tournaments/{{ game.tournament_id }}?game_id={{ game.id }}">
           {% if show_round %}<td class="col-narrow">{{ game.round }}</td>{% endif %}
           <td>{{ engine_name(engines, game.white_engine_id) }}</td>
           <td>{{ engine_name(engines, game.black_engine_id) }}</td>

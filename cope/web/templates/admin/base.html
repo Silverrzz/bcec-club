@@ -3,6 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="cope-csrf" content="{{ csrf_token }}">
     <title>{% block title %}Admin - COPE Chess{% endblock %}</title>
     <link rel="stylesheet" href="{{ url_for('static', path='style.css') }}">
     <script src="{{ url_for('static', path='script.js') }}" defer></script>
@@ -10,6 +11,9 @@
   <body class="admin-body">
     <header class="admin-topbar">
       <a class="admin-topbar__brand" href="/admin">&#9822; COPE Admin</a>
+      <form method="post" action="/admin/logout">
+        <button class="admin-topbar__link" type="submit">Sign out</button>
+      </form>
       <a class="admin-topbar__link" href="/" title="Back to the public site">View site &rarr;</a>
     </header>
 

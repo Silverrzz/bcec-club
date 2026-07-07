@@ -59,10 +59,11 @@
       <h2>Workers</h2>
       {% if workers %}
         <ul class="admin-list">
-          {% for worker in workers %}
+          {% for row in workers %}
+            {% set worker = row.worker %}
             <li>
               <span>{{ worker.label }}</span>
-              {{ status_badge(worker.status) }}
+              {{ status_badge(row.status) }}
               <span class="muted">{{ worker.last_seen or "never seen" }}</span>
             </li>
           {% endfor %}
@@ -80,7 +81,7 @@
         <ul class="admin-list">
           {% for game in live_games %}
             <li>
-              <a href="/games/{{ game.id }}">
+              <a href="/tournaments/{{ game.tournament_id }}?game_id={{ game.id }}">
                 {{ engine_name(engines, game.white_engine_id) }} vs {{ engine_name(engines, game.black_engine_id) }}
               </a>
             </li>
@@ -97,7 +98,7 @@
         <ul class="admin-list">
           {% for game in recent_games %}
             <li>
-              <a href="/games/{{ game.id }}">
+              <a href="/tournaments/{{ game.tournament_id }}?game_id={{ game.id }}">
                 {{ engine_name(engines, game.white_engine_id) }} {{ game.result }} {{ engine_name(engines, game.black_engine_id) }}
               </a>
             </li>

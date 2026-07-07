@@ -233,6 +233,11 @@ button {
   font-size: 12px;
 }
 
+.button.copied {
+  color: $success;
+  border-color: $success;
+}
+
 // --- Forms -------------------------------------------------------------
 
 .input {

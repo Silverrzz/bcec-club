@@ -4,7 +4,7 @@ import io
 import logging
 import secrets
 import sqlite3
-import time
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -25,6 +25,7 @@ from cope.db import (
     GameAssignmentRecord,
     GameRecord,
     MoveRecord,
+    OpeningPositionRecord,
     TournamentRecord,
     WorkerRecord,
     assign_game_to_worker,
@@ -32,8 +33,10 @@ from cope.db import (
     finish_game_assignment,
     finish_game,
     get_engine,
+    get_engine_name,
     get_game,
     get_game_assignment,
+    get_opening_position,
     get_tournament,
     initialize_database,
     list_games,
@@ -42,11 +45,19 @@ from cope.db import (
     mark_game_assignment_live,
     mark_game_live,
     record_move,
+    set_tournament_current_round_at_least,
     set_tournament_status,
 )
 
 from .scheduler import TournamentPreparation, prepare_scheduled_tournaments
-from .events import publish_tournament_event
+from .events import (
+    publish_clock_sync,
+    publish_engine_info,
+    publish_game_move,
+    publish_tournament_event,
+    set_runner_wake_handler,
+    start_event_publisher,
+)
 from cope.tournament.engine_instance import (
     EngineInstance,
     EngineCommandTransport,
@@ -60,6 +71,7 @@ from cope.tournament.tournament import Game
 
 TERMINAL_GAME_STATUSES = {"finished", "abandoned"}
 DEFAULT_WORKER_MAX_PLIES = 160
+DEFAULT_MAX_MOVES_DECISIVE_CP = 800
 LOG = logging.getLogger("cope.runner")
 
 
@@ -76,21 +88,18 @@ class RunnerServiceConfig:
     poll_interval_s: float = 2.0
 
 
-@dataclass(frozen=True, slots=True)
-class OpeningPosition:
-    name: str
-    fen: str
-
-
 def run_tournament_service(config: RunnerServiceConfig) -> None:
     initialize_database(config.db_path)
     LOG.info(
-        "service started db=%s poll_interval_s=%s",
+        "service started db=%s wake_mode=stream",
         config.db_path,
-        config.poll_interval_s,
     )
+    wake = threading.Event()
+    set_runner_wake_handler(lambda _event: wake.set())
+    start_event_publisher()
 
     while True:
+        wake.clear()
         connection: sqlite3.Connection | None = None
         try:
             connection = connect_database(config.db_path)
@@ -102,7 +111,7 @@ def run_tournament_service(config: RunnerServiceConfig) -> None:
             if connection is not None:
                 connection.close()
 
-        time.sleep(config.poll_interval_s)
+        wake.wait(timeout=max(config.poll_interval_s, 0.1))
 
 
 def run_tournament_matches(
@@ -161,23 +170,6 @@ def print_runner_report(report: RunnerReport) -> None:
         LOG.info("finished tournaments count=%s", report.tournaments_finished)
 
 
-def _set_current_round(
-    connection: sqlite3.Connection,
-    tournament: TournamentRecord,
-    round_number: int,
-) -> None:
-    if tournament.current_round >= round_number:
-        return
-    connection.execute(
-        """
-        UPDATE tournaments
-        SET current_round = ?
-        WHERE id = ? AND current_round < ?
-        """,
-        (round_number, tournament.id, round_number),
-    )
-
-
 def next_worker_assignment(
     connection: sqlite3.Connection,
     worker: WorkerRecord,
@@ -190,7 +182,7 @@ def next_worker_assignment(
         if game is None:
             continue
 
-        _set_current_round(connection, tournament, game.round)
+        set_tournament_current_round_at_least(connection, tournament.id, game.round)
         assignment_record = assign_game_to_worker(
             connection,
             game_id=game.id,
@@ -198,7 +190,7 @@ def next_worker_assignment(
             hardware_mode=tournament.config.hardware_mode.value,
             worker_id=worker.id,
         )
-        opening = _opening_position(connection, game.opening_id)
+        opening = get_opening_position(connection, game.opening_id)
         LOG.info(
             "claimed game worker_id=%s assignment_id=%s game_id=%s tournament=%s round=%s",
             worker.id,
@@ -235,7 +227,7 @@ def run_worker_assignment_game(
     assignment_record = _validated_assignment_record(connection, assignment)
     game_record = _validated_game(connection, assignment.assignment.game_id)
     tournament = _validated_tournament(connection, game_record.tournament_id)
-    opening = _opening_position(connection, game_record.opening_id)
+    opening = get_opening_position(connection, game_record.opening_id)
     board = _starting_board(opening)
     _apply_recorded_moves(board, list_moves(connection, game_record.id))
     LOG.info(
@@ -267,7 +259,9 @@ def run_worker_assignment_game(
         black_tm=runtime_time_control.create_manager(),
     )
     live_reporter = _LiveGameReporter(tournament.id, game_record.id, game, white, black)
-    runner = GameRunner(game, on_tick=live_reporter.publish)
+    white.set_info_listener(live_reporter.publish_white_engine_info)
+    black.set_info_listener(live_reporter.publish_black_engine_info)
+    runner = GameRunner(game, on_clock_sync=live_reporter.publish_clock_sync)
 
     mark_worker_assignment_live(connection, assignment.assignment.assignment_id)
     _validated_assignment_record(connection, assignment)
@@ -286,6 +280,7 @@ def run_worker_assignment_game(
         engine = white if side_to_move == chess.WHITE else black
         search = engine.get_last_search_result()
         clock = game.white_tm if side_to_move == chess.WHITE else game.black_tm
+        clock_after_ms = _clock_time_ms(clock)
         record_move(
             connection,
             game_id=game_record.id,
@@ -296,11 +291,14 @@ def run_worker_assignment_game(
             eval_mate=None if search is None else search.eval_mate,
             depth=None if search is None else search.depth,
             nodes=None if search is None else search.nodes,
+            nps=None if search is None else search.nps,
+            pv=None if search is None else search.pv,
+            info_line=None if search is None else search.info_line,
             time_ms=0 if search is None else search.time_ms,
-            clock_after_ms=clock.get_remaining_time() or clock.get_remaining_move_time() or 0,
+            clock_after_ms=clock_after_ms if clock_after_ms is not None else 0,
         )
         connection.commit()
-        publish_tournament_event(tournament.id, {"clear": True})
+        publish_game_move(tournament.id, game_record.id, board.ply())
         if board.ply() <= 10 or board.ply() % 10 == 0:
             LOG.info(
                 "recorded move game_id=%s ply=%s move=%s",
@@ -308,17 +306,15 @@ def run_worker_assignment_game(
                 board.ply(),
                 move.uci(),
             )
-        publish_tournament_event(tournament.id)
 
     _validated_assignment_record(connection, assignment)
+    moves = list_moves(connection, game_record.id)
     if not game.state.is_finished():
-        result = "1/2-1/2"
-        termination = "max moves"
+        result, termination = _max_moves_result(tournament, moves)
     else:
         result = game.state.get_result()
         termination = game.state.get_details() or "unknown"
 
-    moves = list_moves(connection, game_record.id)
     pgn = _build_pgn(connection, tournament, game_record, opening, moves, result, termination)
     finish_game(
         connection,
@@ -349,33 +345,58 @@ class _LiveGameReporter:
         game: Game,
         white: EngineInstance,
         black: EngineInstance,
-        interval_s: float = 0.25,
     ):
         self._tournament_id = tournament_id
         self._game_id = game_id
         self._game = game
         self._white = white
         self._black = black
-        self._interval_s = interval_s
-        self._last_publish = 0.0
 
-    def publish(self, side_to_move: chess.Color, active_remaining_ms: int | None) -> None:
-        now = time.monotonic()
-        if now - self._last_publish < self._interval_s:
-            return
-        self._last_publish = now
+    def publish_white_engine_info(self, line: str, info: EngineSearchInfo) -> None:
+        self._publish_engine_info("white", self._white, line, info)
 
+    def publish_black_engine_info(self, line: str, info: EngineSearchInfo) -> None:
+        self._publish_engine_info("black", self._black, line, info)
+
+    def publish_clock_sync(
+        self,
+        side_to_move: chess.Color,
+        running: bool,
+        active_remaining_ms: int | None,
+    ) -> None:
         side = "white" if side_to_move == chess.WHITE else "black"
-        engine = self._white if side_to_move == chess.WHITE else self._black
-        publish_tournament_event(
+        publish_clock_sync(
             self._tournament_id,
             {
+                "tournament_id": self._tournament_id,
                 "game_id": self._game_id,
                 "active_side": side,
-                "clocks": _live_clock_payload(self._game, side, active_remaining_ms),
-                "engine_data": {
-                    side: _live_engine_data(engine.get_current_search_info()),
-                },
+                "running": running,
+                "clocks_ms": _live_clock_payload(self._game, side, active_remaining_ms),
+            },
+        )
+
+    def _publish_engine_info(
+        self,
+        side: str,
+        engine: EngineInstance,
+        line: str,
+        info: EngineSearchInfo,
+    ) -> None:
+        engine_data = _live_engine_data(info)
+        root_fen = self._game.state.get_board().fen()
+        engine_data["root_fen"] = root_fen
+        engine_data["info"] = line
+        publish_engine_info(
+            self._tournament_id,
+            {
+                "tournament_id": self._tournament_id,
+                "game_id": self._game_id,
+                "engine_id": engine.get_name(),
+                "side": side,
+                "raw": line,
+                "root_fen": root_fen,
+                "engine_data": engine_data,
             },
         )
 
@@ -398,7 +419,10 @@ def _live_clock_payload(
 
 
 def _clock_time_ms(clock) -> int | None:
-    return clock.get_remaining_time() or clock.get_remaining_move_time()
+    remaining_time = clock.get_remaining_time()
+    if remaining_time is not None:
+        return remaining_time
+    return clock.get_remaining_move_time()
 
 
 def _live_engine_data(info: EngineSearchInfo | None) -> dict[str, str]:
@@ -437,7 +461,7 @@ def _worker_assignment_payload(
     tournament: TournamentRecord,
     game: GameRecord,
     assignment: GameAssignmentRecord,
-    opening: OpeningPosition | None,
+    opening: OpeningPositionRecord | None,
 ) -> WorkerGameAssignment:
     return WorkerGameAssignment(
         assignment=GameAssignment(
@@ -515,8 +539,8 @@ def _validated_game(connection: sqlite3.Connection, game_id: int) -> GameRecord:
     game = get_game(connection, game_id)
     if game is None:
         raise RuntimeError(f"unknown game {game_id}")
-    if game.status == "finished":
-        raise RuntimeError(f"game {game_id} is already finished")
+    if game.status in TERMINAL_GAME_STATUSES:
+        raise RuntimeError(f"game {game_id} is already {game.status}")
     return game
 
 
@@ -575,23 +599,7 @@ def _finish_tournament_if_complete(
     return True
 
 
-def _opening_position(
-    connection: sqlite3.Connection,
-    opening_id: int | None,
-) -> OpeningPosition | None:
-    if opening_id is None:
-        return None
-
-    row = connection.execute(
-        "SELECT name, fen FROM openings WHERE id = ?",
-        (opening_id,),
-    ).fetchone()
-    if row is None:
-        return None
-    return OpeningPosition(name=row["name"] or "Opening", fen=row["fen"])
-
-
-def _starting_board(opening: OpeningPosition | None) -> chess.Board:
+def _starting_board(opening: OpeningPositionRecord | None) -> chess.Board:
     if opening is None or opening.fen == "startpos":
         return chess.Board()
     return chess.Board(opening.fen)
@@ -615,11 +623,57 @@ def _max_plies(tournament: TournamentRecord) -> int:
     return DEFAULT_WORKER_MAX_PLIES
 
 
+def _max_moves_result(
+    tournament: TournamentRecord,
+    moves: tuple[MoveRecord, ...],
+) -> tuple[str, str]:
+    score = _latest_white_relative_score(moves)
+    if score is None:
+        return "1/2-1/2", "max moves"
+
+    mate, cp = score
+    if mate is not None:
+        if mate > 0:
+            return "1-0", "max moves: white has forced mate"
+        if mate < 0:
+            return "0-1", "max moves: black has forced mate"
+        return "1/2-1/2", "max moves"
+
+    if cp is None:
+        return "1/2-1/2", "max moves"
+
+    threshold = _max_moves_decisive_cp(tournament)
+    if cp >= threshold:
+        return "1-0", f"max moves: white winning by evaluation ({cp / 100:+.2f})"
+    if cp <= -threshold:
+        return "0-1", f"max moves: black winning by evaluation ({cp / 100:+.2f})"
+    return "1/2-1/2", f"max moves: evaluation within decisive threshold ({cp / 100:+.2f})"
+
+
+def _latest_white_relative_score(
+    moves: tuple[MoveRecord, ...],
+) -> tuple[int | None, int | None] | None:
+    for move in reversed(moves):
+        mover_sign = 1 if move.ply % 2 == 1 else -1
+        if move.eval_mate is not None:
+            return mover_sign * move.eval_mate, None
+        if move.eval_cp is not None:
+            return None, mover_sign * move.eval_cp
+    return None
+
+
+def _max_moves_decisive_cp(tournament: TournamentRecord) -> int:
+    resign_rule = tournament.config.adjudication.resign
+    if resign_rule is not None:
+        return resign_rule.min_abs_cp
+    return DEFAULT_MAX_MOVES_DECISIVE_CP
+
+
 def _build_pgn(
     connection: sqlite3.Connection,
     tournament: TournamentRecord,
     game: GameRecord,
-    opening: OpeningPosition | None,
+    opening: OpeningPositionRecord | None,
     moves: tuple[MoveRecord, ...],
     result: str,
     termination: str,
@@ -631,8 +685,8 @@ def _build_pgn(
 
     pgn_game.headers["Event"] = tournament.name
     pgn_game.headers["Round"] = str(game.round)
-    pgn_game.headers["White"] = _engine_name(connection, game.white_engine_id)
-    pgn_game.headers["Black"] = _engine_name(connection, game.black_engine_id)
+    pgn_game.headers["White"] = get_engine_name(connection, game.white_engine_id)
+    pgn_game.headers["Black"] = get_engine_name(connection, game.black_engine_id)
     pgn_game.headers["Result"] = result
     pgn_game.headers["Termination"] = termination
     if opening is not None and opening.name:
@@ -650,10 +704,3 @@ def _build_pgn(
     exporter = chess.pgn.StringExporter(headers=True, variations=False, comments=False)
     print(pgn_game.accept(exporter), file=output)
     return output.getvalue().strip()
-
-
-def _engine_name(connection: sqlite3.Connection, engine_id: int) -> str:
-    row = connection.execute("SELECT name FROM engines WHERE id = ?", (engine_id,)).fetchone()
-    if row is None:
-        return f"Engine {engine_id}"
-    return row["name"]

@@ -11,6 +11,8 @@ from typing import Protocol, runtime_checkable
 
 import chess
 
+from cope.core.stream import clamp_uci_info_line
+
 from .uci import position_command, setoption_command
 
 
@@ -24,6 +26,7 @@ class EngineSearchResult:
     nps: int | None = None
     time_ms: int = 0
     pv: str | None = None
+    info_line: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +64,7 @@ class EngineInstance:
         self._search_future: Future | None = None
         self._last_search_result: EngineSearchResult | None = None
         self._current_search_info: EngineSearchInfo | None = None
+        self._info_listener: Callable[[str, EngineSearchInfo], None] | None = None
 
     def get_name(self):
         return self._name
@@ -79,6 +83,12 @@ class EngineInstance:
 
     def set_options(self, options: dict[str, str | int | bool]):
         self._options = dict(options)
+
+    def set_info_listener(
+        self,
+        listener: Callable[[str, EngineSearchInfo], None] | None,
+    ) -> None:
+        self._info_listener = listener
 
     def start_new_game(self):
         if self._is_remote():
@@ -152,9 +162,12 @@ class EngineInstance:
         return self._host.execute_engine_command(int(self._name), command, info_handler)
 
     def _record_info_line(self, line: str) -> None:
+        line = clamp_uci_info_line(line)
         info = _parse_info_line(line, self._current_search_info)
         if info is not None:
             self._current_search_info = info
+            if self._info_listener is not None:
+                self._info_listener(line, info)
 
     def _read_remote_until_token(self, command: str, token: str):
         lines = self._send_remote_command(command)
@@ -364,11 +377,13 @@ def _parse_search_result(
 ) -> EngineSearchResult:
     bestmove: chess.Move | None = None
     search_info = EngineSearchInfo()
+    info_line: str | None = None
 
     for line in lines:
         info = _parse_info_line(line, search_info)
         if info is not None:
             search_info = info
+            info_line = clamp_uci_info_line(line)
             continue
 
         parts = line.split()
@@ -394,12 +409,15 @@ def _parse_search_result(
         nps=search_info.nps,
         time_ms=search_info.time_ms,
         pv=search_info.pv,
+        info_line=info_line,
     )
 
 
 def _parse_info_line(line: str, previous: EngineSearchInfo | None) -> EngineSearchInfo | None:
     parts = line.split()
     if not parts or parts[0] != "info":
+        return None
+    if len(parts) >= 2 and parts[1] == "string":
         return None
 
     previous = previous or EngineSearchInfo()
@@ -414,11 +432,15 @@ def _parse_info_line(line: str, previous: EngineSearchInfo | None) -> EngineSear
     if "score" in parts:
         score_index = parts.index("score")
         if score_index + 2 < len(parts) and parts[score_index + 1] == "cp":
-            eval_cp = int(parts[score_index + 2])
-            eval_mate = None
+            score_cp = _int_at(parts, score_index + 2)
+            if score_cp is not None:
+                eval_cp = score_cp
+                eval_mate = None
         elif score_index + 2 < len(parts) and parts[score_index + 1] == "mate":
-            eval_mate = int(parts[score_index + 2])
-            eval_cp = None
+            score_mate = _int_at(parts, score_index + 2)
+            if score_mate is not None:
+                eval_mate = score_mate
+                eval_cp = None
 
     if "pv" in parts:
         pv_index = parts.index("pv")
@@ -440,6 +462,16 @@ def _int_after(parts: list[str], key: str, default: int | None) -> int | None:
     if key not in parts:
         return default
     index = parts.index(key)
-    if index + 1 >= len(parts):
+    value = _int_at(parts, index + 1)
+    if value is None:
         return default
-    return int(parts[index + 1])
+    return value
+
+
+def _int_at(parts: list[str], index: int) -> int | None:
+    if index >= len(parts):
+        return None
+    try:
+        return int(parts[index])
+    except ValueError:
+        return None

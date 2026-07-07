@@ -8,7 +8,7 @@
     {% if live_games %}
       <div class="live-game-list">
         {% for item in live_games %}
-          <article class="live-game-card" data-href="/games/{{ item.game.id }}">
+          <article class="live-game-card" data-href="/tournaments/{{ item.game.tournament_id }}?game_id={{ item.game.id }}">
             <div class="live-game-card__preview board-shell board-shell--preview" data-board data-fen="{{ item.opening.fen if item.opening else 'startpos' }}" data-moves="{{ item.moves | map(attribute='uci') | join(' ') }}">
               <div class="board board--preview" data-board-grid></div>
             </div>
@@ -100,7 +100,7 @@
           </thead>
           <tbody>
             {% for game in recent_games %}
-              <tr data-href="/games/{{ game.id }}">
+              <tr data-href="/tournaments/{{ game.tournament_id }}?game_id={{ game.id }}">
                 <td>{{ tournament_names.get(game.tournament_id, "Tournament " ~ game.tournament_id) }}</td>
                 <td class="col-narrow">{{ game.round }}</td>
                 <td>{{ engine_name(engines, game.white_engine_id) }}</td>

@@ -32,13 +32,35 @@ $admin-topbar-height: 46px;
   }
 
   &__link {
+    border: 0;
+    background: transparent;
     font-size: 13px;
     color: $muted;
+    cursor: pointer;
 
     &:hover {
       color: $text;
     }
   }
+
+  form {
+    margin-left: auto;
+  }
+
+  form + &__link {
+    margin-left: 16px;
+  }
+}
+
+.admin-login {
+  display: grid;
+  place-items: center;
+  min-height: 100vh;
+  padding: 24px;
+}
+
+.admin-login .settings-form {
+  width: min(420px, 100%);
 }
 
 .admin-shell {
@@ -243,9 +265,20 @@ $admin-topbar-height: 46px;
     width: 120px;
   }
 
-  th:nth-child(4),
-  th:nth-child(5) {
+  th:nth-child(4) {
     width: 160px;
+  }
+
+  th:nth-child(5) {
+    width: 78px;
+  }
+
+  th:nth-child(6) {
+    width: 96px;
+  }
+
+  th:nth-child(7) {
+    width: 92px;
   }
 
   .badge {
@@ -265,10 +298,33 @@ $admin-topbar-height: 46px;
   }
 }
 
+.worker-detail-label-form {
+  .field {
+    margin-bottom: 0;
+  }
+}
+
+.worker-detail-label-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+
+  .input {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  .button {
+    flex: 0 0 auto;
+  }
+}
+
 .worker-table__identity,
 .worker-table__work,
 .worker-table__state,
-.worker-table__hardware {
+.worker-table__cores,
+.worker-table__memory,
+.worker-table__actions {
   min-width: 0;
 
   > * + * {
@@ -292,18 +348,28 @@ $admin-topbar-height: 46px;
 }
 
 .worker-table__work,
-.worker-table__hardware {
+.worker-table__cores,
+.worker-table__memory {
   span,
   small,
   strong {
     overflow-wrap: anywhere;
   }
 
-  span,
+  span:not(.worker-state),
   small {
     color: $muted;
     font-size: 12px;
   }
+}
+
+.worker-table__work .worker-state {
+  font-size: 12px;
+}
+
+.worker-table__cores strong,
+.worker-table__memory strong {
+  font-size: 13px;
 }
 
 .worker-table__state {
@@ -407,7 +473,9 @@ $admin-topbar-height: 46px;
     .worker-table__identity,
     .worker-table__work,
     .worker-table__state,
-    .worker-table__hardware {
+    .worker-table__cores,
+    .worker-table__memory,
+    .worker-table__actions {
       align-items: start;
     }
 
