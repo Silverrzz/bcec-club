@@ -54,7 +54,6 @@ def build_settings(form: FormValues) -> dict[str, Any]:
     settings["format"] = form_value(form, "format", "round_robin")
     settings["format_options"] = _format_options(form, settings["format"], errors)
     settings["time_control"] = _time_control(form, errors)
-    settings["hardware_mode"] = form_value(form, "hardware_mode", "shared")
     settings["concurrency"] = _int_field(form, "concurrency", errors, "Concurrency", minimum=1, default=1)
     settings["rated"] = form_flag(form, "rated")
     settings["lag_compensation_ms"] = _int_field(
@@ -276,7 +275,6 @@ def settings_form_values(settings: dict[str, Any]) -> dict[str, Any]:
     settings form expects, for pre-filling inputs."""
     values: dict[str, Any] = {
         "format": settings.get("format", "round_robin"),
-        "hardware_mode": settings.get("hardware_mode", "shared"),
         "concurrency": settings.get("concurrency", 1),
         "rated": settings.get("rated", True),
         "lag_compensation_ms": settings.get("lag_compensation_ms", 50),

@@ -47,6 +47,9 @@ class GameRecord:
     pair_index: int
     white_engine_id: int
     black_engine_id: int
+    match_id: int | None
+    game_number: int
+    tiebreak_kind: str | None
     opening_id: int | None
     status: str
     result: str | None
@@ -54,6 +57,18 @@ class GameRecord:
     pgn: str | None
     started_at: str | None
     finished_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class TournamentMatchRecord:
+    id: int
+    tournament_id: int
+    round: int
+    match_index: int
+    engine1_id: int
+    engine2_id: int | None
+    status: str
+    winner_engine_id: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,9 +94,7 @@ class GameAssignmentRecord:
     id: int
     game_id: int
     assignment_key: str
-    hardware_mode: str
-    white_worker_id: int | None
-    black_worker_id: int | None
+    worker_id: int | None
     status: str
     sent_at: str | None
     acked_at: str | None
@@ -162,9 +175,22 @@ class WorkerToken:
 class TournamentRatingCommitRecord:
     tournament_id: int
     category_id: int
+    command_id: int | None
     status: str
     requested_at: str
     applied_at: str | None
+    error: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class RunnerCommandRecord:
+    id: int
+    command: str
+    payload: dict[str, Any]
+    status: str
+    created_at: str
+    claimed_at: str | None
+    finished_at: str | None
     error: str | None
 
 
@@ -575,6 +601,12 @@ def update_tournament(
 
 def delete_tournament(connection: sqlite3.Connection, tournament_id: int) -> None:
     """Delete a tournament and its games, moves, and participants (cascade)."""
+    rating_commit = get_tournament_rating_commit(connection, tournament_id)
+    if rating_commit is not None:
+        if rating_commit.status == "applied":
+            raise ValueError("tournament results are already part of the ratings")
+        if rating_commit.status in {"pending", "claimed"}:
+            raise ValueError("tournament has a rating commit in progress")
     connection.execute("DELETE FROM tournaments WHERE id = ?", (tournament_id,))
 
 
@@ -586,6 +618,9 @@ def create_game(
     pair_index: int,
     white_engine_id: int,
     black_engine_id: int,
+    match_id: int | None = None,
+    game_number: int = 1,
+    tiebreak_kind: str | None = None,
     opening_id: int | None = None,
     status: str = "pending",
 ) -> int:
@@ -593,9 +628,9 @@ def create_game(
         """
         INSERT INTO games (
           tournament_id, round, pair_index, white_engine_id, black_engine_id,
-          opening_id, status
+          match_id, game_number, tiebreak_kind, opening_id, status
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             tournament_id,
@@ -603,11 +638,89 @@ def create_game(
             pair_index,
             white_engine_id,
             black_engine_id,
+            match_id,
+            game_number,
+            tiebreak_kind,
             opening_id,
             status,
         ),
     )
     return int(cursor.lastrowid)
+
+
+def create_tournament_match(
+    connection: sqlite3.Connection,
+    *,
+    tournament_id: int,
+    round: int,
+    match_index: int,
+    engine1_id: int,
+    engine2_id: int | None,
+    status: str = "pending",
+    winner_engine_id: int | None = None,
+) -> int:
+    cursor = connection.execute(
+        """
+        INSERT INTO tournament_matches (
+          tournament_id, round, match_index, engine1_id, engine2_id, status,
+          winner_engine_id
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            tournament_id,
+            round,
+            match_index,
+            engine1_id,
+            engine2_id,
+            status,
+            winner_engine_id,
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+def list_tournament_matches(
+    connection: sqlite3.Connection,
+    tournament_id: int,
+    *,
+    round: int | None = None,
+) -> tuple[TournamentMatchRecord, ...]:
+    if round is None:
+        rows = connection.execute(
+            """
+            SELECT * FROM tournament_matches
+            WHERE tournament_id = ?
+            ORDER BY round, match_index, id
+            """,
+            (tournament_id,),
+        )
+    else:
+        rows = connection.execute(
+            """
+            SELECT * FROM tournament_matches
+            WHERE tournament_id = ? AND round = ?
+            ORDER BY match_index, id
+            """,
+            (tournament_id, round),
+        )
+    return tuple(_tournament_match_from_row(row) for row in rows)
+
+
+def finish_tournament_match(
+    connection: sqlite3.Connection,
+    match_id: int,
+    *,
+    winner_engine_id: int | None,
+) -> None:
+    connection.execute(
+        """
+        UPDATE tournament_matches
+        SET status = 'finished', winner_engine_id = ?
+        WHERE id = ? AND status = 'pending'
+        """,
+        (winner_engine_id, match_id),
+    )
 
 
 def get_game(connection: sqlite3.Connection, game_id: int) -> GameRecord | None:
@@ -752,20 +865,13 @@ def create_game_assignment(
     *,
     game_id: int,
     assignment_key: str,
-    hardware_mode: str,
 ) -> int:
     cursor = connection.execute(
         """
-        INSERT INTO game_assignments (
-          game_id, assignment_key, hardware_mode, white_worker_id, black_worker_id
-        )
-        VALUES (?, ?, ?, NULL, NULL)
+        INSERT INTO game_assignments (game_id, assignment_key, worker_id)
+        VALUES (?, ?, NULL)
         """,
-        (
-            game_id,
-            assignment_key,
-            hardware_mode,
-        ),
+        (game_id, assignment_key),
     )
     return int(cursor.lastrowid)
 
@@ -803,22 +909,19 @@ def assign_game_to_worker(
     *,
     game_id: int,
     assignment_key: str,
-    hardware_mode: str,
     worker_id: int,
 ) -> GameAssignmentRecord:
     now = utc_now()
     connection.execute(
         """
         INSERT INTO game_assignments (
-          game_id, assignment_key, hardware_mode, white_worker_id, black_worker_id,
+          game_id, assignment_key, worker_id,
           status, sent_at, acked_at, finished_at, last_error
         )
-        VALUES (?, ?, ?, ?, ?, 'assigned', ?, NULL, NULL, NULL)
+        VALUES (?, ?, ?, 'assigned', ?, NULL, NULL, NULL)
         ON CONFLICT(game_id) DO UPDATE SET
           assignment_key = excluded.assignment_key,
-          hardware_mode = excluded.hardware_mode,
-          white_worker_id = excluded.white_worker_id,
-          black_worker_id = excluded.black_worker_id,
+          worker_id = excluded.worker_id,
           status = 'assigned',
           sent_at = excluded.sent_at,
           acked_at = NULL,
@@ -828,8 +931,6 @@ def assign_game_to_worker(
         (
             game_id,
             assignment_key,
-            hardware_mode,
-            worker_id,
             worker_id,
             now,
         ),
@@ -1184,11 +1285,11 @@ def _active_worker_tournament_ids(
             SELECT DISTINCT games.tournament_id
             FROM game_assignments
             JOIN games ON games.id = game_assignments.game_id
-            WHERE (game_assignments.white_worker_id = ? OR game_assignments.black_worker_id = ?)
+            WHERE game_assignments.worker_id = ?
               AND game_assignments.status IN ('assigned', 'acked', 'live')
               AND games.status IN ('assigned', 'live')
             """,
-            (worker_id, worker_id),
+            (worker_id,),
         )
     )
 
@@ -1208,11 +1309,11 @@ def _release_worker_active_assignments(
           AND id IN (
             SELECT game_id
             FROM game_assignments
-            WHERE (white_worker_id = ? OR black_worker_id = ?)
+            WHERE worker_id = ?
               AND status IN ('assigned', 'acked', 'live')
           )
         """,
-        (worker_id, worker_id),
+        (worker_id,),
     )
     connection.execute(
         """
@@ -1220,12 +1321,11 @@ def _release_worker_active_assignments(
         SET status = 'abandoned',
             finished_at = ?,
             last_error = ?,
-            white_worker_id = CASE WHEN white_worker_id = ? THEN NULL ELSE white_worker_id END,
-            black_worker_id = CASE WHEN black_worker_id = ? THEN NULL ELSE black_worker_id END
-        WHERE (white_worker_id = ? OR black_worker_id = ?)
+            worker_id = NULL
+        WHERE worker_id = ?
           AND status IN ('assigned', 'acked', 'live')
         """,
-        (now, reason[:500], worker_id, worker_id, worker_id, worker_id),
+        (now, reason[:500], worker_id),
     )
 
 
@@ -1239,11 +1339,11 @@ def delete_worker(connection: sqlite3.Connection, worker_id: int) -> None:
           AND id IN (
             SELECT game_id
             FROM game_assignments
-            WHERE (white_worker_id = ? OR black_worker_id = ?)
+            WHERE worker_id = ?
               AND status IN ('assigned', 'acked', 'live')
           )
         """,
-        (worker_id, worker_id),
+        (worker_id,),
     )
     connection.execute(
         """
@@ -1256,11 +1356,10 @@ def delete_worker(connection: sqlite3.Connection, worker_id: int) -> None:
               WHEN status IN ('assigned', 'acked', 'live') THEN ?
               ELSE finished_at
             END,
-            white_worker_id = CASE WHEN white_worker_id = ? THEN NULL ELSE white_worker_id END,
-            black_worker_id = CASE WHEN black_worker_id = ? THEN NULL ELSE black_worker_id END
-        WHERE white_worker_id = ? OR black_worker_id = ?
+            worker_id = NULL
+        WHERE worker_id = ?
         """,
-        (utc_now(), worker_id, worker_id, worker_id, worker_id),
+        (utc_now(), worker_id),
     )
     connection.execute("DELETE FROM workers WHERE id = ?", (worker_id,))
 
@@ -1445,27 +1544,101 @@ def enqueue_runner_command(
     return int(cursor.lastrowid)
 
 
+def claim_next_runner_command(
+    connection: sqlite3.Connection,
+) -> RunnerCommandRecord | None:
+    while True:
+        row = connection.execute(
+            """
+            SELECT * FROM runner_commands
+            WHERE status = 'pending'
+            ORDER BY id
+            LIMIT 1
+            """
+        ).fetchone()
+        if row is None:
+            return None
+
+        claimed_at = utc_now()
+        cursor = connection.execute(
+            """
+            UPDATE runner_commands
+            SET status = 'claimed', claimed_at = ?, finished_at = NULL, error = NULL
+            WHERE id = ? AND status = 'pending'
+            """,
+            (claimed_at, row["id"]),
+        )
+        if cursor.rowcount == 0:
+            continue
+
+        try:
+            payload = json.loads(row["payload"])
+        except (TypeError, json.JSONDecodeError):
+            payload = {"_invalid_payload": row["payload"]}
+        if not isinstance(payload, dict):
+            payload = {"_invalid_payload": row["payload"]}
+
+        return RunnerCommandRecord(
+            id=row["id"],
+            command=row["command"],
+            payload=payload,
+            status="claimed",
+            created_at=row["created_at"],
+            claimed_at=claimed_at,
+            finished_at=None,
+            error=None,
+        )
+
+
+def finish_runner_command(connection: sqlite3.Connection, command_id: int) -> None:
+    connection.execute(
+        """
+        UPDATE runner_commands
+        SET status = 'applied', finished_at = ?, error = NULL
+        WHERE id = ? AND status = 'claimed'
+        """,
+        (utc_now(), command_id),
+    )
+
+
+def fail_runner_command(
+    connection: sqlite3.Connection,
+    command_id: int,
+    error: str,
+) -> None:
+    connection.execute(
+        """
+        UPDATE runner_commands
+        SET status = 'failed', finished_at = ?, error = ?
+        WHERE id = ? AND status = 'claimed'
+        """,
+        (utc_now(), error, command_id),
+    )
+
+
 def request_tournament_rating_commit(
     connection: sqlite3.Connection,
     tournament: TournamentRecord,
-) -> None:
+) -> bool:
+    if tournament.status != "finished":
+        raise ValueError("tournament is not complete")
+    if not tournament.config.rated:
+        raise ValueError("unrated tournament results cannot be committed")
+
+    existing = get_tournament_rating_commit(connection, tournament.id)
+    if existing is not None:
+        if existing.status in {"claimed", "applied"}:
+            return False
+        if existing.status == "pending" and existing.command_id is not None:
+            command = connection.execute(
+                "SELECT status FROM runner_commands WHERE id = ?",
+                (existing.command_id,),
+            ).fetchone()
+            if command is not None and command["status"] in {"pending", "claimed"}:
+                return False
+
     now = utc_now()
-    connection.execute(
-        """
-        INSERT INTO tournament_rating_commits (
-          tournament_id, category_id, status, requested_at
-        )
-        VALUES (?, ?, 'pending', ?)
-        ON CONFLICT(tournament_id) DO UPDATE SET
-          status = 'pending',
-          category_id = excluded.category_id,
-          requested_at = excluded.requested_at,
-          applied_at = NULL,
-          error = NULL
-        """,
-        (tournament.id, tournament.category_id, now),
-    )
-    enqueue_runner_command(
+    command_id = enqueue_runner_command(
         connection,
         "commit_tournament_results",
         {
@@ -1473,6 +1646,23 @@ def request_tournament_rating_commit(
             "category_id": tournament.category_id,
         },
     )
+    connection.execute(
+        """
+        INSERT INTO tournament_rating_commits (
+          tournament_id, category_id, command_id, status, requested_at
+        )
+        VALUES (?, ?, ?, 'pending', ?)
+        ON CONFLICT(tournament_id) DO UPDATE SET
+          status = 'pending',
+          category_id = excluded.category_id,
+          command_id = excluded.command_id,
+          requested_at = excluded.requested_at,
+          applied_at = NULL,
+          error = NULL
+        """,
+        (tournament.id, tournament.category_id, command_id, now),
+    )
+    return True
 
 
 def get_tournament_rating_commit(
@@ -1583,6 +1773,7 @@ def _tournament_rating_commit_from_row(row: sqlite3.Row) -> TournamentRatingComm
     return TournamentRatingCommitRecord(
         tournament_id=row["tournament_id"],
         category_id=row["category_id"],
+        command_id=row["command_id"],
         status=row["status"],
         requested_at=row["requested_at"],
         applied_at=row["applied_at"],
@@ -1598,6 +1789,9 @@ def _game_from_row(row: sqlite3.Row) -> GameRecord:
         pair_index=row["pair_index"],
         white_engine_id=row["white_engine_id"],
         black_engine_id=row["black_engine_id"],
+        match_id=row["match_id"],
+        game_number=row["game_number"],
+        tiebreak_kind=row["tiebreak_kind"],
         opening_id=row["opening_id"],
         status=row["status"],
         result=row["result"],
@@ -1605,6 +1799,19 @@ def _game_from_row(row: sqlite3.Row) -> GameRecord:
         pgn=row["pgn"],
         started_at=row["started_at"],
         finished_at=row["finished_at"],
+    )
+
+
+def _tournament_match_from_row(row: sqlite3.Row) -> TournamentMatchRecord:
+    return TournamentMatchRecord(
+        id=row["id"],
+        tournament_id=row["tournament_id"],
+        round=row["round"],
+        match_index=row["match_index"],
+        engine1_id=row["engine1_id"],
+        engine2_id=row["engine2_id"],
+        status=row["status"],
+        winner_engine_id=row["winner_engine_id"],
     )
 
 
@@ -1632,9 +1839,7 @@ def _game_assignment_from_row(row: sqlite3.Row) -> GameAssignmentRecord:
         id=row["id"],
         game_id=row["game_id"],
         assignment_key=row["assignment_key"],
-        hardware_mode=row["hardware_mode"],
-        white_worker_id=row["white_worker_id"],
-        black_worker_id=row["black_worker_id"],
+        worker_id=row["worker_id"],
         status=row["status"],
         sent_at=row["sent_at"],
         acked_at=row["acked_at"],

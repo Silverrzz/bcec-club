@@ -251,7 +251,12 @@ def main(argv: list[str] | None = None) -> int:
 
         print_runner_report(report)
 
-        if not report.prepared and report.tournaments_finished == 0 and not report.errors:
+        if (
+            not report.prepared
+            and report.tournaments_finished == 0
+            and report.commands_applied == 0
+            and report.commands_failed == 0
+        ):
             LOG.info("no scheduled tournaments to prepare")
             return 0
 

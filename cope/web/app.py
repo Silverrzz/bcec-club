@@ -65,6 +65,7 @@ from cope.db import (
     list_rating_rows,
     list_suite_openings,
     list_tournaments,
+    list_tournament_matches,
     list_uncommitted_finished_tournaments,
     list_upcoming_games,
     list_workers,
@@ -82,7 +83,7 @@ from cope.db import (
     update_tournament,
     update_worker_label,
 )
-from cope.core.models import EngineSpec, HardwareInfo
+from cope.core.models import EngineSpec, HardwareInfo, TournamentFormat
 from cope.core.stream import (
     StreamEnvelope,
     StreamProtocolError,
@@ -508,7 +509,7 @@ def create_app(
                 "viewer_locked": viewer_locked,
                 "engine_data": _engine_data(viewer_game, viewer_moves),
                 "clocks": _clock_data(viewer_moves),
-                "standings": _standings(tournament, games, engines),
+                "standings": _standings(connection, tournament, games, engines),
                 "settings": _settings_view(connection, tournament),
                 "engine_hardware": _engine_hardware_view(connection, tournament),
                 "chat_messages": chat_messages,
@@ -886,7 +887,10 @@ def create_app(
                 detail="abort the tournament before deleting it",
             )
 
-        delete_tournament(connection, tournament_id)
+        try:
+            delete_tournament(connection, tournament_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         connection.commit()
         return RedirectResponse(
             url="/admin/tournaments?notice=" + quote("Tournament deleted."),
@@ -904,10 +908,14 @@ def create_app(
         if tournament.status != "finished":
             raise HTTPException(status_code=409, detail="tournament is not complete")
 
-        request_tournament_rating_commit(connection, tournament)
+        try:
+            requested = request_tournament_rating_commit(connection, tournament)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         connection.commit()
+        notice = "Rating commit requested." if requested else "Rating commit is already queued or applied."
         return RedirectResponse(
-            url=f"/admin/tournaments/{tournament_id}?notice=" + quote("Rating commit requested."),
+            url=f"/admin/tournaments/{tournament_id}?notice=" + quote(notice),
             status_code=303,
         )
 
@@ -2522,7 +2530,7 @@ def _tournament_live_payload(
         "moves": [_move_payload(move) for move in viewer_moves],
         "engine_data": engine_data,
         "clocks": clocks,
-        "standings": _standings(tournament, games, engines),
+        "standings": _standings(connection, tournament, games, engines),
         "games": [_game_payload(game, engines) for game in games],
     }
 
@@ -2696,6 +2704,7 @@ def _tournament_index_stats(tournaments: list[dict[str, Any]]) -> dict[str, int]
 
 
 def _standings(
+    connection: sqlite3.Connection,
     tournament: TournamentRecord,
     games: tuple[GameRecord, ...],
     engines: dict[int, str],
@@ -2717,16 +2726,59 @@ def _standings(
             points[game.white_engine_id] += 0.5
             points[game.black_engine_id] += 0.5
 
+    matches = list_tournament_matches(connection, tournament.id)
+    bye_points: dict[int, float] = {}
+    if tournament.config.format == TournamentFormat.SWISS:
+        for match in matches:
+            if match.status == "bye":
+                points[match.engine1_id] += 1.0
+                bye_points[match.engine1_id] = bye_points.get(match.engine1_id, 0.0) + 1.0
+
+    buchholz = {engine_id: 0.0 for engine_id in points}
+    if tournament.config.format == TournamentFormat.SWISS:
+        for game in games:
+            if game.result is None:
+                continue
+            buchholz[game.white_engine_id] += points[game.black_engine_id]
+            buchholz[game.black_engine_id] += points[game.white_engine_id]
+
+    stage = {engine_id: 0 for engine_id in points}
+    if tournament.config.format == TournamentFormat.KNOCKOUT:
+        for match in matches:
+            stage[match.engine1_id] = max(stage[match.engine1_id], match.round)
+            if match.engine2_id is not None:
+                stage[match.engine2_id] = max(stage[match.engine2_id], match.round)
+            if match.winner_engine_id is not None:
+                stage[match.winner_engine_id] = max(stage[match.winner_engine_id], match.round + 1)
+
+    seed = {
+        engine_id: index
+        for index, engine_id in enumerate(tournament.config.participants)
+    }
     rows = [
         {
             "engine_id": engine_id,
             "name": engines.get(engine_id, f"Engine {engine_id}"),
             "points": points[engine_id],
             "played": played[engine_id],
+            "buchholz": buchholz[engine_id],
+            "bye_points": bye_points.get(engine_id, 0.0),
+            "stage": stage[engine_id],
         }
         for engine_id in points
     ]
-    rows.sort(key=lambda row: (-row["points"], row["name"]))
+    if tournament.config.format == TournamentFormat.KNOCKOUT:
+        rows.sort(key=lambda row: (-row["stage"], -row["points"], seed[row["engine_id"]]))
+    elif tournament.config.format == TournamentFormat.SWISS:
+        rows.sort(
+            key=lambda row: (
+                -row["points"],
+                -row["buchholz"],
+                seed[row["engine_id"]],
+            )
+        )
+    else:
+        rows.sort(key=lambda row: (-row["points"], row["name"]))
     return rows
 
 
@@ -2813,7 +2865,6 @@ def _settings_view(
 
     rows.extend(
         [
-            ("Hardware", config.hardware_mode.value.title()),
             ("Concurrency", str(config.concurrency)),
             ("Rated", "Yes" if config.rated else "No"),
             ("Lag compensation", f"{config.lag_compensation_ms}ms"),

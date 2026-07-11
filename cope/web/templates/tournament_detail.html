@@ -140,6 +140,8 @@
               <th>Engine</th>
               <th>Points</th>
               <th>Played</th>
+              {% if tournament.config.format.value == "swiss" %}<th data-standing-buchholz>Buchholz</th>{% endif %}
+              {% if tournament.config.format.value == "knockout" %}<th data-standing-stage>Stage</th>{% endif %}
             </tr>
           </thead>
           <tbody data-live-standings>
@@ -149,6 +151,8 @@
                 <td>{{ row.name }}</td>
                 <td>{{ row.points }}</td>
                 <td>{{ row.played }}</td>
+                {% if tournament.config.format.value == "swiss" %}<td>{{ row.buchholz }}</td>{% endif %}
+                {% if tournament.config.format.value == "knockout" %}<td>{{ row.stage }}</td>{% endif %}
               </tr>
             {% endfor %}
           </tbody>

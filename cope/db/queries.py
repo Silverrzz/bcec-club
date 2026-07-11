@@ -187,14 +187,14 @@ def get_worker_activity(
         JOIN games ON games.id = game_assignments.game_id
         JOIN tournaments ON tournaments.id = games.tournament_id
         LEFT JOIN moves ON moves.game_id = games.id
-        WHERE (game_assignments.white_worker_id = ? OR game_assignments.black_worker_id = ?)
+        WHERE game_assignments.worker_id = ?
           AND game_assignments.status IN ('assigned', 'acked', 'live')
           AND games.status IN ('assigned', 'live')
         GROUP BY game_assignments.id
         ORDER BY game_assignments.sent_at DESC, game_assignments.id DESC
         LIMIT 1
         """,
-        (worker_id, worker_id),
+        (worker_id,),
     ).fetchone()
     if row is None:
         return None
@@ -220,17 +220,12 @@ def active_engine_hardware_profiles(
         SELECT
           games.white_engine_id,
           games.black_engine_id,
-          game_assignments.hardware_mode,
-          white_workers.hw AS white_hw,
-          black_workers.hw AS black_hw
+          workers.hw AS worker_hw
         FROM game_assignments
         JOIN games ON games.id = game_assignments.game_id
-        LEFT JOIN workers AS white_workers
-          ON white_workers.id = game_assignments.white_worker_id
-          AND white_workers.status IN ('connected', 'building', 'ready', 'busy')
-        LEFT JOIN workers AS black_workers
-          ON black_workers.id = game_assignments.black_worker_id
-          AND black_workers.status IN ('connected', 'building', 'ready', 'busy')
+        LEFT JOIN workers
+          ON workers.id = game_assignments.worker_id
+          AND workers.status IN ('connected', 'building', 'ready', 'busy')
         WHERE games.tournament_id = ?
           AND games.status IN ('assigned', 'live')
           AND game_assignments.status IN ('assigned', 'acked', 'live')
@@ -241,16 +236,11 @@ def active_engine_hardware_profiles(
     hardware_by_engine: dict[int, list[HardwareInfo]] = {}
     seen: dict[int, set[str]] = {}
     for row in rows:
-        white_hw = _hardware_from_json(row["white_hw"])
-        black_hw = _hardware_from_json(row["black_hw"])
-
-        if row["hardware_mode"] == "shared":
-            white_hw = white_hw or black_hw
-            black_hw = black_hw or white_hw
+        worker_hw = _hardware_from_json(row["worker_hw"])
 
         for engine_id, hw in (
-            (row["white_engine_id"], white_hw),
-            (row["black_engine_id"], black_hw),
+            (row["white_engine_id"], worker_hw),
+            (row["black_engine_id"], worker_hw),
         ):
             if hw is None:
                 continue
@@ -274,14 +264,21 @@ def database_stats(connection: sqlite3.Connection) -> dict[str, int]:
 def list_uncommitted_finished_tournaments(
     connection: sqlite3.Connection,
 ) -> tuple[TournamentRecord, ...]:
-    committed_ids = {
+    active_or_applied_ids = {
         row["tournament_id"]
-        for row in connection.execute("SELECT tournament_id FROM tournament_rating_commits")
+        for row in connection.execute(
+            """
+            SELECT tournament_id FROM tournament_rating_commits
+            WHERE status IN ('pending', 'claimed', 'applied')
+            """
+        )
     }
     return tuple(
         tournament
         for tournament in list_tournaments(connection)
-        if tournament.status == "finished" and tournament.id not in committed_ids
+        if tournament.status == "finished"
+        and tournament.config.rated
+        and tournament.id not in active_or_applied_ids
     )
 
 

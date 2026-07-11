@@ -56,6 +56,19 @@ CREATE TABLE IF NOT EXISTS participants (
   UNIQUE (tournament_id, seed)
 );
 
+CREATE TABLE IF NOT EXISTS tournament_matches (
+  id INTEGER PRIMARY KEY,
+  tournament_id INTEGER NOT NULL REFERENCES tournaments(id) ON DELETE CASCADE,
+  round INTEGER NOT NULL,
+  match_index INTEGER NOT NULL,
+  engine1_id INTEGER NOT NULL REFERENCES engines(id),
+  engine2_id INTEGER REFERENCES engines(id),
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending', 'finished', 'bye')),
+  winner_engine_id INTEGER REFERENCES engines(id),
+  UNIQUE (tournament_id, round, match_index)
+);
+
 CREATE TABLE IF NOT EXISTS games (
   id INTEGER PRIMARY KEY,
   tournament_id INTEGER NOT NULL REFERENCES tournaments(id) ON DELETE CASCADE,
@@ -63,6 +76,9 @@ CREATE TABLE IF NOT EXISTS games (
   pair_index INTEGER NOT NULL,
   white_engine_id INTEGER NOT NULL REFERENCES engines(id),
   black_engine_id INTEGER NOT NULL REFERENCES engines(id),
+  match_id INTEGER REFERENCES tournament_matches(id) ON DELETE SET NULL,
+  game_number INTEGER NOT NULL DEFAULT 1,
+  tiebreak_kind TEXT CHECK (tiebreak_kind IS NULL OR tiebreak_kind IN ('extra_pair', 'armageddon')),
   opening_id INTEGER,
   status TEXT NOT NULL DEFAULT 'pending'
     CHECK (status IN ('pending', 'assigned', 'live', 'finished', 'abandoned')),
@@ -80,9 +96,7 @@ CREATE TABLE IF NOT EXISTS game_assignments (
   id INTEGER PRIMARY KEY,
   game_id INTEGER NOT NULL UNIQUE REFERENCES games(id) ON DELETE CASCADE,
   assignment_key TEXT NOT NULL UNIQUE,
-  hardware_mode TEXT NOT NULL CHECK (hardware_mode IN ('shared', 'paired')),
-  white_worker_id INTEGER REFERENCES workers(id) ON DELETE SET NULL,
-  black_worker_id INTEGER REFERENCES workers(id) ON DELETE SET NULL,
+  worker_id INTEGER REFERENCES workers(id) ON DELETE SET NULL,
   status TEXT NOT NULL DEFAULT 'assigned'
     CHECK (status IN ('assigned', 'acked', 'live', 'finished', 'abandoned', 'expired')),
   sent_at TEXT,
@@ -122,7 +136,12 @@ CREATE TABLE IF NOT EXISTS rating_history (
   id INTEGER PRIMARY KEY,
   engine_id INTEGER NOT NULL REFERENCES engines(id),
   category_id INTEGER NOT NULL REFERENCES categories(id),
+  tournament_id INTEGER NOT NULL REFERENCES tournaments(id),
+  opponent_engine_id INTEGER NOT NULL REFERENCES engines(id),
+  elo_before REAL NOT NULL,
   elo REAL NOT NULL,
+  elo_change REAL NOT NULL,
+  score REAL NOT NULL CHECK (score IN (0, 0.5, 1)),
   game_id INTEGER NOT NULL REFERENCES games(id),
   at TEXT NOT NULL
 );
@@ -130,6 +149,7 @@ CREATE TABLE IF NOT EXISTS rating_history (
 CREATE TABLE IF NOT EXISTS tournament_rating_commits (
   tournament_id INTEGER PRIMARY KEY REFERENCES tournaments(id) ON DELETE CASCADE,
   category_id INTEGER NOT NULL REFERENCES categories(id),
+  command_id INTEGER,
   status TEXT NOT NULL DEFAULT 'pending'
     CHECK (status IN ('pending', 'claimed', 'applied', 'failed')),
   requested_at TEXT NOT NULL,
@@ -200,6 +220,7 @@ CREATE TABLE IF NOT EXISTS runner_commands (
 
 CREATE INDEX IF NOT EXISTS idx_games_tournament_status ON games(tournament_id, status);
 CREATE INDEX IF NOT EXISTS idx_games_round_pair ON games(tournament_id, round, pair_index);
+CREATE INDEX IF NOT EXISTS idx_tournament_matches_round ON tournament_matches(tournament_id, round, match_index);
 CREATE INDEX IF NOT EXISTS idx_rating_history_engine_category_at ON rating_history(engine_id, category_id, at);
 CREATE INDEX IF NOT EXISTS idx_runner_commands_status_created ON runner_commands(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_workers_status ON workers(status);

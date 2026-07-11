@@ -13,6 +13,8 @@
 
   {{ flash(notice, error, errors) }}
 
+  <p class="muted">Each worker process handles one complete game at a time. To run several on one machine, create one worker here for each process.</p>
+
   <div class="workers-page">
     <section class="panel workers-panel" data-worker-monitor>
       {% if worker_rows %}

@@ -29,19 +29,21 @@
         </button>
       </form>
     {% endfor %}
-    {% if tournament.status == "finished" and not commit %}
+    {% if tournament.status == "finished" and tournament.config.rated and (not commit or commit.status == "failed") %}
       <form method="post" action="/admin/tournaments/{{ tournament.id }}/commit-results">
-        <button class="button button--primary" type="submit">Commit results to ratings</button>
+        <button class="button button--primary" type="submit">{% if commit %}Retry rating commit{% else %}Commit results to ratings{% endif %}</button>
       </form>
     {% endif %}
-    {% if tournament.status not in ("scheduled", "running") %}
+    {% if tournament.status not in ("scheduled", "running") and (not commit or commit.status == "failed") %}
       <form method="post" action="/admin/tournaments/{{ tournament.id }}/delete">
         <button class="button button--danger" type="submit"
                 data-confirm="Delete '{{ tournament.name }}' and all of its games? This cannot be undone.">Delete</button>
       </form>
     {% endif %}
-    {% if not actions and tournament.status == "finished" and commit %}
+    {% if not actions and tournament.status == "finished" and commit and commit.status != "failed" %}
       <p class="muted">This tournament is complete.</p>
+    {% elif not actions and tournament.status == "finished" and not tournament.config.rated %}
+      <p class="muted">This tournament is complete and was configured as unrated.</p>
     {% endif %}
   </section>
 
@@ -51,6 +53,7 @@
       <p>{{ status_badge(commit.status) }} requested {{ commit.requested_at }}
         {% if commit.applied_at %}&middot; applied {{ commit.applied_at }}{% endif %}</p>
       {% if commit.error %}<p class="flash flash--error">{{ commit.error }}</p>{% endif %}
+      {% if commit.status == "applied" %}<p class="muted">Applied rating results are permanent, so this tournament can no longer be deleted.</p>{% endif %}
     </section>
   {% endif %}
 

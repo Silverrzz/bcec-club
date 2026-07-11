@@ -49,7 +49,8 @@ from cope.db import (
     set_tournament_status,
 )
 
-from .scheduler import TournamentPreparation, prepare_scheduled_tournaments
+from .scheduler import TournamentPreparation, advance_tournament, prepare_scheduled_tournaments
+from .commands import process_pending_runner_commands
 from .events import (
     publish_clock_sync,
     publish_engine_info,
@@ -79,6 +80,9 @@ LOG = logging.getLogger("cope.runner")
 class RunnerReport:
     prepared: tuple[TournamentPreparation, ...]
     tournaments_finished: int
+    commands_applied: int = 0
+    commands_failed: int = 0
+    rating_commits_applied: int = 0
     errors: tuple[str, ...] = ()
 
 
@@ -119,6 +123,7 @@ def run_tournament_matches(
 ) -> RunnerReport:
     prepared = prepare_scheduled_tournaments(connection)
     tournaments_finished = finish_completed_tournaments(connection)
+    command_report = process_pending_runner_commands(connection)
     connection.commit()
     for result in prepared:
         if result.skipped_reason is None:
@@ -127,10 +132,16 @@ def run_tournament_matches(
         for tournament in list_tournaments(connection):
             if tournament.status == "finished":
                 publish_tournament_event(tournament.id)
+    for result in command_report.rating_commits:
+        publish_tournament_event(result.tournament_id)
 
     return RunnerReport(
         prepared=prepared,
         tournaments_finished=tournaments_finished,
+        commands_applied=command_report.applied,
+        commands_failed=command_report.failed,
+        rating_commits_applied=len(command_report.rating_commits),
+        errors=command_report.errors,
     )
 
 
@@ -168,6 +179,14 @@ def print_runner_report(report: RunnerReport) -> None:
 
     if report.tournaments_finished:
         LOG.info("finished tournaments count=%s", report.tournaments_finished)
+    if report.commands_applied:
+        LOG.info(
+            "applied runner commands count=%s rating_commits=%s",
+            report.commands_applied,
+            report.rating_commits_applied,
+        )
+    if report.commands_failed:
+        LOG.warning("failed runner commands count=%s", report.commands_failed)
 
 
 def next_worker_assignment(
@@ -187,7 +206,6 @@ def next_worker_assignment(
             connection,
             game_id=game.id,
             assignment_key=secrets.token_urlsafe(24),
-            hardware_mode=tournament.config.hardware_mode.value,
             worker_id=worker.id,
         )
         opening = get_opening_position(connection, game.opening_id)
@@ -589,10 +607,14 @@ def _finish_tournament_if_complete(
     games = list_games(connection, current.id)
     if not games:
         return False
-    if any(game.status not in TERMINAL_GAME_STATUSES for game in games):
-        return False
-    if any(game.status == "abandoned" for game in games):
+    all_terminal = all(game.status in TERMINAL_GAME_STATUSES for game in games)
+    if all_terminal and any(game.status == "abandoned" for game in games):
         set_tournament_status(connection, current.id, "aborted")
+        return False
+
+    advance = advance_tournament(connection, current)
+    games = list_games(connection, current.id)
+    if not advance.complete or any(game.status not in TERMINAL_GAME_STATUSES for game in games):
         return False
 
     set_tournament_status(connection, current.id, "finished")

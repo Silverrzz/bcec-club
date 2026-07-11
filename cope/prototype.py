@@ -6,7 +6,6 @@ from pathlib import Path
 from .core.models import (
     AdjudicationConfig,
     EngineSpec,
-    HardwareMode,
     IncrementTimeControl,
     RoundRobinFormatOptions,
     TournamentConfig,
@@ -108,7 +107,6 @@ def run_prototype_data_setup() -> None:
             format_options=RoundRobinFormatOptions(double_rr=True),
             participants=[1, 2],
             time_control=IncrementTimeControl(initial_ms=60_000, increment_ms=1_000),
-            hardware_mode=HardwareMode.SHARED,
             concurrency=1,
             adjudication=AdjudicationConfig(),
         )

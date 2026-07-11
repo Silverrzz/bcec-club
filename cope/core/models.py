@@ -105,11 +105,6 @@ class TournamentFormat(StrEnum):
     GAUNTLET = "gauntlet"
 
 
-class HardwareMode(StrEnum):
-    SHARED = "shared"
-    PAIRED = "paired"
-
-
 class KnockoutTiebreak(StrEnum):
     ARMAGEDDON = "armageddon"
     EXTRA_PAIR = "extra_pair"
@@ -145,7 +140,6 @@ class TournamentConfig(StrictModel):
     format_options: FormatOptions
     participants: list[int] = Field(min_length=2)
     time_control: TimeControl
-    hardware_mode: HardwareMode
     concurrency: int = Field(gt=0)
     opening_suite_id: int | None = Field(default=None, gt=0)
     adjudication: AdjudicationConfig
@@ -158,6 +152,7 @@ class TournamentConfig(StrictModel):
         if isinstance(data, dict):
             data = dict(data)
             data.pop("rating_category", None)
+            data.pop("hardware_mode", None)
             data.setdefault("category_id", 1)
             data.setdefault("category_settings_linked", True)
         return data

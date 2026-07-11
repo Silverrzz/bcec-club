@@ -18,9 +18,9 @@ LOG = logging.getLogger("cope.worker.engine")
 
 
 class UciEngineProcess:
-    def __init__(self, spec: EngineSpec):
+    def __init__(self, spec: EngineSpec, *, worker_id: int):
         self._spec = spec
-        self._source_dir = _engine_source_dir(spec)
+        self._source_dir = _engine_source_dir(spec, worker_id)
         self._binary_path = self._source_dir / spec.binary_path
         self._process: subprocess.Popen[str] | None = None
         self._stdout: queue.Queue[str | None] = queue.Queue()
@@ -392,8 +392,12 @@ class UciEngineProcess:
             lines.append(line)
 
 
-def _engine_source_dir(spec: EngineSpec) -> Path:
-    cache_root = Path(os.environ.get("COPE_WORKER_ENGINE_DIR", ".cope-worker/engines"))
+def _engine_source_dir(spec: EngineSpec, worker_id: int) -> Path:
+    configured_cache_root = os.environ.get("COPE_WORKER_ENGINE_DIR")
+    if configured_cache_root:
+        cache_root = Path(configured_cache_root)
+    else:
+        cache_root = Path(".cope-worker/workers") / str(worker_id) / "engines"
     source_key = hashlib.blake2s(
         f"{spec.git_url}\0{spec.branch}".encode("utf-8"),
         digest_size=8,

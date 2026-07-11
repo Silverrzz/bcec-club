@@ -797,6 +797,12 @@ document.querySelectorAll("[data-tournament-live]").forEach((arena) => {
       appendCell(row, standing.name || `Engine ${standing.engine_id}`);
       appendCell(row, String(standing.points ?? 0));
       appendCell(row, String(standing.played ?? 0));
+      if (document.querySelector("[data-standing-buchholz]")) {
+        appendCell(row, String(standing.buchholz ?? 0));
+      }
+      if (document.querySelector("[data-standing-stage]")) {
+        appendCell(row, String(standing.stage ?? 0));
+      }
       return row;
     }));
   }

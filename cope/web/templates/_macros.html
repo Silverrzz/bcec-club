@@ -67,7 +67,7 @@
         <option value="knockout" {% if values.format == "knockout" %}selected{% endif %}>Knockout</option>
         <option value="gauntlet" {% if values.format == "gauntlet" %}selected{% endif %}>Gauntlet</option>
       </select>
-      <p class="field-help">Only round robin is currently played by the runner; other formats stay paused.</p>
+      <p class="field-help">Swiss rounds and knockout stages are paired as results arrive. Gauntlets rotate colours across every opponent.</p>
     </div>
 
     <div class="field field--checkbox" data-format-field="round_robin">
@@ -91,7 +91,7 @@
       <div class="field">
         <label for="knockout_tiebreak">Tiebreak</label>
         <select class="input" id="knockout_tiebreak" name="knockout_tiebreak">
-          <option value="armageddon" {% if values.knockout_tiebreak == "armageddon" %}selected{% endif %}>Armageddon</option>
+          <option value="armageddon" {% if values.knockout_tiebreak == "armageddon" %}selected{% endif %}>Armageddon (Black advances on a draw)</option>
           <option value="extra_pair" {% if values.knockout_tiebreak == "extra_pair" %}selected{% endif %}>Extra game pair</option>
         </select>
       </div>
@@ -154,13 +154,6 @@
   <fieldset class="form-section">
     <legend>Execution</legend>
     <div class="field-row">
-      <div class="field">
-        <label for="hardware_mode">Hardware mode</label>
-        <select class="input" id="hardware_mode" name="hardware_mode">
-          <option value="shared" {% if values.hardware_mode == "shared" %}selected{% endif %}>Shared (both engines on one worker)</option>
-          <option value="paired" {% if values.hardware_mode == "paired" %}selected{% endif %}>Paired (one worker per engine)</option>
-        </select>
-      </div>
       <div class="field">
         <label for="concurrency">Concurrent games</label>
         <input class="input input--small" id="concurrency" type="number" min="1" name="concurrency" value="{{ values.concurrency }}">

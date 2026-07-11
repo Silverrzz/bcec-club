@@ -65,7 +65,7 @@ async def run_worker_client(config: WorkerClientConfig) -> None:
                 if envelope.type != "assignment":
                     raise ProtocolValidationError(f"unexpected runner message: {envelope.type}")
                 assignment = WorkerGameAssignment.model_validate(envelope.data)
-                await _serve_assignment(websocket, assignment)
+                await _serve_assignment(websocket, assignment, worker_id=welcome.worker_id)
     except ConnectionClosed as error:
         _log_connection_closed(error)
     except Exception:
@@ -94,9 +94,14 @@ def _build_hello(config: WorkerClientConfig) -> WorkerTokenHello | WorkerSession
     )
 
 
-async def _serve_assignment(websocket, assignment: WorkerGameAssignment) -> None:
+async def _serve_assignment(
+    websocket,
+    assignment: WorkerGameAssignment,
+    *,
+    worker_id: int,
+) -> None:
     engines = {
-        engine_id: UciEngineProcess(engine)
+        engine_id: UciEngineProcess(engine, worker_id=worker_id)
         for engine_id, engine in assignment.engines.items()
     }
     engine_names = ", ".join(engine.name for engine in assignment.engines.values())
