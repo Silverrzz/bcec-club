@@ -74,6 +74,7 @@ from cope.tournament.engine_instance import (
     EngineSearchInfo,
 )
 from cope.tournament.game_runner import GameRunner
+from cope.version import app_version
 from cope.tournament.game_state import GameState
 from cope.tournament.time_control import RuntimeTimeControl, TimeControlCategory
 from cope.tournament.tournament import Game
@@ -116,7 +117,7 @@ def run_tournament_service(config: RunnerServiceConfig) -> None:
             touch_service_heartbeat(
                 connection,
                 "scheduler",
-                os.environ.get("COPE_DEPLOY_COMMIT", "dev"),
+                app_version(),
             )
             report = run_tournament_matches(connection)
             print_runner_report(report)

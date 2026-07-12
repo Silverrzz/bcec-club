@@ -17,7 +17,7 @@ interface DashboardData {
   running_tournaments: Tournament[]
   complete_tournaments: Tournament[]
   recent_games: Game[]
-  system: { commit: string; schema_version: number; services: Array<{ service: string; app_commit: string; last_seen: string }> }
+  system: { version: string; schema_version: number; services: Array<{ service: string; app_version: string; last_seen: string }> }
 }
 
 const data = ref<DashboardData | null>(null)
@@ -101,7 +101,7 @@ onMounted(load)
         </RouterLink>
       </section>
 
-      <section class="panel system-strip"><div><span>Release</span><code>{{ data.system.commit.slice(0, 12) }}</code></div><div><span>Schema</span><strong>v{{ data.system.schema_version }}</strong></div><div v-for="service in data.system.services" :key="service.service"><span>{{ humanize(service.service) }}</span><strong>{{ formatDate(service.last_seen) }}</strong></div></section>
+      <section class="panel system-strip"><div><span>Release</span><code>{{ data.system.version }}</code></div><div><span>Schema</span><strong>v{{ data.system.schema_version }}</strong></div><div v-for="service in data.system.services" :key="service.service"><span>{{ humanize(service.service) }}</span><strong>{{ formatDate(service.last_seen) }}</strong></div></section>
 
       <div class="dashboard-grid">
         <section class="panel dashboard-panel dashboard-panel--wide">

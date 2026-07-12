@@ -95,7 +95,7 @@ class WorkerServerConfig:
     host: str = field(default_factory=default_worker_host)
     port: int = field(default_factory=default_worker_port)
     db_path: str | Path = DEFAULT_DB_PATH
-    expected_app_commit: str | None = None
+    expected_app_version: str | None = None
     heartbeat_interval_ms: int = 5000
     assignment_poll_interval_s: float = 10.0
     presence_flush_interval_s: float = 15.0
@@ -222,7 +222,7 @@ class WorkerHandshakeServer:
             touch_service_heartbeat(
                 connection,
                 "worker-server",
-                self._config.expected_app_commit or "dev",
+                self._config.expected_app_version or "dev",
             )
             connection.commit()
         finally:
@@ -292,7 +292,7 @@ class WorkerHandshakeServer:
                 | WorkerPoolSlotHello
                 | WorkerPoolEnrollmentHello,
             )
-            self._validate_app_commit(hello)
+            self._validate_app_version(hello)
             if isinstance(hello, WorkerPoolEnrollmentHello):
                 welcome = self._enroll_worker_pool(hello)
                 await _send_message(websocket, "pool_welcome", welcome)
@@ -555,17 +555,17 @@ class WorkerHandshakeServer:
             return None
         return work.result()
 
-    def _validate_app_commit(
+    def _validate_app_version(
         self,
         hello: WorkerTokenHello
         | WorkerSessionHello
         | WorkerPoolSlotHello
         | WorkerPoolEnrollmentHello,
     ) -> None:
-        expected = self._config.expected_app_commit
-        if expected is not None and hello.app_commit != expected:
+        expected = self._config.expected_app_version
+        if expected is not None and hello.app_version != expected:
             raise ProtocolValidationError(
-                f"app_commit mismatch: expected {expected}, got {hello.app_commit}"
+                f"app_version mismatch: expected {expected}, got {hello.app_version}"
             )
 
     def _enroll_worker_pool(
@@ -584,7 +584,7 @@ class WorkerHandshakeServer:
                     pool=pool,
                     machine_id=hello.machine_id,
                     hw=hello.hw,
-                    app_commit=hello.app_commit,
+                    app_commit=hello.app_version,
                     protocol_version=PROTOCOL_VERSION,
                 )
             except ValueError as error:
@@ -659,7 +659,7 @@ class WorkerHandshakeServer:
                 worker_id=worker.id,
                 label=label,
                 session_id=session_id,
-                app_commit=hello.app_commit,
+                app_commit=hello.app_version,
                 protocol_version=PROTOCOL_VERSION,
                 machine_id=hello.machine_id,
                 hw=hello.hw,

@@ -1,16 +1,13 @@
 x-cope-service: &cope-service
   build:
     context: .
-    args:
-      COPE_DEPLOY_COMMIT: ${COPE_DEPLOY_COMMIT:?Set COPE_DEPLOY_COMMIT to the checked-out commit}
-  image: cope-chess:${COPE_DEPLOY_COMMIT}
+  image: cope-chess:local
   restart: unless-stopped
   environment: &cope-environment
     COPE_DATABASE_URL: postgresql://cope@db:5432/cope
     COPE_DATABASE_PASSWORD_FILE: /run/secrets/cope_db_password
     COPE_DATABASE_POOL_MIN: "2"
     COPE_DATABASE_POOL_MAX: "50"
-    COPE_DEPLOY_COMMIT: ${COPE_DEPLOY_COMMIT}
     COPE_ADMIN_TOKEN_FILE: /run/secrets/cope_admin_token
     COPE_WEB_EVENT_TOKEN_FILE: /run/secrets/cope_event_token
     COPE_WEB_STREAM_URL: ws://web:8701/internal/stream

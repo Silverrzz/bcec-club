@@ -25,7 +25,7 @@ install -o root -g root -m 0644 "$repo_dir/deploy/cope-worker.service" /etc/syst
 
 if [ ! -f /etc/cope/worker.env ]; then
   install -o root -g root -m 0644 /dev/null /etc/cope/worker.env
-  printf 'COPE_WORKER_SERVER_URL=wss://cope.example.com/worker\nCOPE_DEPLOY_COMMIT=replace-with-git-commit\n' > /etc/cope/worker.env
+  printf 'COPE_WORKER_SERVER_URL=wss://cope.example.com/worker\n' > /etc/cope/worker.env
 fi
 
 systemctl daemon-reload

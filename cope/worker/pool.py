@@ -26,16 +26,16 @@ from .client import WorkerClientConfig, _detect_hardware, _detect_machine_id, ru
 
 
 LOG = logging.getLogger("cope.worker_pool")
-STATE_VERSION = 1
+STATE_VERSION = 2
 LOCAL_HOSTS = {"127.0.0.1", "::1", "localhost"}
 
 
 class WorkerPoolState(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    version: Literal[1] = STATE_VERSION
+    version: Literal[2] = STATE_VERSION
     server_url: str
-    app_commit: str
+    app_version: str
     pool_id: int = Field(gt=0)
     label: str
     machine_id: str
@@ -45,7 +45,7 @@ class WorkerPoolState(BaseModel):
 @dataclass(frozen=True)
 class WorkerPoolConfig:
     server_url: str
-    app_commit: str
+    app_version: str
     state_file: Path
     enrollment_token_file: Path | None = None
     machine_id: str | None = None
@@ -60,9 +60,9 @@ async def run_worker_pool(config: WorkerPoolConfig) -> None:
             raise ValueError(
                 "pool state belongs to a different worker server; use its original --server-url"
             )
-        if state.app_commit != config.app_commit:
+        if state.app_version != config.app_version:
             raise ValueError(
-                "pool state belongs to a different app commit; deploy matching worker code"
+                "pool state belongs to a different app version; deploy matching worker code"
             )
     else:
         token = _read_enrollment_token(config.enrollment_token_file)
@@ -93,7 +93,7 @@ async def _enroll_pool(config: WorkerPoolConfig, token: str) -> WorkerPoolState:
         enrollment_token=token,
         machine_id=machine_id,
         hw=_detect_hardware(),
-        app_commit=config.app_commit,
+        app_version=config.app_version,
     )
     async with connect(config.server_url) as websocket:
         await websocket.send(encode_message(make_message("hello", hello)))
@@ -103,7 +103,7 @@ async def _enroll_pool(config: WorkerPoolConfig, token: str) -> WorkerPoolState:
         raise ValueError("worker server enrolled the pool for a different machine identity")
     return WorkerPoolState(
         server_url=config.server_url,
-        app_commit=config.app_commit,
+        app_version=config.app_version,
         pool_id=welcome.pool_id,
         label=welcome.label,
         machine_id=welcome.machine_id,
@@ -120,7 +120,7 @@ async def _run_slot(
             await run_worker_client(
                 WorkerClientConfig(
                     server_url=state.server_url,
-                    app_commit=state.app_commit,
+                    app_version=state.app_version,
                     pool_slot_token=slot.slot_token,
                     label_hint=slot.label,
                     threads=slot.resources.threads,

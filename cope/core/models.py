@@ -6,7 +6,7 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
-PROTOCOL_VERSION = 6
+PROTOCOL_VERSION = 7
 UciOptionValue = str | int | bool
 
 
@@ -380,26 +380,26 @@ class WorkerTokenHello(WorkerActiveAssignmentsMixin):
     token: str = Field(min_length=1)
     label_hint: str = Field(default="", max_length=80)
     hw: HardwareInfo
-    app_commit: str = Field(min_length=1)
+    app_version: str = Field(min_length=1)
 
 
 class WorkerSessionHello(WorkerActiveAssignmentsMixin):
     session_id: str = Field(min_length=1)
     hw: HardwareInfo
-    app_commit: str = Field(min_length=1)
+    app_version: str = Field(min_length=1)
 
 
 class WorkerPoolSlotHello(WorkerActiveAssignmentsMixin):
     slot_token: str = Field(min_length=1)
     hw: HardwareInfo
-    app_commit: str = Field(min_length=1)
+    app_version: str = Field(min_length=1)
 
 
 class WorkerPoolEnrollmentHello(StrictModel):
     enrollment_token: str = Field(min_length=1)
     machine_id: str = Field(min_length=8, max_length=128)
     hw: HardwareInfo
-    app_commit: str = Field(min_length=1)
+    app_version: str = Field(min_length=1)
 
 
 class WorkerPoolSlotCredential(StrictModel):
@@ -424,7 +424,7 @@ class WorkerWelcome(StrictModel):
 
 
 class Envelope(StrictModel):
-    v: Literal[6] = PROTOCOL_VERSION
+    v: Literal[7] = PROTOCOL_VERSION
     type: str = Field(min_length=1)
     seq: int = Field(ge=0)
     t_mono_ms: int = Field(ge=0)

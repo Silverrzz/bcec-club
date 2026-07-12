@@ -128,6 +128,7 @@ from cope.web import forms
 from cope.web.forms import FormError, form_flag, form_value
 from cope.web.openings import parse_opening_uploads, parse_openings
 from cope.web.requests import read_form, read_form_with_files
+from cope.version import app_version
 
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -434,7 +435,7 @@ def create_app(
             {
                 "status": "live",
                 "service": "cope-web",
-                "commit": os.environ.get("COPE_DEPLOY_COMMIT", "dev"),
+                "version": app_version(),
             }
         )
 
@@ -475,7 +476,7 @@ def create_app(
                     touch_service_heartbeat(
                         heartbeat_connection,
                         "web",
-                        os.environ.get("COPE_DEPLOY_COMMIT", "dev"),
+                        app_version(),
                     )
                     heartbeat_connection.commit()
                     app.state.last_service_heartbeat = time.monotonic()
@@ -2617,7 +2618,7 @@ def _worker_record_payload(worker) -> dict[str, Any]:
         "token_expires_at": worker.token_expires_at,
         "status": worker.status,
         "session_id": worker.session_id,
-        "app_commit": worker.app_commit,
+        "app_version": worker.app_commit,
         "protocol_version": worker.protocol_version,
         "machine_id": worker.machine_id,
         "pool_id": worker.pool_id,

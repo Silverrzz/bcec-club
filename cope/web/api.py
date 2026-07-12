@@ -85,6 +85,7 @@ from cope.db import (
 from cope.web import forms
 from cope.web.openings import parse_opening_uploads, parse_openings
 from cope.web.requests import read_form
+from cope.version import app_version
 
 
 LOG = logging.getLogger("cope.web.api")
@@ -519,7 +520,7 @@ def register_api_routes(app: FastAPI) -> None:
                 "complete_tournaments": list_uncommitted_finished_tournaments(connection),
                 "recent_games": list_games_by_status(connection, "finished", limit=6),
                 "system": {
-                    "commit": os.environ.get("COPE_DEPLOY_COMMIT", "dev"),
+                    "version": app_version(),
                     "schema_version": database_schema_version(connection),
                     "services": list_service_heartbeats(connection),
                 },

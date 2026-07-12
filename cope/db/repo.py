@@ -342,7 +342,7 @@ def list_service_heartbeats(connection: sqlite3.Connection) -> tuple[dict[str, s
     return tuple(
         {
             "service": str(row["service"]),
-            "app_commit": str(row["app_commit"]),
+            "app_version": str(row["app_commit"]),
             "last_seen": str(row["last_seen"]),
         }
         for row in connection.execute("SELECT * FROM service_heartbeats ORDER BY service")

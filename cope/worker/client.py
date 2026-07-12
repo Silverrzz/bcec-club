@@ -48,7 +48,7 @@ RECONNECT_MAX_DELAY_S = 30.0
 @dataclass(frozen=True)
 class WorkerClientConfig:
     server_url: str
-    app_commit: str
+    app_version: str
     token: str | None = None
     session_id: str | None = None
     pool_slot_token: str | None = None
@@ -100,9 +100,9 @@ async def _run_worker_connection(
         else config
     )
     LOG.info(
-        "connecting to runner url=%s app_commit=%s",
+        "connecting to runner url=%s app_version=%s",
         connection_config.server_url,
-        connection_config.app_commit,
+        connection_config.app_version,
     )
     async with connect(connection_config.server_url) as websocket:
         await _send_message(websocket, "hello", _build_hello(connection_config))
@@ -159,7 +159,7 @@ def _build_hello(
             token=config.token,
             label_hint=config.label_hint,
             hw=hw,
-            app_commit=config.app_commit,
+            app_version=config.app_version,
             machine_id=machine_id,
             resources=config.resources,
         )
@@ -168,7 +168,7 @@ def _build_hello(
         return WorkerPoolSlotHello(
             slot_token=config.pool_slot_token,
             hw=hw,
-            app_commit=config.app_commit,
+            app_version=config.app_version,
             machine_id=machine_id,
             resources=config.resources,
         )
@@ -176,7 +176,7 @@ def _build_hello(
     return WorkerSessionHello(
         session_id=config.session_id or "",
         hw=hw,
-        app_commit=config.app_commit,
+        app_version=config.app_version,
         machine_id=machine_id,
         resources=config.resources,
     )
@@ -415,7 +415,7 @@ def _message_log_context(message_type: str, data: Any) -> str:
             auth = "session"
         hw = payload.get("hw") or {}
         return (
-            f"auth={auth} app_commit={payload.get('app_commit')} "
+            f"auth={auth} app_version={payload.get('app_version')} "
             f"label_hint={payload.get('label_hint', '')!r} "
             f"active_assignments={len(payload.get('active_assignment_ids') or [])} "
             f"cpu={hw.get('cpu_model')} cores={hw.get('physical_cores')}P/{hw.get('logical_cores')}T "

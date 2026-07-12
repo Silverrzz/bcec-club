@@ -119,7 +119,7 @@ export interface Worker {
   status: string
   token_expires_at?: string | null
   session_id?: string | null
-  app_commit?: string | null
+  app_version?: string | null
   protocol_version?: number | null
   machine_id?: string | null
   pool_id?: number | null

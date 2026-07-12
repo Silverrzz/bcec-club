@@ -6,10 +6,8 @@ COPY frontend/ ./
 RUN npm run build
 
 FROM python:3.13-slim-bookworm AS runtime
-ARG COPE_DEPLOY_COMMIT=dev
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    COPE_DEPLOY_COMMIT=${COPE_DEPLOY_COMMIT} \
     COPE_DATABASE_URL=postgresql://cope@db:5432/cope
 WORKDIR /app
 RUN apt-get update \

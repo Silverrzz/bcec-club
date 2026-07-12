@@ -184,7 +184,7 @@ def main(argv: list[str] | None = None) -> int:
         default=default_worker_port(),
         help="worker websocket bind port",
     )
-    worker_server_parser.add_argument("--app-commit", default=_default_app_commit())
+    worker_server_parser.add_argument("--app-version", default=_default_app_version())
     worker_server_parser.add_argument(
         "--web-stream-url",
         dest="web_stream_url",
@@ -232,7 +232,7 @@ def main(argv: list[str] | None = None) -> int:
     worker_parser.add_argument("--token")
     worker_parser.add_argument("--session-id")
     worker_parser.add_argument("--label-hint", default="")
-    worker_parser.add_argument("--app-commit", default=_default_app_commit())
+    worker_parser.add_argument("--app-version", default=_default_app_version())
     worker_parser.add_argument(
         "--threads",
         type=_positive_int,
@@ -255,7 +255,7 @@ def main(argv: list[str] | None = None) -> int:
         help="enroll or resume a machine worker pool",
     )
     worker_pool_parser.add_argument("--server-url", default=default_worker_server_url())
-    worker_pool_parser.add_argument("--app-commit", default=_default_app_commit())
+    worker_pool_parser.add_argument("--app-version", default=_default_app_version())
     worker_pool_parser.add_argument(
         "--state-file",
         type=Path,
@@ -277,7 +277,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.role == "version":
         from .core.models import PROTOCOL_VERSION
 
-        print(f"cope-chess 0.1.0 commit={_default_app_commit()} protocol={PROTOCOL_VERSION}")
+        print(f"cope-chess version={_default_app_version()} protocol={PROTOCOL_VERSION}")
         return 0
 
     if args.role == "doctor":
@@ -337,7 +337,7 @@ def main(argv: list[str] | None = None) -> int:
             host=args.worker_host,
             port=args.worker_port,
             db_path=args.db_path,
-            expected_app_commit=args.app_commit,
+            expected_app_version=args.app_version,
             assignment_poll_interval_s=args.poll_interval_s,
             presence_flush_interval_s=args.presence_flush_interval_s,
             game_thread_count=args.game_threads,
@@ -418,7 +418,7 @@ def main(argv: list[str] | None = None) -> int:
 
         config = WorkerClientConfig(
             server_url=args.server_url,
-            app_commit=args.app_commit,
+            app_version=args.app_version,
             token=args.token,
             session_id=args.session_id,
             label_hint=args.label_hint,
@@ -438,7 +438,7 @@ def main(argv: list[str] | None = None) -> int:
 
         config = WorkerPoolConfig(
             server_url=args.server_url,
-            app_commit=args.app_commit,
+            app_version=args.app_version,
             state_file=args.state_file,
             enrollment_token_file=args.enrollment_token_file,
             machine_id=args.machine_id,
@@ -454,8 +454,10 @@ def main(argv: list[str] | None = None) -> int:
     return 2
 
 
-def _default_app_commit() -> str:
-    return os.environ.get("COPE_DEPLOY_COMMIT", "dev")
+def _default_app_version() -> str:
+    from .version import app_version
+
+    return app_version()
 
 
 def _install_sigterm_handler() -> None:
