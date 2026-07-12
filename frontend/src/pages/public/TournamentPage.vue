@@ -428,12 +428,16 @@ function applySnapshot(snapshot: LiveSnapshot): void {
   if (snapshot.standings) data.value.standings = snapshot.standings
 
   if (awaitingNextLiveAfterGameId && routeGameId.value === awaitingNextLiveAfterGameId) {
-    const nextLiveGame = snapshot.game?.status === 'live'
+    const nextLiveGame = isActiveGame(snapshot.game)
       && !sameId(snapshot.game.id, awaitingNextLiveAfterGameId)
       ? snapshot.game
-      : data.value.games.find((game) => game.status === 'live' && !sameId(game.id, awaitingNextLiveAfterGameId))
+      : data.value.games.find((game) => isActiveGame(game) && !sameId(game.id, awaitingNextLiveAfterGameId))
     if (nextLiveGame) void followLiveGame(nextLiveGame.id)
   }
+}
+
+function isActiveGame(game: GameRecord | null | undefined): game is GameRecord {
+  return game?.status === 'assigned' || game?.status === 'live'
 }
 
 async function followLiveGame(gameId: Identifier): Promise<void> {
