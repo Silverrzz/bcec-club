@@ -1,0 +1,15 @@
+{$COPE_DOMAIN} {
+    encode zstd gzip
+
+    @worker path /worker
+    reverse_proxy @worker worker-server:8702
+    reverse_proxy web:8701
+
+    header {
+        X-Content-Type-Options nosniff
+        Referrer-Policy same-origin
+        X-Frame-Options DENY
+    }
+
+    log
+}

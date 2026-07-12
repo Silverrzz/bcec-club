@@ -4,6 +4,9 @@ import argparse
 import asyncio
 import logging
 import os
+import signal
+import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .network import (
@@ -24,6 +27,7 @@ LOG = logging.getLogger("cope.cli")
 
 
 def main(argv: list[str] | None = None) -> int:
+    _install_sigterm_handler()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
@@ -38,6 +42,22 @@ def main(argv: list[str] | None = None) -> int:
         default=_default_db_path(),
         help="path to the SQLite database file",
     )
+
+    db_parser = subparsers.add_parser("db", help="database lifecycle operations")
+    db_subparsers = db_parser.add_subparsers(dest="db_command", required=True)
+    for command in ("migrate", "check"):
+        command_parser = db_subparsers.add_parser(command)
+        command_parser.add_argument("--db-path", default=_default_db_path())
+    backup_parser = db_subparsers.add_parser("backup")
+    backup_parser.add_argument("--db-path", default=_default_db_path())
+    backup_parser.add_argument("--output", type=Path)
+    backup_parser.add_argument("--keep", type=_positive_int, default=7)
+    restore_parser = db_subparsers.add_parser("restore")
+    restore_parser.add_argument("source", type=Path)
+    restore_parser.add_argument("--db-path", default=_default_db_path())
+
+    subparsers.add_parser("doctor", help="check database and production configuration")
+    subparsers.add_parser("version", help="print the COPE release and protocol version")
 
     build_css_parser = subparsers.add_parser("build-css", help="compile web SCSS")
     build_css_parser.add_argument(
@@ -67,19 +87,24 @@ def main(argv: list[str] | None = None) -> int:
         default=_default_db_path(),
         help="path to the SQLite database file",
     )
+    mint_worker_parser.add_argument("--threads", type=_positive_int, default=1)
+    mint_worker_parser.add_argument("--hash-mb", type=_positive_int, default=32)
 
     web_parser = subparsers.add_parser("web", help="start the web server")
     web_parser.add_argument("--host", default=default_web_host())
     web_parser.add_argument("--port", type=int, default=default_web_port())
     web_parser.add_argument(
         "--worker-server-url",
-        default=default_worker_server_url(),
-        help="public websocket URL workers should use to reach the runner",
+        default=os.environ.get("COPE_WORKER_SERVER_URL") or None,
+        help=(
+            "public websocket URL workers should use; by default the web service "
+            "uses the worker server endpoint registered in the shared database"
+        ),
     )
     web_parser.add_argument(
         "--event-token",
         default=default_web_event_token(),
-        help="shared token required for internal runner streams",
+        help="shared token required for internal service streams",
     )
     web_parser.add_argument(
         "--admin-token",
@@ -92,61 +117,92 @@ def main(argv: list[str] | None = None) -> int:
         help="path to the SQLite database file",
     )
 
-    runner_parser = subparsers.add_parser("runner", help="start the tournament runner")
-    runner_parser.add_argument(
-        "--worker-server",
-        action="store_true",
-        help="run only the worker websocket handshake server",
+    scheduler_parser = subparsers.add_parser(
+        "scheduler",
+        help="start the tournament scheduler and command processor",
     )
-    runner_parser.add_argument(
-        "--worker-host",
-        default=default_worker_host(),
-        help="worker websocket bind host",
-    )
-    runner_parser.add_argument(
-        "--worker-port",
-        type=int,
-        default=default_worker_port(),
-        help="worker websocket bind port",
-    )
-    runner_parser.add_argument("--app-commit", default=_default_app_commit())
-    runner_parser.add_argument(
+    scheduler_parser.add_argument(
         "--web-stream-url",
         dest="web_stream_url",
         default=default_web_stream_url(),
-        help="web server websocket URL for runner event streams",
+        help="web server websocket URL for scheduler event streams",
     )
-    runner_parser.add_argument(
+    scheduler_parser.add_argument(
         "--web-event-token",
         default=default_web_event_token(),
         help="shared token used for the internal web stream",
     )
-    runner_parser.add_argument(
+    scheduler_parser.add_argument(
         "--web-event-timeout-s",
         type=float,
         default=default_web_event_timeout_s(),
         help="seconds to wait when opening the internal web stream",
     )
-    runner_parser.add_argument(
+    scheduler_parser.add_argument(
         "--db-path",
         default=_default_db_path(),
         help="path to the SQLite database file",
     )
-    runner_parser.add_argument(
+    scheduler_parser.add_argument(
         "--prototype",
         action="store_true",
         help="run the in-memory prototype tournament",
     )
-    runner_parser.add_argument(
+    scheduler_parser.add_argument(
         "--poll-interval-s",
         type=float,
         default=2.0,
         help="seconds between fallback scans when no stream wake arrives",
     )
-    runner_parser.add_argument(
+    scheduler_parser.add_argument(
         "--once",
         action="store_true",
-        help="run one scheduler/execution pass and exit",
+        help="run one scheduler and command-processing pass, then exit",
+    )
+
+    worker_server_parser = subparsers.add_parser(
+        "worker-server",
+        help="start the worker websocket server",
+    )
+    worker_server_parser.add_argument(
+        "--worker-host",
+        default=default_worker_host(),
+        help="worker websocket bind host",
+    )
+    worker_server_parser.add_argument(
+        "--worker-port",
+        type=_positive_int,
+        default=default_worker_port(),
+        help="worker websocket bind port",
+    )
+    worker_server_parser.add_argument("--app-commit", default=_default_app_commit())
+    worker_server_parser.add_argument(
+        "--web-stream-url",
+        dest="web_stream_url",
+        default=default_web_stream_url(),
+        help="web server websocket URL for worker-server event streams",
+    )
+    worker_server_parser.add_argument(
+        "--web-event-token",
+        default=default_web_event_token(),
+        help="shared token used for the internal web stream",
+    )
+    worker_server_parser.add_argument(
+        "--web-event-timeout-s",
+        type=float,
+        default=default_web_event_timeout_s(),
+        help="seconds to wait when opening the internal web stream",
+    )
+    worker_server_parser.add_argument(
+        "--db-path",
+        default=_default_db_path(),
+        help="path to the SQLite database file",
+    )
+    worker_server_parser.add_argument(
+        "--poll-interval-s",
+        type=float,
+        default=2.0,
+        help="seconds between worker assignment fallback scans",
     )
 
     worker_parser = subparsers.add_parser("worker", help="start a worker client")
@@ -155,8 +211,58 @@ def main(argv: list[str] | None = None) -> int:
     worker_parser.add_argument("--session-id")
     worker_parser.add_argument("--label-hint", default="")
     worker_parser.add_argument("--app-commit", default=_default_app_commit())
+    worker_parser.add_argument(
+        "--threads",
+        type=_positive_int,
+        default=1,
+        help="CPU threads reserved for this worker process",
+    )
+    worker_parser.add_argument(
+        "--hash-mb",
+        type=_positive_int,
+        default=32,
+        help="total engine hash memory reserved for this worker process",
+    )
+    worker_parser.add_argument(
+        "--machine-id",
+        help="stable machine identity override for containers or isolated environments",
+    )
+
+    worker_pool_parser = subparsers.add_parser(
+        "worker-pool",
+        help="enroll or resume a machine worker pool",
+    )
+    worker_pool_parser.add_argument("--server-url", default=default_worker_server_url())
+    worker_pool_parser.add_argument("--app-commit", default=_default_app_commit())
+    worker_pool_parser.add_argument(
+        "--state-file",
+        type=Path,
+        default=Path(".cope-worker/pool.json"),
+        help="current-user-only file used to persist pool slot credentials",
+    )
+    worker_pool_parser.add_argument(
+        "--enrollment-token-file",
+        type=Path,
+        help="read the one-time enrollment token from a file instead of prompting",
+    )
+    worker_pool_parser.add_argument(
+        "--machine-id",
+        help="stable machine identity override for containers or isolated environments",
+    )
 
     args = parser.parse_args(argv)
+
+    if args.role == "version":
+        from .core.models import PROTOCOL_VERSION
+
+        print(f"cope-chess 0.1.0 commit={_default_app_commit()} protocol={PROTOCOL_VERSION}")
+        return 0
+
+    if args.role == "doctor":
+        return _doctor()
+
+    if args.role == "db":
+        return _database_command(args)
 
     if args.role == "init-db":
         from .db import initialize_database
@@ -181,6 +287,8 @@ def main(argv: list[str] | None = None) -> int:
                 connection,
                 label=args.label,
                 ttl_seconds=args.ttl_seconds,
+                assigned_threads=args.threads,
+                assigned_hash_mb=args.hash_mb,
             )
             connection.commit()
         finally:
@@ -191,7 +299,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"token={token.token}")
         return 0
 
-    if args.role == "runner":
+    if args.role in {"scheduler", "worker-server"}:
         from .runner.events import configure_event_publisher
 
         configure_event_publisher(
@@ -200,23 +308,24 @@ def main(argv: list[str] | None = None) -> int:
             timeout_s=args.web_event_timeout_s,
         )
 
-        if args.worker_server:
-            from .runner.worker_server import WorkerServerConfig, run_worker_server
+    if args.role == "worker-server":
+        from .runner.worker_server import WorkerServerConfig, run_worker_server
 
-            config = WorkerServerConfig(
-                host=args.worker_host,
-                port=args.worker_port,
-                db_path=args.db_path,
-                expected_app_commit=args.app_commit,
-                assignment_poll_interval_s=args.poll_interval_s,
-            )
-            try:
-                asyncio.run(run_worker_server(config))
-            except KeyboardInterrupt:
-                LOG.info("runner stopped")
-                return 130
-            return 0
+        config = WorkerServerConfig(
+            host=args.worker_host,
+            port=args.worker_port,
+            db_path=args.db_path,
+            expected_app_commit=args.app_commit,
+            assignment_poll_interval_s=args.poll_interval_s,
+        )
+        try:
+            asyncio.run(run_worker_server(config))
+        except KeyboardInterrupt:
+            LOG.info("worker server stopped")
+            return 130
+        return 0
 
+    if args.role == "scheduler":
         if args.prototype:
             run_prototype_tournament()
             return 0
@@ -239,7 +348,7 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 run_tournament_service(config)
             except KeyboardInterrupt:
-                LOG.info("runner stopped")
+                LOG.info("scheduler stopped")
                 return 130
             return 0
 
@@ -290,8 +399,32 @@ def main(argv: list[str] | None = None) -> int:
             token=args.token,
             session_id=args.session_id,
             label_hint=args.label_hint,
+            threads=args.threads,
+            hash_mb=args.hash_mb,
+            machine_id=args.machine_id,
         )
-        asyncio.run(run_worker_client(config))
+        try:
+            asyncio.run(run_worker_client(config))
+        except KeyboardInterrupt:
+            LOG.info("worker stopped")
+            return 130
+        return 0
+
+    if args.role == "worker-pool":
+        from .worker.pool import WorkerPoolConfig, run_worker_pool
+
+        config = WorkerPoolConfig(
+            server_url=args.server_url,
+            app_commit=args.app_commit,
+            state_file=args.state_file,
+            enrollment_token_file=args.enrollment_token_file,
+            machine_id=args.machine_id,
+        )
+        try:
+            asyncio.run(run_worker_pool(config))
+        except KeyboardInterrupt:
+            LOG.info("worker pool stopped")
+            return 130
         return 0
 
     parser.error(f"unknown role: {args.role}")
@@ -300,6 +433,23 @@ def main(argv: list[str] | None = None) -> int:
 
 def _default_app_commit() -> str:
     return os.environ.get("COPE_DEPLOY_COMMIT", "dev")
+
+
+def _install_sigterm_handler() -> None:
+    if not hasattr(signal, "SIGTERM"):
+        return
+
+    def stop(_signum, _frame) -> None:
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, stop)
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
 
 
 def _default_db_path() -> str:
@@ -319,6 +469,103 @@ def _build_css(source: Path, output: Path) -> None:
     css = sass.compile(filename=str(source), output_style="expanded")
     output.write_text(css, encoding="utf-8")
     print(f"compiled {source} -> {output}")
+
+
+def _database_command(args) -> int:
+    from .db import (
+        SCHEMA_VERSION,
+        connect_database,
+        database_schema_version,
+        initialize_database,
+    )
+
+    db_path = Path(args.db_path).expanduser().resolve()
+    if args.db_command == "migrate":
+        initialize_database(db_path)
+        print(f"database migrated path={db_path} schema={SCHEMA_VERSION}")
+        return 0
+
+    if args.db_command == "check":
+        connection = connect_database(db_path)
+        try:
+            result = str(connection.execute("PRAGMA integrity_check").fetchone()[0])
+            version = database_schema_version(connection)
+        finally:
+            connection.close()
+        print(f"database path={db_path} integrity={result} schema={version}/{SCHEMA_VERSION}")
+        return 0 if result == "ok" and version == SCHEMA_VERSION else 1
+
+    if args.db_command == "backup":
+        initialize_database(db_path)
+        output = args.output or Path("backups") / (
+            "cope-" + datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + ".db"
+        )
+        output = output.expanduser().resolve()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        source = connect_database(db_path)
+        destination = sqlite3.connect(output)
+        try:
+            source.backup(destination)
+        finally:
+            destination.close()
+            source.close()
+        backups = sorted(output.parent.glob("cope-*.db"), key=lambda path: path.stat().st_mtime)
+        for stale in backups[:-args.keep]:
+            stale.unlink()
+        print(f"database backup created at {output}")
+        return 0
+
+    if args.db_command == "restore":
+        source_path = args.source.expanduser().resolve()
+        if not source_path.is_file() or source_path == db_path:
+            raise SystemExit("restore source must be a separate SQLite backup file")
+        source = sqlite3.connect(source_path)
+        try:
+            result = str(source.execute("PRAGMA integrity_check").fetchone()[0])
+            if result != "ok":
+                raise SystemExit(f"backup integrity check failed: {result}")
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            destination = sqlite3.connect(db_path)
+            try:
+                source.backup(destination)
+            finally:
+                destination.close()
+        finally:
+            source.close()
+        print(f"database restored from {source_path} to {db_path}")
+        return 0
+
+    raise SystemExit(f"unknown database command: {args.db_command}")
+
+
+def _doctor() -> int:
+    from .db import SCHEMA_VERSION, connect_database, database_schema_version
+
+    failures: list[str] = []
+    db_path = Path(_default_db_path()).expanduser().resolve()
+    if not db_path.is_file():
+        failures.append(f"database does not exist: {db_path}")
+    else:
+        connection = connect_database(db_path)
+        try:
+            integrity = str(connection.execute("PRAGMA quick_check").fetchone()[0])
+            version = database_schema_version(connection)
+        finally:
+            connection.close()
+        if integrity != "ok":
+            failures.append(f"database quick_check: {integrity}")
+        if version != SCHEMA_VERSION:
+            failures.append(f"database schema is {version}, expected {SCHEMA_VERSION}")
+    if not default_admin_token():
+        failures.append("COPE_ADMIN_TOKEN or COPE_ADMIN_TOKEN_FILE is not configured")
+    if not default_web_event_token():
+        failures.append("COPE_WEB_EVENT_TOKEN or COPE_WEB_EVENT_TOKEN_FILE is not configured")
+    if failures:
+        for failure in failures:
+            print(f"FAIL {failure}")
+        return 1
+    print(f"OK database={db_path} schema={SCHEMA_VERSION}")
+    return 0
 
 
 if __name__ == "__main__":

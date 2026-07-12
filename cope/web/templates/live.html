@@ -5,42 +5,48 @@
 
 {% block content %}
   <section class="home-section home-live">
-    {% if live_games %}
+    {% if running_tournaments %}
       <div class="live-game-list">
-        {% for item in live_games %}
-          <article class="live-game-card" data-href="/tournaments/{{ item.game.tournament_id }}?game_id={{ item.game.id }}">
-            <div class="live-game-card__preview board-shell board-shell--preview" data-board data-fen="{{ item.opening.fen if item.opening else 'startpos' }}" data-moves="{{ item.moves | map(attribute='uci') | join(' ') }}">
-              <div class="board board--preview" data-board-grid></div>
-            </div>
+        {% for item in running_tournaments %}
+          {% set tournament = item.tournament %}
+          {% set preview = item.preview %}
+          <article class="live-game-card" data-href="/tournaments/{{ tournament.record.id }}">
+            {% if preview %}
+              <div class="live-game-card__preview board-shell board-shell--preview" data-board data-fen="{{ preview.opening.fen if preview.opening else 'startpos' }}" data-moves="{{ preview.moves | map(attribute='uci') | join(' ') }}">
+                <div class="board board--preview" data-board-grid></div>
+              </div>
+            {% endif %}
             <div class="live-game-card__body">
               <header class="live-game-card__header">
                 <div>
-                  <h3>
-                    {{ item.white_name }}
-                    <span class="muted">vs</span>
-                    {{ item.black_name }}
-                  </h3>
-                  <p>{{ item.tournament.name }} &middot; round {{ item.game.round }} &middot; {{ item.format }} &middot; {{ item.time_control }}</p>
+                  <h3>{{ tournament.record.name }}</h3>
+                  <p>{{ tournament.format }} &middot; {{ tournament.time_control }}</p>
                 </div>
-                {{ status_badge(item.game.status) }}
+                {{ status_badge(tournament.record.status) }}
               </header>
 
+              {% if preview %}
+                <p>{{ preview.white_name }} <span class="muted">vs</span> {{ preview.black_name }} &middot; round {{ preview.game.round }}</p>
+              {% else %}
+                <p>Waiting for the next game to start.</p>
+              {% endif %}
+
               <div class="progress">
-                <div class="progress__bar" style="width: {{ (item.summary.finished / item.summary.total * 100) | round if item.summary.total else 0 }}%"></div>
+                <div class="progress__bar" style="width: {{ tournament.progress_percent }}%"></div>
               </div>
 
               <dl class="live-game-card__facts">
                 <div>
                   <dt>Moves</dt>
-                  <dd>{{ item.moves|length }}</dd>
+                  <dd>{{ preview.moves|length if preview else "-" }}</dd>
                 </div>
                 <div>
                   <dt>Last move</dt>
-                  <dd>{{ item.last_move.san if item.last_move else "-" }}</dd>
+                  <dd>{{ preview.last_move.san if preview and preview.last_move else "-" }}</dd>
                 </div>
                 <div>
                   <dt>Tournament</dt>
-                  <dd>{{ item.summary.finished }} / {{ item.summary.total }} complete</dd>
+                  <dd>{{ tournament.summary.finished }} / {{ tournament.summary.total }} complete</dd>
                 </div>
               </dl>
             </div>
@@ -49,7 +55,7 @@
       </div>
     {% else %}
       <div class="empty-state">
-        <p>No active games.</p>
+        <p>No running tournaments.</p>
       </div>
     {% endif %}
   </section>

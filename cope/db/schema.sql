@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS engines (
   commit_hash TEXT NOT NULL,
   build_cmd TEXT NOT NULL,
   binary_path TEXT NOT NULL,
+  required_dependencies TEXT NOT NULL DEFAULT '[]',
   uci_options TEXT NOT NULL DEFAULT '{}',
   active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1))
 );
@@ -37,12 +38,13 @@ VALUES (
 CREATE TABLE IF NOT EXISTS tournaments (
   id INTEGER PRIMARY KEY,
   name TEXT NOT NULL,
-  category_id INTEGER NOT NULL DEFAULT 1 REFERENCES categories(id),
+  category_id INTEGER REFERENCES categories(id),
   settings_unlinked INTEGER NOT NULL DEFAULT 0 CHECK (settings_unlinked IN (0, 1)),
   config TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'draft'
     CHECK (status IN ('draft', 'scheduled', 'running', 'paused', 'finished', 'aborted')),
   current_round INTEGER NOT NULL DEFAULT 0,
+  worker_profile TEXT,
   created_at TEXT NOT NULL,
   started_at TEXT,
   finished_at TEXT
@@ -157,6 +159,35 @@ CREATE TABLE IF NOT EXISTS tournament_rating_commits (
   error TEXT
 );
 
+CREATE TABLE IF NOT EXISTS worker_pools (
+  id INTEGER PRIMARY KEY,
+  label TEXT NOT NULL,
+  enrollment_token_hash TEXT,
+  enrollment_expires_at TEXT,
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending', 'enrolled', 'revoked')),
+  machine_id TEXT,
+  slot_count INTEGER NOT NULL CHECK (slot_count > 0),
+  assigned_threads INTEGER NOT NULL CHECK (assigned_threads > 0),
+  assigned_hash_mb INTEGER NOT NULL CHECK (assigned_hash_mb > 0),
+  created_at TEXT NOT NULL,
+  enrolled_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS service_endpoints (
+  service TEXT PRIMARY KEY,
+  host TEXT NOT NULL,
+  port INTEGER NOT NULL CHECK (port > 0 AND port <= 65535),
+  path TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS service_heartbeats (
+  service TEXT PRIMARY KEY,
+  app_commit TEXT NOT NULL,
+  last_seen TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS workers (
   id INTEGER PRIMARY KEY,
   label TEXT NOT NULL,
@@ -167,7 +198,15 @@ CREATE TABLE IF NOT EXISTS workers (
   session_id TEXT,
   app_commit TEXT,
   protocol_version INTEGER,
+  machine_id TEXT,
+  pool_id INTEGER REFERENCES worker_pools(id) ON DELETE SET NULL,
+  pool_slot_token_hash TEXT,
+  assigned_threads INTEGER NOT NULL DEFAULT 1 CHECK (assigned_threads > 0),
+  assigned_hash_mb INTEGER NOT NULL DEFAULT 32 CHECK (assigned_hash_mb > 0),
   hw TEXT,
+  available_dependencies TEXT NOT NULL DEFAULT '[]',
+  dependency_manifest_revision TEXT,
+  dependencies_checked_at TEXT,
   last_seen TEXT
 );
 
@@ -189,9 +228,19 @@ CREATE TABLE IF NOT EXISTS openings (
 
 CREATE TABLE IF NOT EXISTS chat_messages (
   id INTEGER PRIMARY KEY,
+  tournament_id INTEGER NOT NULL REFERENCES tournaments(id) ON DELETE CASCADE,
   display_name TEXT NOT NULL,
   text TEXT NOT NULL,
   at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS system_chat_events (
+  tournament_id INTEGER NOT NULL REFERENCES tournaments(id) ON DELETE CASCADE,
+  event_key TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  message_id INTEGER NOT NULL REFERENCES chat_messages(id) ON DELETE CASCADE,
+  metadata TEXT NOT NULL DEFAULT '{}',
+  PRIMARY KEY (tournament_id, event_key)
 );
 
 CREATE TABLE IF NOT EXISTS chat_settings (
@@ -226,3 +275,4 @@ CREATE INDEX IF NOT EXISTS idx_runner_commands_status_created ON runner_commands
 CREATE INDEX IF NOT EXISTS idx_workers_status ON workers(status);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_workers_token_hash ON workers(token_hash) WHERE token_hash IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_workers_session_id ON workers(session_id) WHERE session_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_worker_pools_enrollment_token_hash ON worker_pools(enrollment_token_hash) WHERE enrollment_token_hash IS NOT NULL;

@@ -14,14 +14,14 @@
           <option value="{{ category.id }}" {% if category.id == form_category_id %}selected{% endif %}>{{ category.name }}</option>
         {% endfor %}
       </select>
-      <p class="field-help">Committed results update this category's Elo list.</p>
+      <p class="field-help">Only category tournaments can update an Elo list.</p>
     </div>
     <div class="field field--checkbox">
       <label>
         <input type="checkbox" name="category_settings_linked" data-linked-toggle {% if form_linked %}checked{% endif %}>
-        Use the category's default settings
+        Use this rating category and its settings exactly
       </label>
-      <button class="button button--small" type="button" data-unlink-settings {% if not form_linked %}hidden{% endif %}>Unlink settings</button>
+      <button class="button button--small" type="button" data-unlink-settings {% if not form_linked %}hidden{% endif %}>Use independent settings</button>
     </div>
   </div>
 </fieldset>

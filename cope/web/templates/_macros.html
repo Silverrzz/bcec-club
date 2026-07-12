@@ -70,11 +70,10 @@
       <p class="field-help">Swiss rounds and knockout stages are paired as results arrive. Gauntlets rotate colours across every opponent.</p>
     </div>
 
-    <div class="field field--checkbox" data-format-field="round_robin">
-      <label>
-        <input type="checkbox" name="round_robin_double" {% if values.round_robin_double %}checked{% endif %}>
-        Double round robin (each pairing plays both colours)
-      </label>
+    <div class="field" data-format-field="round_robin">
+      <label for="round_robin_games_per_pairing">Games per pairing</label>
+      <input class="input input--small" id="round_robin_games_per_pairing" type="number" min="1" name="round_robin_games_per_pairing" value="{{ values.round_robin_games_per_pairing }}">
+      <p class="field-help">Each pairing plays this many times, alternating colours.</p>
     </div>
 
     <div class="field" data-format-field="swiss">

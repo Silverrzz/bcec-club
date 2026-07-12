@@ -61,6 +61,11 @@
         <input class="input" id="binary_path" name="binary_path" value="{{ values.get('binary_path', '') }}" required placeholder="build/engine.exe">
         <p class="field-help">Path to the built UCI binary, relative to the repository root.</p>
       </div>
+      <div class="field">
+        <label for="required_dependencies">Required executables <span class="field-optional">(optional)</span></label>
+        <textarea class="input" id="required_dependencies" name="required_dependencies" rows="4" placeholder="clang++&#10;cmake&#10;cargo">{{ values.get('required_dependencies', '') }}</textarea>
+        <p class="field-help">One executable name per line. COPE checks the worker service PATH but never installs software.</p>
+      </div>
     </fieldset>
 
     <fieldset class="form-section">

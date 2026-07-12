@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 import secrets
 import threading
+import time
 from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass, field
@@ -16,10 +18,19 @@ from websockets.server import WebSocketServerProtocol, serve
 
 from cope.core.models import (
     AssignmentComplete,
+    AssignmentRejected,
+    AssignmentReady,
+    DependencyProbe,
+    DependencyReport,
     EngineCommand,
     EngineCommandResult,
     EngineInfo,
     PROTOCOL_VERSION,
+    WorkerPoolEnrollmentHello,
+    WorkerPoolSlotCredential,
+    WorkerPoolSlotHello,
+    WorkerPoolWelcome,
+    WorkerResources,
     WorkerSessionHello,
     WorkerTokenHello,
     WorkerWelcome,
@@ -37,14 +48,22 @@ from cope.db import (
     connect_database,
     disconnect_worker,
     fail_game_assignment,
+    acknowledge_game_assignment,
     get_game,
     get_worker,
     get_worker_by_session_id,
+    get_worker_by_pool_slot_token,
     get_worker_by_token,
+    get_worker_pool_by_token,
+    enroll_worker_pool,
     initialize_database,
     list_workers,
+    list_engine_records,
+    set_service_endpoint,
     touch_worker_seen,
+    touch_service_heartbeat,
     update_worker_status,
+    update_worker_dependencies,
     upsert_worker_connection,
     worker_token_is_valid,
 )
@@ -52,7 +71,6 @@ from cope.network import DEFAULT_WORKER_PATH, default_worker_host, default_worke
 from cope.runner.local import (
     next_worker_assignment,
     run_worker_assignment_game,
-    run_tournament_matches,
 )
 from cope.runner.events import (
     publish_tournament_event,
@@ -65,6 +83,11 @@ from cope.runner.events import (
 LOG = logging.getLogger("cope.worker_server")
 WORKER_CONNECTION_REPLACED_CLOSE_CODE = 4001
 ASSIGNABLE_WORKER_STATUSES = {"connected", "building", "ready", "busy"}
+DEPENDENCY_PROBE_INTERVAL_S = 30.0
+
+
+class AssignmentDependencyRejected(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -87,14 +110,16 @@ async def run_worker_server(config: WorkerServerConfig) -> None:
     for tournament_id in orphaned_tournaments:
         publish_tournament_event(tournament_id)
     heartbeat_interval_s = max(config.heartbeat_interval_ms / 1000, 0.5)
+    ping_timeout_s = max(heartbeat_interval_s * 3, 15.0)
     async with serve(
         server.handle_connection,
         config.host,
         config.port,
         ping_interval=heartbeat_interval_s,
-        ping_timeout=heartbeat_interval_s,
+        ping_timeout=ping_timeout_s,
         close_timeout=1,
     ):
+        _register_worker_endpoint(config)
         LOG.info(
             "listening for workers bind=%s:%s path=%s db=%s",
             config.host,
@@ -103,6 +128,22 @@ async def run_worker_server(config: WorkerServerConfig) -> None:
             config.db_path,
         )
         await asyncio.Future()
+
+
+def _register_worker_endpoint(config: WorkerServerConfig) -> None:
+    initialize_database(config.db_path)
+    connection = connect_database(config.db_path)
+    try:
+        set_service_endpoint(
+            connection,
+            service="worker-server",
+            host=config.host,
+            port=config.port,
+            path=DEFAULT_WORKER_PATH,
+        )
+        connection.commit()
+    finally:
+        connection.close()
 
 
 class WorkerConnectionInactive(RuntimeError):
@@ -165,20 +206,36 @@ class WorkerHandshakeServer:
             hello = decode_message(
                 raw_message,
                 "hello",
-                WorkerTokenHello | WorkerSessionHello,
+                WorkerTokenHello
+                | WorkerSessionHello
+                | WorkerPoolSlotHello
+                | WorkerPoolEnrollmentHello,
             )
             self._validate_app_commit(hello)
+            if isinstance(hello, WorkerPoolEnrollmentHello):
+                welcome = self._enroll_worker_pool(hello)
+                await _send_message(websocket, "pool_welcome", welcome)
+                publish_workers_changed(
+                    "worker.pool_enrolled",
+                    {"pool_id": welcome.pool_id, "slot_count": len(welcome.slots)},
+                )
+                await websocket.close(code=1000, reason="worker pool enrolled")
+                return
             authenticated_worker = self._authenticate_worker(hello)
             session_id = _new_session_id()
             label = _worker_label(authenticated_worker, hello)
             worker = self._record_connection(authenticated_worker, label, session_id, hello)
 
+            dependency_probe = self._dependency_probe()
             welcome = WorkerWelcome(
                 worker_id=worker.id,
                 session_id=session_id,
                 heartbeat_interval_ms=self._config.heartbeat_interval_ms,
+                resources=worker.resources,
+                dependency_probe=dependency_probe,
             )
             await _send_message(websocket, "welcome", welcome)
+            await self._receive_dependency_report(websocket, worker, dependency_probe)
             LOG.info("worker accepted worker_id=%s label=%s", worker.id, label)
             publish_workers_changed("worker.connected", {"worker_id": worker.id})
             await self._wake_workers()
@@ -207,10 +264,15 @@ class WorkerHandshakeServer:
         wake_generation = self._work_generation
         closed = asyncio.create_task(websocket.wait_closed())
         heartbeat = asyncio.create_task(self._maintain_worker_heartbeat(worker, closed))
+        next_dependency_probe_at = time.monotonic() + DEPENDENCY_PROBE_INTERVAL_S
         try:
             while True:
                 if websocket.closed:
                     return
+
+                if time.monotonic() >= next_dependency_probe_at:
+                    await self._refresh_worker_dependencies(websocket, worker)
+                    next_dependency_probe_at = time.monotonic() + DEPENDENCY_PROBE_INTERVAL_S
 
                 try:
                     assignment = self._claim_next_assignment(worker)
@@ -244,7 +306,7 @@ class WorkerHandshakeServer:
 
                 if not self._record_worker_status(
                     worker.id,
-                    "busy",
+                    "building",
                     session_id=worker.session_id,
                 ):
                     self._fail_assignment(
@@ -265,11 +327,29 @@ class WorkerHandshakeServer:
                 transport = WorkerEngineTransport(websocket, assignment)
                 try:
                     await _send_message(websocket, "assignment", assignment)
+                    ready = await self._receive_assignment_ready(websocket, assignment)
+                    self._acknowledge_assignment(ready)
+                    if not self._record_worker_status(
+                        worker.id,
+                        "busy",
+                        session_id=worker.session_id,
+                    ):
+                        raise WorkerConnectionInactive("worker session is no longer current")
                     await asyncio.to_thread(
                         self._run_assignment_game,
                         assignment,
                         transport,
                     )
+                except AssignmentDependencyRejected as error:
+                    self._fail_assignment(assignment, error)
+                    LOG.warning(
+                        "assignment rejected worker_id=%s assignment_id=%s reason=%s",
+                        worker.id,
+                        payload.assignment_id,
+                        error,
+                    )
+                    await self._wake_workers()
+                    continue
                 except asyncio.CancelledError:
                     try:
                         self._fail_assignment(assignment, RuntimeError("runner shutting down"))
@@ -401,21 +481,137 @@ class WorkerHandshakeServer:
                 worker.id,
                 session_id=worker.session_id,
             )
+            touch_service_heartbeat(
+                connection,
+                "worker-server",
+                self._config.expected_app_commit or "dev",
+            )
             connection.commit()
             return updated
         finally:
             connection.close()
 
-    def _validate_app_commit(self, hello: WorkerTokenHello | WorkerSessionHello) -> None:
+    def _dependency_probe(self) -> DependencyProbe:
+        connection = connect_database(self._config.db_path)
+        try:
+            dependencies = sorted(
+                {
+                    dependency
+                    for engine in list_engine_records(connection)
+                    if engine.active
+                    for dependency in engine.required_dependencies
+                }
+            )
+        finally:
+            connection.close()
+        revision = hashlib.sha256("\0".join(dependencies).encode("utf-8")).hexdigest()
+        return DependencyProbe(
+            revision=revision,
+            required_dependencies=dependencies,
+        )
+
+    async def _refresh_worker_dependencies(
+        self,
+        websocket: WebSocketServerProtocol,
+        worker: WorkerRecord,
+    ) -> None:
+        probe = self._dependency_probe()
+        await _send_message(websocket, "dependency_probe", probe)
+        await self._receive_dependency_report(websocket, worker, probe)
+
+    async def _receive_dependency_report(
+        self,
+        websocket: WebSocketServerProtocol,
+        worker: WorkerRecord,
+        probe: DependencyProbe,
+    ) -> None:
+        raw_message = await websocket.recv()
+        report = decode_message(raw_message, "dependency_report", DependencyReport)
+        if report.revision != probe.revision:
+            raise ProtocolValidationError("dependency report revision mismatch")
+        unexpected = set(report.available_dependencies).difference(
+            probe.required_dependencies
+        )
+        if unexpected:
+            raise ProtocolValidationError("dependency report contains unrequested names")
+        connection = connect_database(self._config.db_path)
+        try:
+            updated = update_worker_dependencies(
+                connection,
+                worker.id,
+                available_dependencies=report.available_dependencies,
+                manifest_revision=report.revision,
+                session_id=worker.session_id,
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        if not updated:
+            raise WorkerConnectionInactive("worker session is no longer current")
+        publish_workers_changed("worker.dependencies", {"worker_id": worker.id})
+
+    def _validate_app_commit(
+        self,
+        hello: WorkerTokenHello
+        | WorkerSessionHello
+        | WorkerPoolSlotHello
+        | WorkerPoolEnrollmentHello,
+    ) -> None:
         expected = self._config.expected_app_commit
         if expected is not None and hello.app_commit != expected:
             raise ProtocolValidationError(
                 f"app_commit mismatch: expected {expected}, got {hello.app_commit}"
             )
 
+    def _enroll_worker_pool(
+        self,
+        hello: WorkerPoolEnrollmentHello,
+    ) -> WorkerPoolWelcome:
+        initialize_database(self._config.db_path)
+        connection = connect_database(self._config.db_path)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            pool = get_worker_pool_by_token(connection, hello.enrollment_token)
+            if pool is None:
+                raise ProtocolValidationError("invalid or expired worker pool enrollment token")
+            try:
+                credentials = enroll_worker_pool(
+                    connection,
+                    pool=pool,
+                    machine_id=hello.machine_id,
+                    hw=hello.hw,
+                    app_commit=hello.app_commit,
+                    protocol_version=PROTOCOL_VERSION,
+                )
+            except ValueError as error:
+                raise ProtocolValidationError(str(error)) from error
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return WorkerPoolWelcome(
+            pool_id=pool.id,
+            label=pool.label,
+            machine_id=hello.machine_id,
+            slots=[
+                WorkerPoolSlotCredential(
+                    worker_id=credential.worker_id,
+                    label=credential.label,
+                    slot_token=credential.token,
+                    resources=WorkerResources(
+                        threads=pool.assigned_threads,
+                        hash_mb=pool.assigned_hash_mb,
+                    ),
+                )
+                for credential in credentials
+            ],
+        )
+
     def _authenticate_worker(
         self,
-        hello: WorkerTokenHello | WorkerSessionHello,
+        hello: WorkerTokenHello | WorkerSessionHello | WorkerPoolSlotHello,
     ) -> WorkerRecord:
         initialize_database(self._config.db_path)
         connection = connect_database(self._config.db_path)
@@ -424,6 +620,12 @@ class WorkerHandshakeServer:
                 worker = get_worker_by_token(connection, hello.token)
                 if worker is None or not worker_token_is_valid(worker):
                     raise ProtocolValidationError("invalid or expired worker token")
+                return worker
+
+            if isinstance(hello, WorkerPoolSlotHello):
+                worker = get_worker_by_pool_slot_token(connection, hello.slot_token)
+                if worker is None or worker.status == "revoked":
+                    raise ProtocolValidationError("invalid worker pool slot credential")
                 return worker
 
             worker = get_worker_by_session_id(connection, hello.session_id)
@@ -438,10 +640,12 @@ class WorkerHandshakeServer:
         worker: WorkerRecord,
         label: str,
         session_id: str,
-        hello: WorkerTokenHello | WorkerSessionHello,
+        hello: WorkerTokenHello | WorkerSessionHello | WorkerPoolSlotHello,
     ) -> WorkerRecord:
         connection = connect_database(self._config.db_path)
         try:
+            connection.execute("BEGIN IMMEDIATE")
+            self._validate_worker_resources(connection, worker, hello)
             tournament_ids = disconnect_worker(
                 connection,
                 worker.id,
@@ -454,6 +658,7 @@ class WorkerHandshakeServer:
                 session_id=session_id,
                 app_commit=hello.app_commit,
                 protocol_version=PROTOCOL_VERSION,
+                machine_id=hello.machine_id,
                 hw=hello.hw,
             )
             current = get_worker(connection, worker.id)
@@ -468,6 +673,60 @@ class WorkerHandshakeServer:
         for tournament_id in tournament_ids:
             publish_tournament_event(tournament_id)
         return current
+
+    def _validate_worker_resources(
+        self,
+        connection,
+        worker: WorkerRecord,
+        hello: WorkerTokenHello | WorkerSessionHello | WorkerPoolSlotHello,
+    ) -> None:
+        if hello.resources != worker.resources:
+            raise ProtocolValidationError(
+                "worker resource arguments do not match its registered reservation: "
+                f"expected {worker.assigned_threads} threads and "
+                f"{worker.assigned_hash_mb}MB hash"
+            )
+
+        machine_workers = [
+            candidate
+            for candidate in list_workers(connection)
+            if candidate.id != worker.id
+            and candidate.machine_id == hello.machine_id
+            and candidate.status != "revoked"
+            and (
+                candidate.pool_id is not None
+                or candidate.status in ASSIGNABLE_WORKER_STATUSES
+            )
+        ]
+        for candidate in machine_workers:
+            if candidate.hw is None:
+                continue
+            if candidate.hw.physical_cores != hello.hw.physical_cores:
+                raise ProtocolValidationError(
+                    "connected workers with the same machine id reported different physical core counts"
+                )
+            if candidate.hw.total_ram_mb != hello.hw.total_ram_mb:
+                raise ProtocolValidationError(
+                    "connected workers with the same machine id reported different RAM capacities"
+                )
+
+        reserved_threads = hello.resources.threads + sum(
+            candidate.assigned_threads for candidate in machine_workers
+        )
+        if reserved_threads > hello.hw.physical_cores:
+            raise ProtocolValidationError(
+                f"machine resource oversubscription: workers reserve {reserved_threads} threads "
+                f"but only {hello.hw.physical_cores} physical cores are available"
+            )
+
+        reserved_hash_mb = hello.resources.hash_mb + sum(
+            candidate.assigned_hash_mb for candidate in machine_workers
+        )
+        if reserved_hash_mb > hello.hw.total_ram_mb:
+            raise ProtocolValidationError(
+                f"machine resource oversubscription: workers reserve {reserved_hash_mb}MB hash "
+                f"but only {hello.hw.total_ram_mb}MB RAM is available"
+            )
 
     def _connected_worker(self, worker_id: int) -> WorkerRecord:
         connection = connect_database(self._config.db_path)
@@ -523,12 +782,14 @@ class WorkerHandshakeServer:
         initialize_database(self._config.db_path)
         connection = connect_database(self._config.db_path)
         try:
+            connection.execute("BEGIN IMMEDIATE")
             live_worker = self._validate_assignable_worker(connection, worker)
-            run_tournament_matches(connection)
-            live_worker = self._validate_assignable_worker(connection, live_worker)
             assignment = next_worker_assignment(connection, live_worker)
             if assignment is not None:
                 connection.commit()
+                game = get_game(connection, assignment.assignment.game_id)
+                if game is not None:
+                    publish_tournament_event(game.tournament_id)
             return assignment
         except Exception:
             connection.rollback()
@@ -556,6 +817,45 @@ class WorkerHandshakeServer:
         connection = connect_database(self._config.db_path)
         try:
             run_worker_assignment_game(connection, assignment, transport)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    async def _receive_assignment_ready(
+        self,
+        websocket: WebSocketServerProtocol,
+        assignment,
+    ) -> AssignmentReady:
+        raw_message = await websocket.recv()
+        envelope = decode_envelope(raw_message)
+        if envelope.type == "assignment_rejected":
+            rejected = AssignmentRejected.model_validate(envelope.data)
+            if not rejected.matches_assignment(assignment.assignment):
+                raise ProtocolValidationError("assignment rejection mismatch")
+            raise AssignmentDependencyRejected(
+                "worker missing dependencies: " + ", ".join(rejected.missing_dependencies)
+            )
+        if envelope.type != "assignment_ready":
+            raise ProtocolValidationError(
+                f"expected assignment_ready, got {envelope.type}"
+            )
+        ready = AssignmentReady.model_validate(envelope.data)
+        if not ready.matches_assignment(assignment.assignment):
+            raise ProtocolValidationError("assignment_ready assignment mismatch")
+        expected = set(assignment.engines)
+        if set(ready.prepared_engine_ids) != expected:
+            raise ProtocolValidationError(
+                "assignment_ready must include every assigned engine"
+            )
+        return ready
+
+    def _acknowledge_assignment(self, ready: AssignmentReady) -> None:
+        connection = connect_database(self._config.db_path)
+        try:
+            acknowledge_game_assignment(connection, ready.assignment_id)
             connection.commit()
         except Exception:
             connection.rollback()
@@ -711,16 +1011,20 @@ def _validate_worker_payload(model_type, data):
         raise ProtocolValidationError(str(error)) from error
 
 
-def _hello_label(hello: WorkerTokenHello | WorkerSessionHello) -> str:
+def _hello_label(
+    hello: WorkerTokenHello | WorkerSessionHello | WorkerPoolSlotHello,
+) -> str:
     if isinstance(hello, WorkerTokenHello):
         return hello.label_hint or "token worker"
 
+    if isinstance(hello, WorkerPoolSlotHello):
+        return "pool worker"
     return "session worker"
 
 
 def _worker_label(
     worker: WorkerRecord,
-    hello: WorkerTokenHello | WorkerSessionHello,
+    hello: WorkerTokenHello | WorkerSessionHello | WorkerPoolSlotHello,
 ) -> str:
     if worker.label:
         return worker.label

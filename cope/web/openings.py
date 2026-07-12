@@ -48,10 +48,13 @@ def _parse_pgn_openings(text: str) -> list[tuple[str, str]]:
         board = game.board()
         for move in game.mainline_moves():
             board.push(move)
-        name = (
-            game.headers.get("Opening")
-            or game.headers.get("Event")
-            or f"PGN line {len(openings) + 1}"
+        name = next(
+            (
+                value
+                for key in ("Opening", "Event")
+                if (value := game.headers.get(key, "").strip()) not in {"?", "-"}
+            ),
+            f"PGN line {len(openings) + 1}",
         )
         openings.append((name, board.fen()))
     return openings

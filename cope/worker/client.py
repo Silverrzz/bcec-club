@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import platform
-from dataclasses import dataclass
+import shutil
+import uuid
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any
 
 from websockets.client import connect
@@ -12,15 +16,19 @@ from websockets.exceptions import ConnectionClosed
 
 from cope.core.models import (
     AssignmentComplete,
+    AssignmentRejected,
+    AssignmentReady,
     BenchInfo,
     EngineCommand,
     EngineCommandResult,
     EngineInfo,
     HardwareInfo,
     WorkerGameAssignment,
+    WorkerPoolSlotHello,
     WorkerSessionHello,
     WorkerTokenHello,
     WorkerWelcome,
+    WorkerResources,
 )
 from cope.core.protocol import (
     ProtocolValidationError,
@@ -34,6 +42,8 @@ from .uci_engine import UciEngineProcess
 
 
 LOG = logging.getLogger("cope.worker")
+RECONNECT_INITIAL_DELAY_S = 1.0
+RECONNECT_MAX_DELAY_S = 30.0
 
 
 @dataclass(frozen=True)
@@ -42,42 +52,108 @@ class WorkerClientConfig:
     app_commit: str
     token: str | None = None
     session_id: str | None = None
+    pool_slot_token: str | None = None
     label_hint: str = ""
+    threads: int = 1
+    hash_mb: int = 32
+    machine_id: str | None = None
+
+    @property
+    def resources(self) -> WorkerResources:
+        return WorkerResources(threads=self.threads, hash_mb=self.hash_mb)
 
 
 async def run_worker_client(config: WorkerClientConfig) -> None:
+    state = _WorkerConnectionState(session_id=config.session_id)
+    reconnect_delay_s = RECONNECT_INITIAL_DELAY_S
+    while True:
+        state.connected = False
+        try:
+            await _run_worker_connection(config, state)
+        except ConnectionClosed as error:
+            _log_connection_closed(error)
+        except (OSError, asyncio.TimeoutError) as error:
+            LOG.warning("runner connection failed: %s", error)
+        except Exception:
+            LOG.exception("worker client failed")
+            raise
+
+        if state.connected:
+            reconnect_delay_s = RECONNECT_INITIAL_DELAY_S
+        LOG.info("reconnecting to runner in %.1fs", reconnect_delay_s)
+        await asyncio.sleep(reconnect_delay_s)
+        reconnect_delay_s = min(reconnect_delay_s * 2, RECONNECT_MAX_DELAY_S)
+
+
+@dataclass
+class _WorkerConnectionState:
+    session_id: str | None
+    connected: bool = False
+
+
+async def _run_worker_connection(
+    config: WorkerClientConfig,
+    state: _WorkerConnectionState,
+) -> None:
+    connection_config = (
+        replace(config, token=None, session_id=state.session_id)
+        if state.session_id is not None and config.pool_slot_token is None
+        else config
+    )
     LOG.info(
         "connecting to runner url=%s app_commit=%s",
-        config.server_url,
-        config.app_commit,
+        connection_config.server_url,
+        connection_config.app_commit,
     )
-    try:
-        async with connect(config.server_url) as websocket:
-            await _send_message(websocket, "hello", _build_hello(config))
-            welcome = await _recv_message(websocket, "welcome", WorkerWelcome)
-            LOG.info(
-                "accepted by runner worker_id=%s session=%s",
-                welcome.worker_id,
-                _redact_secret(welcome.session_id),
+    async with connect(connection_config.server_url) as websocket:
+        await _send_message(websocket, "hello", _build_hello(connection_config))
+        welcome = await _recv_message(websocket, "welcome", WorkerWelcome)
+        if welcome.resources != connection_config.resources:
+            raise ProtocolValidationError(
+                "runner accepted a different resource reservation than the worker requested"
             )
-            while True:
-                envelope = await _recv_envelope(websocket)
-                if envelope.type != "assignment":
-                    raise ProtocolValidationError(f"unexpected runner message: {envelope.type}")
-                assignment = WorkerGameAssignment.model_validate(envelope.data)
-                await _serve_assignment(websocket, assignment, worker_id=welcome.worker_id)
-    except ConnectionClosed as error:
-        _log_connection_closed(error)
-    except Exception:
-        LOG.exception("worker client failed")
-        raise
+        state.session_id = welcome.session_id
+        await _send_dependency_report(websocket, welcome.dependency_probe)
+        state.connected = True
+        LOG.info(
+            "accepted by runner worker_id=%s session=%s",
+            welcome.worker_id,
+            _redact_secret(welcome.session_id),
+        )
+        while True:
+            envelope = await _recv_envelope(websocket)
+            if envelope.type == "dependency_probe":
+                probe = DependencyProbe.model_validate(envelope.data)
+                await _send_dependency_report(websocket, probe)
+                continue
+            if envelope.type != "assignment":
+                raise ProtocolValidationError(f"unexpected runner message: {envelope.type}")
+            assignment = WorkerGameAssignment.model_validate(envelope.data)
+            if not connection_config.resources.can_run(assignment.required_resources):
+                raise ProtocolValidationError(
+                    "assignment exceeds worker reservation: "
+                    f"requires {assignment.required_resources.threads} threads and "
+                    f"{assignment.required_resources.hash_mb}MB hash, worker has "
+                    f"{connection_config.resources.threads} threads and "
+                    f"{connection_config.resources.hash_mb}MB hash"
+                )
+            await _serve_assignment(websocket, assignment, worker_id=welcome.worker_id)
 
 
-def _build_hello(config: WorkerClientConfig) -> WorkerTokenHello | WorkerSessionHello:
-    if (config.token is None) == (config.session_id is None):
-        raise ValueError("worker client needs exactly one of token or session_id")
+def _build_hello(
+    config: WorkerClientConfig,
+) -> WorkerTokenHello | WorkerSessionHello | WorkerPoolSlotHello:
+    credential_count = sum(
+        value is not None
+        for value in (config.token, config.session_id, config.pool_slot_token)
+    )
+    if credential_count != 1:
+        raise ValueError(
+            "worker client needs exactly one of token, session_id, or pool_slot_token"
+        )
 
     hw = _detect_hardware()
+    machine_id = config.machine_id or _detect_machine_id()
 
     if config.token is not None:
         return WorkerTokenHello(
@@ -85,12 +161,25 @@ def _build_hello(config: WorkerClientConfig) -> WorkerTokenHello | WorkerSession
             label_hint=config.label_hint,
             hw=hw,
             app_commit=config.app_commit,
+            machine_id=machine_id,
+            resources=config.resources,
+        )
+
+    if config.pool_slot_token is not None:
+        return WorkerPoolSlotHello(
+            slot_token=config.pool_slot_token,
+            hw=hw,
+            app_commit=config.app_commit,
+            machine_id=machine_id,
+            resources=config.resources,
         )
 
     return WorkerSessionHello(
         session_id=config.session_id or "",
         hw=hw,
         app_commit=config.app_commit,
+        machine_id=machine_id,
+        resources=config.resources,
     )
 
 
@@ -100,6 +189,31 @@ async def _serve_assignment(
     *,
     worker_id: int,
 ) -> None:
+    missing_dependencies = sorted(
+        {
+            dependency
+            for engine in assignment.engines.values()
+            for dependency in engine.required_dependencies
+            if shutil.which(dependency) is None
+        }
+    )
+    if missing_dependencies:
+        await _send_message(
+            websocket,
+            "assignment_rejected",
+            AssignmentRejected(
+                **assignment.assignment.message_fields(),
+                reason="missing_dependencies",
+                missing_dependencies=missing_dependencies,
+            ),
+        )
+        LOG.warning(
+            "assignment rejected assignment_id=%s missing_dependencies=%s",
+            assignment.assignment.assignment_id,
+            ",".join(missing_dependencies),
+        )
+        return
+
     engines = {
         engine_id: UciEngineProcess(engine, worker_id=worker_id)
         for engine_id, engine in assignment.engines.items()
@@ -114,6 +228,20 @@ async def _serve_assignment(
         engine_names,
     )
     try:
+        await asyncio.gather(
+            *(asyncio.to_thread(engine.prepare) for engine in engines.values())
+        )
+        ready = AssignmentReady(
+            **assignment.assignment.message_fields(),
+            prepared_engine_ids=sorted(engines),
+        )
+        await _send_message(websocket, "assignment_ready", ready)
+        LOG.info(
+            "assignment prepared assignment_id=%s game_id=%s engines=%s",
+            assignment.assignment.assignment_id,
+            assignment.assignment.game_id,
+            ready.prepared_engine_ids,
+        )
         commands_handled = 0
         while True:
             envelope = await _recv_envelope(websocket)
@@ -198,6 +326,22 @@ async def _serve_assignment(
         )
 
 
+async def _send_dependency_report(websocket, probe: DependencyProbe) -> None:
+    available = [
+        dependency
+        for dependency in probe.required_dependencies
+        if shutil.which(dependency) is not None
+    ]
+    await _send_message(
+        websocket,
+        "dependency_report",
+        DependencyReport(
+            revision=probe.revision,
+            available_dependencies=available,
+        ),
+    )
+
+
 def _validate_assignment_message(
     message: AssignmentComplete | EngineCommand,
     assignment: WorkerGameAssignment,
@@ -241,7 +385,12 @@ async def _recv_message(websocket, message_type: str, data_type):
 def _message_log_context(message_type: str, data: Any) -> str:
     payload = _model_data(data)
     if message_type == "hello":
-        auth = "token" if payload.get("token") else "session"
+        if payload.get("token"):
+            auth = "token"
+        elif payload.get("slot_token"):
+            auth = "pool_slot"
+        else:
+            auth = "session"
         hw = payload.get("hw") or {}
         return (
             f"auth={auth} app_commit={payload.get('app_commit')} "
@@ -271,7 +420,7 @@ def _message_log_context(message_type: str, data: Any) -> str:
             f"round={payload.get('round')} max_plies={payload.get('max_plies')} "
             f"engines={engine_names}"
         )
-    if message_type == "assignment_complete":
+    if message_type in {"assignment_ready", "assignment_complete"}:
         return _assignment_context(payload)
     if message_type == "engine_command":
         return (
@@ -324,21 +473,25 @@ def _detect_hardware() -> HardwareInfo:
     logical_cores = os.cpu_count() or 1
     physical_cores = logical_cores
     ram_gb = 1
+    ram_mb = 1024
 
     try:
         import psutil
 
         physical_cores = psutil.cpu_count(logical=False) or logical_cores
         logical_cores = psutil.cpu_count(logical=True) or logical_cores
-        ram_gb = max(1, round(psutil.virtual_memory().total / (1024**3)))
+        total_ram = psutil.virtual_memory().total
+        ram_mb = max(1, total_ram // (1024**2))
+        ram_gb = max(1, round(total_ram / (1024**3)))
     except ImportError:
         pass
 
     hw = HardwareInfo(
-        cpu_model=platform.processor() or platform.machine() or "unknown",
+        cpu_model=_detect_cpu_model(),
         physical_cores=physical_cores,
         logical_cores=logical_cores,
         ram_gb=ram_gb,
+        ram_mb=ram_mb,
         gpu=None,
         os=f"{platform.system()} {platform.release()}".strip(),
         python=platform.python_version(),
@@ -354,6 +507,46 @@ def _detect_hardware() -> HardwareInfo:
     return hw
 
 
+def _detect_machine_id() -> str:
+    configured = os.environ.get("COPE_MACHINE_ID", "").strip()
+    if configured:
+        return configured
+
+    fingerprint = "|".join(
+        (
+            platform.node().strip().lower(),
+            f"{uuid.getnode():012x}",
+            platform.system().strip().lower(),
+            platform.machine().strip().lower(),
+        )
+    )
+    return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
+
+
+def _detect_cpu_model() -> str:
+    processor = platform.processor().strip()
+    if processor and processor.lower() not in {"unknown", platform.machine().lower()}:
+        return processor
+
+    processor_identifier = os.environ.get("PROCESSOR_IDENTIFIER", "").strip()
+    if processor_identifier:
+        return processor_identifier
+
+    cpuinfo = Path("/proc/cpuinfo")
+    if cpuinfo.is_file():
+        try:
+            for line in cpuinfo.read_text(encoding="utf-8", errors="replace").splitlines():
+                key, separator, value = line.partition(":")
+                if separator and key.strip().lower() in {"model name", "hardware"}:
+                    model = value.strip()
+                    if model:
+                        return model
+        except OSError:
+            pass
+
+    return platform.machine() or "unknown"
+
+
 def _log_connection_closed(error: ConnectionClosed) -> None:
     reason = error.reason or str(error) or error.__class__.__name__
     if error.code == 1000:
@@ -361,3 +554,5 @@ def _log_connection_closed(error: ConnectionClosed) -> None:
         return
 
     LOG.warning("runner connection lost code=%s reason=%s", error.code, reason)
+    DependencyProbe,
+    DependencyReport,

@@ -94,18 +94,21 @@ def build_tournament_config(form: FormValues) -> TournamentConfig:
     if len(participants) < 2:
         errors.append("Select at least two participating engines.")
 
+    linked = form_flag(form, "category_settings_linked")
     category = form_value(form, "category_id")
-    category_id = int(category) if category.isdigit() else 1
+    category_id = int(category) if linked and category.isdigit() else None
 
     if errors:
         raise FormError(errors)
 
     try:
+        config_values = {key: value for key, value in settings.items() if key != "rated"}
         return TournamentConfig(
             category_id=category_id,
-            category_settings_linked=form_flag(form, "category_settings_linked"),
+            category_settings_linked=linked,
             participants=participants,
-            **settings,
+            rated=settings["rated"] if linked else False,
+            **config_values,
         )
     except ValidationError as exc:
         raise FormError(_validation_messages(exc)) from exc
@@ -133,7 +136,16 @@ def _format_options(form: FormValues, format_name: str, errors: list[str]) -> An
                     form, "gauntlet_games_per_opponent", errors, "Games per opponent", minimum=1, default=2
                 ),
             )
-        return RoundRobinFormatOptions(double_rr=form_flag(form, "round_robin_double"))
+        return RoundRobinFormatOptions(
+            games_per_pairing=_int_field(
+                form,
+                "round_robin_games_per_pairing",
+                errors,
+                "Games per pairing",
+                minimum=1,
+                default=2,
+            )
+        )
     except ValidationError as exc:
         errors.extend(_validation_messages(exc))
         return RoundRobinFormatOptions()
@@ -251,7 +263,6 @@ def _validation_messages(exc: ValidationError) -> list[str]:
 
 _CHECKBOX_FIELDS = (
     "rated",
-    "round_robin_double",
     "adjudication_draw",
     "adjudication_resign",
     "adjudication_syzygy",
@@ -279,7 +290,7 @@ def settings_form_values(settings: dict[str, Any]) -> dict[str, Any]:
         "rated": settings.get("rated", True),
         "lag_compensation_ms": settings.get("lag_compensation_ms", 50),
         "opening_suite_id": settings.get("opening_suite_id") or "",
-        "round_robin_double": True,
+        "round_robin_games_per_pairing": 2,
         "swiss_rounds": 7,
         "knockout_games_per_match": 2,
         "knockout_tiebreak": "armageddon",
@@ -304,7 +315,7 @@ def settings_form_values(settings: dict[str, Any]) -> dict[str, Any]:
     }
 
     options = settings.get("format_options") or {}
-    values["round_robin_double"] = options.get("double_rr", True)
+    values["round_robin_games_per_pairing"] = options.get("games_per_pairing", 2)
     values["swiss_rounds"] = options.get("rounds", values["swiss_rounds"])
     values["knockout_games_per_match"] = options.get("games_per_match", values["knockout_games_per_match"])
     values["knockout_tiebreak"] = options.get("tiebreak", values["knockout_tiebreak"])

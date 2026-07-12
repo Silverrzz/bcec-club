@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#0b1017" />
+    <meta name="description" content="COPE chess tournaments, live games, ratings, and administration." />
+    <title>COPE Chess</title>
+    <script>
+      (() => {
+        let saved = null;
+        try { saved = localStorage.getItem("cope-theme"); } catch {}
+        const dark = saved !== "light";
+        document.documentElement.dataset.theme = dark ? "dark" : "light";
+        document.documentElement.style.colorScheme = dark ? "dark" : "light";
+        document.querySelector('meta[name="theme-color"]').content = dark ? "#0b1017" : "#f3f6fa";
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

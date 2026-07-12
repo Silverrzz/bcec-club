@@ -104,7 +104,7 @@ def run_prototype_data_setup() -> None:
         config = TournamentConfig(
             category_id=1,
             format=TournamentFormat.ROUND_ROBIN,
-            format_options=RoundRobinFormatOptions(double_rr=True),
+            format_options=RoundRobinFormatOptions(games_per_pairing=2),
             participants=[1, 2],
             time_control=IncrementTimeControl(initial_ms=60_000, increment_ms=1_000),
             concurrency=1,

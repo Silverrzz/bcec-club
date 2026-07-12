@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 import secrets
 import sqlite3
 import threading
@@ -11,6 +12,10 @@ from pathlib import Path
 import chess
 import chess.pgn
 
+from cope.chat import (
+    announce_game_finished,
+    announce_tournament_finished,
+)
 from cope.core.models import (
     ColorSlot,
     GameAssignment,
@@ -20,6 +25,7 @@ from cope.core.models import (
     MoveNodesTimeControl,
     MoveTimeControl,
     MovesToGoTimeControl,
+    WorkerResources,
 )
 from cope.db import (
     GameAssignmentRecord,
@@ -29,6 +35,7 @@ from cope.db import (
     TournamentRecord,
     WorkerRecord,
     assign_game_to_worker,
+    claim_tournament_worker_profile,
     connect_database,
     finish_game_assignment,
     finish_game,
@@ -47,6 +54,8 @@ from cope.db import (
     record_move,
     set_tournament_current_round_at_least,
     set_tournament_status,
+    touch_service_heartbeat,
+    worker_hardware_profile,
 )
 
 from .scheduler import TournamentPreparation, advance_tournament, prepare_scheduled_tournaments
@@ -107,6 +116,11 @@ def run_tournament_service(config: RunnerServiceConfig) -> None:
         connection: sqlite3.Connection | None = None
         try:
             connection = connect_database(config.db_path)
+            touch_service_heartbeat(
+                connection,
+                "scheduler",
+                os.environ.get("COPE_DEPLOY_COMMIT", "dev"),
+            )
             report = run_tournament_matches(connection)
             print_runner_report(report)
         except Exception:
@@ -197,8 +211,33 @@ def next_worker_assignment(
         if tournament.status != "running":
             continue
 
-        game = _next_playable_game(list_games(connection, tournament.id))
+        games = list_games(connection, tournament.id)
+        active_games = sum(
+            game.status in {"assigned", "live"}
+            for game in games
+        )
+        if active_games >= tournament.config.concurrency:
+            continue
+
+        required_resources = _tournament_required_resources(tournament)
+        if not worker.resources.can_run(required_resources):
+            continue
+
+        if worker.hw is None:
+            continue
+        hardware_profile = worker_hardware_profile(worker.hw)
+        if tournament.worker_profile is not None and tournament.worker_profile != hardware_profile:
+            continue
+
+        game = _next_playable_game_for_worker(connection, games, worker)
         if game is None:
+            continue
+
+        if not claim_tournament_worker_profile(
+            connection,
+            tournament.id,
+            hardware_profile,
+        ):
             continue
 
         set_tournament_current_round_at_least(connection, tournament.id, game.round)
@@ -340,6 +379,13 @@ def run_worker_assignment_game(
         result=result,
         termination=termination,
         pgn=pgn,
+    )
+    announce_game_finished(
+        connection,
+        tournament,
+        game_record,
+        result=result,
+        termination=termination,
     )
     finish_game_assignment(connection, assignment_record.id)
     _finish_tournament_if_complete(connection, tournament)
@@ -491,6 +537,10 @@ def _worker_assignment_payload(
                 ColorSlot.BLACK: game.black_engine_id,
             },
             time_control=tournament.config.time_control,
+            uci_options_overrides={
+                engine_id: _tournament_engine_options(tournament, engine_id)
+                for engine_id in {game.white_engine_id, game.black_engine_id}
+            },
         ),
         tournament_name=tournament.name,
         round=game.round,
@@ -498,6 +548,7 @@ def _worker_assignment_payload(
         opening_name=None if opening is None else opening.name,
         max_plies=_max_plies(tournament),
         engines=_assignment_engines(connection, game),
+        required_resources=_tournament_required_resources(tournament),
     )
 
 
@@ -522,9 +573,41 @@ def _engine_options(
     if spec is None:
         raise RuntimeError(f"assignment missing engine {engine_id}")
 
-    options = dict(spec.uci_options)
-    options.update(assignment.assignment.uci_options_overrides.get(engine_id, {}))
+    return _merge_uci_options(
+        spec.uci_options,
+        assignment.assignment.uci_options_overrides.get(engine_id, {}),
+    )
+
+
+def _tournament_required_resources(tournament: TournamentRecord) -> WorkerResources:
+    return WorkerResources(
+        threads=tournament.config.engine_threads,
+        hash_mb=tournament.config.engine_hash_mb * 2,
+    )
+
+
+def _tournament_engine_options(
+    tournament: TournamentRecord,
+    engine_id: int,
+) -> dict[str, str | int | bool]:
+    options = dict(tournament.config.uci_options.get(engine_id, {}))
+    options["Threads"] = tournament.config.engine_threads
+    options["Hash"] = tournament.config.engine_hash_mb
     return options
+
+
+def _merge_uci_options(
+    base: dict[str, str | int | bool],
+    overrides: dict[str, str | int | bool],
+) -> dict[str, str | int | bool]:
+    overridden_names = {name.strip().lower() for name in overrides}
+    merged = {
+        name: value
+        for name, value in base.items()
+        if name.strip().lower() not in overridden_names
+    }
+    merged.update(overrides)
+    return merged
 
 
 def _runtime_time_control(time_control: TimeControl) -> RuntimeTimeControl:
@@ -596,6 +679,26 @@ def _next_playable_game(games: tuple[GameRecord, ...]) -> GameRecord | None:
     return next((game for game in games if game.status == "pending"), None)
 
 
+def _next_playable_game_for_worker(
+    connection: sqlite3.Connection,
+    games: tuple[GameRecord, ...],
+    worker: WorkerRecord,
+) -> GameRecord | None:
+    available = set(worker.available_dependencies)
+    for game in games:
+        if game.status != "pending":
+            continue
+        engines = _assignment_engines(connection, game)
+        required = {
+            dependency
+            for engine in engines.values()
+            for dependency in engine.required_dependencies
+        }
+        if required.issubset(available):
+            return game
+    return None
+
+
 def _finish_tournament_if_complete(
     connection: sqlite3.Connection,
     tournament: TournamentRecord,
@@ -618,6 +721,8 @@ def _finish_tournament_if_complete(
         return False
 
     set_tournament_status(connection, current.id, "finished")
+    finished = get_tournament(connection, current.id) or current
+    announce_tournament_finished(connection, finished)
     return True
 
 

@@ -633,7 +633,8 @@ document.querySelectorAll("[data-tournament-live]").forEach((arena) => {
     const seconds = Math.floor(total / 1000);
     const minutes = Math.floor(seconds / 60);
     const remainder = seconds % 60;
-    return `${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`;
+    const millisecondsPart = total % 1000;
+    return `${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}.${String(millisecondsPart).padStart(3, "0")}`;
   }
 
   function stopClockRender() {

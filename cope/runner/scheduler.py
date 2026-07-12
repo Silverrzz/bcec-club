@@ -11,6 +11,7 @@ from cope.core.models import (
     SwissFormatOptions,
     TournamentFormat,
 )
+from cope.chat import announce_tournament_started
 from cope.db import (
     GameRecord,
     OpeningRecord,
@@ -74,6 +75,11 @@ def prepare_tournament(
     set_tournament_status(connection, tournament.id, "running")
     current = _refresh_tournament(connection, tournament)
     advance = advance_tournament(connection, current)
+    announce_tournament_started(
+        connection,
+        current,
+        scheduled_games=len(list_games(connection, tournament.id)),
+    )
     return TournamentPreparation(
         tournament_id=tournament.id,
         tournament_name=tournament.name,
@@ -124,27 +130,21 @@ def generate_round_robin_games(
     round_pairings = _round_robin_pairings(participants)
     rounds_per_cycle = len(round_pairings)
 
-    for round_number, pairings in enumerate(round_pairings, start=1):
-        for pair_index, (white_engine_id, black_engine_id) in enumerate(pairings, start=1):
-            _create_scheduled_game(
-                connection,
-                tournament,
-                round_number=round_number,
-                pair_index=pair_index,
-                white_engine_id=white_engine_id,
-                black_engine_id=black_engine_id,
-                opening_offset=opening_offset + created_games,
-                opening_ids=opening_ids,
-            )
-            created_games += 1
-            if options.double_rr:
+    for cycle_index in range(options.games_per_pairing):
+        for base_round, pairings in enumerate(round_pairings, start=1):
+            round_number = base_round + cycle_index * rounds_per_cycle
+            for pair_index, pairing in enumerate(pairings, start=1):
+                white_engine_id, black_engine_id = pairing
+                if cycle_index % 2 == 1:
+                    white_engine_id, black_engine_id = black_engine_id, white_engine_id
                 _create_scheduled_game(
                     connection,
                     tournament,
-                    round_number=round_number + rounds_per_cycle,
+                    round_number=round_number,
                     pair_index=pair_index,
-                    white_engine_id=black_engine_id,
-                    black_engine_id=white_engine_id,
+                    white_engine_id=white_engine_id,
+                    black_engine_id=black_engine_id,
+                    game_number=cycle_index + 1,
                     opening_offset=opening_offset + created_games,
                     opening_ids=opening_ids,
                 )

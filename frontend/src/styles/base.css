@@ -1,0 +1,246 @@
+#app {
+  min-height: 100vh;
+  min-height: 100dvh;
+}
+
+a {
+  text-decoration-color: color-mix(in srgb, currentColor 38%, transparent);
+  text-underline-offset: 0.16em;
+}
+
+a:hover {
+  text-decoration-color: currentColor;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  color: var(--color-text);
+  font-weight: 650;
+  line-height: 1.18;
+  text-wrap: balance;
+}
+
+h1 {
+  font-size: clamp(1.75rem, 3vw, 2.5rem);
+  letter-spacing: -0.035em;
+}
+
+h2 {
+  font-size: clamp(1.25rem, 2vw, 1.625rem);
+  letter-spacing: -0.02em;
+}
+
+h3 {
+  font-size: 1.0625rem;
+}
+
+small {
+  font-size: 0.8125rem;
+}
+
+code,
+pre,
+kbd,
+samp {
+  font-family: var(--font-mono);
+}
+
+code {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-sunken);
+  padding: 0.1em 0.32em;
+  font-size: 0.875em;
+}
+
+.page-container {
+  width: min(100%, var(--content-max));
+  margin-inline: auto;
+  padding-inline: clamp(var(--space-4), 3vw, var(--space-10));
+}
+
+.page-container--narrow {
+  max-width: var(--content-narrow);
+}
+
+.page-stack {
+  display: flex;
+  flex-direction: column;
+  gap: clamp(var(--space-5), 2.5vw, var(--space-8));
+}
+
+.section-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.content-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 19rem), 1fr));
+  gap: var(--space-5);
+  align-items: start;
+}
+
+.panel {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface);
+  box-shadow: var(--shadow-xs);
+}
+
+.panel__header,
+.panel__body,
+.panel__footer {
+  padding: clamp(var(--space-4), 2vw, var(--space-6));
+}
+
+.panel__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.panel__footer {
+  border-top: 1px solid var(--color-border);
+  background: var(--color-surface-sunken);
+}
+
+.muted {
+  color: var(--color-text-muted);
+}
+
+.secondary {
+  color: var(--color-text-secondary);
+}
+
+.text-danger {
+  color: var(--color-danger);
+}
+
+.text-success {
+  color: var(--color-success);
+}
+
+.link {
+  border: 0;
+  background: none;
+  color: var(--color-link);
+  cursor: pointer;
+  padding: 0;
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, currentColor 38%, transparent);
+  text-underline-offset: 0.16em;
+}
+
+.link:hover {
+  text-decoration-color: currentColor;
+}
+
+.divider {
+  height: 1px;
+  border: 0;
+  background: var(--color-border);
+  margin: 0;
+}
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.toolbar--between {
+  justify-content: space-between;
+}
+
+.button-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.form-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+  gap: var(--space-5);
+}
+
+.form-grid > * {
+  grid-column: span 6;
+}
+
+.form-grid > .form-span-full {
+  grid-column: 1 / -1;
+}
+
+.definition-list {
+  display: grid;
+  grid-template-columns: minmax(8rem, 0.45fr) minmax(0, 1fr);
+  gap: var(--space-3) var(--space-6);
+}
+
+.definition-list dt {
+  color: var(--color-text-muted);
+}
+
+.definition-list dd {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.sr-only {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  padding: 0 !important;
+  margin: -1px !important;
+  overflow: hidden !important;
+  clip: rect(0, 0, 0, 0) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
+}
+
+.skip-link {
+  position: fixed;
+  z-index: 1000;
+  top: var(--space-3);
+  left: var(--space-3);
+  transform: translateY(-200%);
+  border-radius: var(--radius-md);
+  background: var(--color-text);
+  color: var(--color-bg);
+  padding: var(--space-3) var(--space-4);
+  font-weight: 650;
+}
+
+.skip-link:focus {
+  transform: none;
+}
+
+@media (max-width: 42rem) {
+  .form-grid > * {
+    grid-column: 1 / -1;
+  }
+
+  .definition-list {
+    grid-template-columns: 1fr;
+    gap: var(--space-1);
+  }
+
+  .definition-list dd + dt {
+    margin-top: var(--space-3);
+  }
+}

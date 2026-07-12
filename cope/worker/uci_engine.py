@@ -35,6 +35,11 @@ class UciEngineProcess:
             self._binary_path,
         )
 
+    def prepare(self) -> None:
+        """Install and build this engine without starting a UCI game process."""
+        with self._io_lock:
+            self._ensure_built()
+
     def handle_command(
         self,
         command: str,
@@ -408,7 +413,14 @@ def _engine_source_dir(spec: EngineSpec, worker_id: int) -> Path:
 
 def _build_key(spec: EngineSpec) -> str:
     digest = hashlib.blake2s(digest_size=16)
-    for value in (spec.git_url, spec.branch, spec.commit, spec.build_cmd, spec.binary_path):
+    for value in (
+        spec.git_url,
+        spec.branch,
+        spec.commit,
+        spec.build_cmd,
+        spec.binary_path,
+        *spec.required_dependencies,
+    ):
         digest.update(value.encode("utf-8"))
         digest.update(b"\0")
     return digest.hexdigest()

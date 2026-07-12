@@ -143,9 +143,9 @@
     <div class="action-bar">
       {% if worker.status != "revoked" %}
         <form method="post" action="/admin/workers/{{ worker.id }}/revoke">
-          <input type="hidden" name="next" value="/admin/workers/{{ worker.id }}">
+          <input type="hidden" name="next" value="/admin/workers">
           <button class="button" type="submit"
-                  data-confirm="Revoke worker '{{ worker.label }}'? It will not be able to reconnect.">Revoke worker</button>
+                  data-confirm="Revoke worker '{{ worker.label }}'? It will be removed and cannot reconnect.">Revoke worker</button>
         </form>
       {% endif %}
       <form method="post" action="/admin/workers/{{ worker.id }}/delete">

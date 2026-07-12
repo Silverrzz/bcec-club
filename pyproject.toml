@@ -37,4 +37,12 @@ include = ["cope*"]
 
 [tool.setuptools.package-data]
 "cope.db" = ["schema.sql"]
-"cope.web" = ["templates/*.html", "templates/admin/*.html", "static/*.css", "static/*.js", "static/scss/*.scss"]
+"cope.web" = [
+    "frontend_dist/*",
+    "frontend_dist/assets/*",
+    "templates/*.html",
+    "templates/admin/*.html",
+    "static/*.css",
+    "static/*.js",
+    "static/scss/*.scss",
+]

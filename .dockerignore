@@ -1,0 +1,11 @@
+.git
+.github
+.venv
+.cope-worker
+backups
+secrets
+tmp
+cope.db*
+frontend/node_modules
+**/__pycache__
+**/*.pyc

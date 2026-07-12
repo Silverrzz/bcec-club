@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 
+from cope.chat import announce_results_committed
 from cope.db import (
     RunnerCommandRecord,
     claim_next_runner_command,
@@ -63,7 +64,15 @@ def _dispatch_runner_command(
     command: RunnerCommandRecord,
 ) -> RatingCommitResult | None:
     if command.command == "commit_tournament_results":
-        return apply_tournament_rating_commit(connection, command)
+        result = apply_tournament_rating_commit(connection, command)
+        announce_results_committed(
+            connection,
+            tournament_id=result.tournament_id,
+            category_id=result.category_id,
+            games_applied=result.games_applied,
+            engines_updated=result.engines_updated,
+        )
+        return result
     raise ValueError(f"unknown runner command {command.command!r}")
 
 

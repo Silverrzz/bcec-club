@@ -1,0 +1,2 @@
+recursive-include frontend *
+prune frontend/node_modules

@@ -72,6 +72,8 @@ def apply_tournament_rating_commit(
         raise RatingCommitError("tournament is not complete")
     if not tournament.config.rated:
         raise RatingCommitError("tournament is not rated")
+    if tournament.category_id is None or not tournament.config.category_settings_linked:
+        raise RatingCommitError("custom tournament results cannot be committed to ratings")
     if tournament.category_id != category_id:
         raise RatingCommitError("tournament category changed after the commit request")
 

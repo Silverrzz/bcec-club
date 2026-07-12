@@ -1,0 +1,22 @@
+[Unit]
+Description=COPE Chess worker pool
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cope-worker
+Group=cope-worker
+EnvironmentFile=/etc/cope/worker.env
+WorkingDirectory=/var/lib/cope-worker
+ExecStart=/opt/cope-worker/venv/bin/cope worker-pool --server-url ${COPE_WORKER_SERVER_URL} --app-commit ${COPE_DEPLOY_COMMIT} --state-file /var/lib/cope-worker/pool.json
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/cope-worker
+
+[Install]
+WantedBy=multi-user.target

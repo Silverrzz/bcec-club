@@ -1,10 +1,43 @@
-*.pyc
-*.pyc.*
+# Python bytecode and tool caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
 
+# Python environments and packaging output
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# Frontend dependencies and generated output
+/frontend/node_modules/
+/frontend/dist/
+/frontend/*.tsbuildinfo
+/cope/web/frontend_dist/
+
+# Runtime data
 /tmp/
 /.cope-worker/
-
 *.db
-*.db*
+*.db-*
+*.db-journal
+/backups/
 
-*.egg-info/
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+/secrets/
+
+# Editor and OS metadata
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

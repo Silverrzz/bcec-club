@@ -1,0 +1,105 @@
+x-cope-service: &cope-service
+  build:
+    context: .
+    args:
+      COPE_DEPLOY_COMMIT: ${COPE_DEPLOY_COMMIT:?Set COPE_DEPLOY_COMMIT to the checked-out commit}
+  image: cope-chess:${COPE_DEPLOY_COMMIT}
+  restart: unless-stopped
+  environment: &cope-environment
+    COPE_DB_PATH: /data/cope.db
+    COPE_DEPLOY_COMMIT: ${COPE_DEPLOY_COMMIT}
+    COPE_ADMIN_TOKEN_FILE: /run/secrets/cope_admin_token
+    COPE_WEB_EVENT_TOKEN_FILE: /run/secrets/cope_event_token
+    COPE_WEB_STREAM_URL: ws://web:8701/internal/stream
+    COPE_WORKER_SERVER_URL: wss://${COPE_DOMAIN:?Set COPE_DOMAIN}/worker
+  secrets:
+    - cope_admin_token
+    - cope_event_token
+  volumes:
+    - cope-data:/data
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "5"
+
+services:
+  migrate:
+    <<: *cope-service
+    restart: "no"
+    command: ["db", "migrate", "--db-path", "/data/cope.db"]
+
+  web:
+    <<: *cope-service
+    command: ["web", "--host", "0.0.0.0", "--port", "8701", "--db-path", "/data/cope.db"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8701/health/ready', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  scheduler:
+    <<: *cope-service
+    command: ["scheduler", "--db-path", "/data/cope.db"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      web:
+        condition: service_healthy
+
+  worker-server:
+    <<: *cope-service
+    command: ["worker-server", "--worker-host", "0.0.0.0", "--worker-port", "8702", "--db-path", "/data/cope.db"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      web:
+        condition: service_healthy
+
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    environment:
+      COPE_DOMAIN: ${COPE_DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      web:
+        condition: service_healthy
+      worker-server:
+        condition: service_started
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+  backup:
+    <<: *cope-service
+    profiles: ["operations"]
+    restart: "no"
+    working_dir: /backups
+    command: ["db", "backup", "--db-path", "/data/cope.db", "--keep", "7"]
+    volumes:
+      - cope-data:/data
+      - ./backups:/backups
+
+secrets:
+  cope_admin_token:
+    file: ./secrets/admin_token
+  cope_event_token:
+    file: ./secrets/event_token
+
+volumes:
+  cope-data:
+  caddy-data:
+  caddy-config:

@@ -4,24 +4,40 @@ import asyncio
 import contextlib
 import copy
 import hmac
+import ipaddress
+import json
+import os
+import re
 import secrets
 import sqlite3
 import threading
+import time
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
+from urllib.parse import urlsplit, urlunsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.encoders import jsonable_encoder
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import ValidationError
 
+from cope.chat import (
+    DEFAULT_COMMAND_REGISTRY,
+    ChatCommandContext,
+    ChatCommandError,
+    parse_chat_command,
+)
 from cope.db import (
     DEFAULT_DB_PATH,
+    SCHEMA_VERSION,
     ChatSettingsRecord,
+    ChatMessageRecord,
     GameRecord,
     MoveRecord,
     TournamentRecord,
@@ -35,6 +51,7 @@ from cope.db import (
     create_tournament,
     create_worker,
     database_stats,
+    database_schema_version,
     delete_category,
     delete_chat_message,
     delete_engine,
@@ -44,6 +61,7 @@ from cope.db import (
     engine_game_count,
     get_category,
     get_chat_settings,
+    get_chat_message,
     get_engine,
     get_engine_record,
     get_opening_position,
@@ -52,9 +70,9 @@ from cope.db import (
     get_tournament_rating_commit,
     get_worker,
     get_worker_activity,
+    get_service_endpoint,
     list_categories,
     list_chat_messages,
-    list_active_games,
     list_engine_games,
     list_engine_records,
     list_engines,
@@ -63,12 +81,15 @@ from cope.db import (
     list_moves,
     list_opening_suites,
     list_rating_rows,
+    list_service_heartbeats,
     list_suite_openings,
     list_tournaments,
     list_tournament_matches,
     list_uncommitted_finished_tournaments,
     list_upcoming_games,
     list_workers,
+    list_worker_pools,
+    touch_service_heartbeat,
     mint_worker_token_for_worker,
     next_engine_id,
     replace_suite_openings,
@@ -97,7 +118,9 @@ from cope.network import (
     LOCAL_EVENT_PUBLISHERS,
     default_admin_token,
     default_web_event_token,
-    default_worker_server_url,
+    DEFAULT_WORKER_PATH,
+    WILDCARD_HOSTS,
+    default_worker_port,
 )
 from cope.web import forms
 from cope.web.forms import FormError, form_flag, form_value
@@ -106,6 +129,9 @@ from cope.web.requests import read_form, read_form_with_files
 
 
 PACKAGE_DIR = Path(__file__).resolve().parent
+FRONTEND_DIST_DIR = PACKAGE_DIR / "frontend_dist"
+FRONTEND_INDEX = FRONTEND_DIST_DIR / "index.html"
+ADMIN_SESSION_MAX_AGE_SECONDS = 43_200
 templates = Jinja2Templates(directory=str(PACKAGE_DIR / "templates"))
 
 # Valid admin actions on a tournament, per current status.
@@ -149,7 +175,7 @@ class StreamHub:
         self._seq_by_topic: dict[str, int] = {}
         self._subscribers: dict[str, set[StreamSubscription]] = {}
         self._internal_clients: set[asyncio.Queue[StreamEnvelope | None]] = set()
-        self._tournament_live: dict[int, dict[str, Any]] = {}
+        self._tournament_live: dict[int, dict[int, dict[str, Any]]] = {}
         self._max_subscribers = max_subscribers
         self._max_queue = max_queue
 
@@ -249,40 +275,81 @@ class StreamHub:
             loop.call_soon_threadsafe(_enqueue_internal_event, queue, event)
         return event
 
-    def tournament_live(self, tournament_id: int) -> dict[str, Any] | None:
+    def tournament_live(
+        self,
+        tournament_id: int,
+        game_id: int | None = None,
+    ) -> dict[int, dict[str, Any]] | dict[str, Any] | None:
         with self._lock:
-            live = self._tournament_live.get(tournament_id)
-            if live is None:
+            live_games = self._tournament_live.get(tournament_id)
+            if live_games is None:
                 return None
-            return copy.deepcopy(live)
+            if game_id is not None:
+                live = live_games.get(game_id)
+                return copy.deepcopy(live) if live is not None else None
+            return copy.deepcopy(live_games)
 
     def clear_tournament_live(self, tournament_id: int) -> None:
         with self._lock:
             self._tournament_live.pop(tournament_id, None)
 
+    def prune_tournament_live(
+        self,
+        tournament_id: int,
+        active_game_ids: set[int],
+    ) -> None:
+        with self._lock:
+            games = self._tournament_live.get(tournament_id)
+            if games is None:
+                return
+            for game_id in tuple(games):
+                if game_id not in active_game_ids:
+                    games.pop(game_id, None)
+            if not games:
+                self._tournament_live.pop(tournament_id, None)
+
     def _record_live_event(self, event: StreamEnvelope) -> None:
         tournament_id = _event_tournament_id(event)
         if tournament_id is None:
             return
+        game_id = _event_game_id(event)
         if event.type == "game.move":
-            self._tournament_live.pop(tournament_id, None)
+            if game_id is not None:
+                games = self._tournament_live.get(tournament_id)
+                if games is not None:
+                    games.pop(game_id, None)
+                    if not games:
+                        self._tournament_live.pop(tournament_id, None)
             return
         if event.type == "tournament.live":
             live = event.data.get("live")
             if isinstance(live, dict):
+                live_game_id = _positive_int(live.get("game_id")) or game_id
                 if live.get("clear"):
-                    self._tournament_live.pop(tournament_id, None)
-                else:
-                    self._tournament_live[tournament_id] = dict(live)
+                    if live_game_id is None:
+                        self._tournament_live.pop(tournament_id, None)
+                    else:
+                        games = self._tournament_live.get(tournament_id)
+                        if games is not None:
+                            games.pop(live_game_id, None)
+                            if not games:
+                                self._tournament_live.pop(tournament_id, None)
+                elif live_game_id is not None:
+                    self._tournament_live.setdefault(tournament_id, {})[
+                        live_game_id
+                    ] = dict(live)
             return
         if event.type == "engine.info":
             side = event.data.get("side")
             engine_data = event.data.get("engine_data")
-            game_id = event.data.get("game_id")
-            if side not in {"white", "black"} or not isinstance(engine_data, dict):
+            if (
+                game_id is None
+                or side not in {"white", "black"}
+                or not isinstance(engine_data, dict)
+            ):
                 return
-            live = self._tournament_live.setdefault(
-                tournament_id,
+            live = self._tournament_live.setdefault(tournament_id, {}).setdefault(
+                game_id,
                 {"game_id": game_id, "engine_data": {}, "clocks": {}},
             )
             live["game_id"] = game_id
@@ -290,15 +357,22 @@ class StreamHub:
             return
         if event.type == "clock.sync":
             clocks = event.data.get("clocks_ms")
-            game_id = event.data.get("game_id")
-            if not isinstance(clocks, dict):
+            if game_id is None or not isinstance(clocks, dict):
                 return
-            live = self._tournament_live.setdefault(
-                tournament_id,
+            live = self._tournament_live.setdefault(tournament_id, {}).setdefault(
+                game_id,
                 {"game_id": game_id, "engine_data": {}, "clocks": {}},
             )
             live["game_id"] = game_id
             live["clocks"] = dict(clocks)
+            live["clock_state"] = {
+                "game_id": game_id,
+                "clocks_ms": dict(clocks),
+                "active_side": event.data.get("active_side"),
+                "running": bool(event.data.get("running")),
+                "observed_at": event.sent_at,
+                "sent_at": event.sent_at,
+            }
 
 
 def _enqueue_internal_event(
@@ -323,42 +397,159 @@ def create_app(
 ) -> FastAPI:
     app = FastAPI(title="COPE Chess")
     app.state.db_path = Path(db_path)
-    app.state.worker_server_url = worker_server_url or default_worker_server_url()
+    app.state.worker_server_url = worker_server_url
     app.state.event_token = event_token or default_web_event_token()
     app.state.admin_token = admin_token or default_admin_token()
     app.state.stream_hub = StreamHub()
+    app.state.request_limits = {}
+    app.state.last_service_heartbeat = 0.0
+    app.add_middleware(GZipMiddleware, minimum_size=1_000)
     app.mount(
         "/static",
         StaticFiles(directory=str(PACKAGE_DIR / "static")),
         name="static",
     )
+    frontend_assets = FRONTEND_DIST_DIR / "assets"
+    if frontend_assets.is_dir():
+        app.mount(
+            "/assets",
+            StaticFiles(directory=str(frontend_assets)),
+            name="frontend-assets",
+        )
+
+    @app.get("/health/live", include_in_schema=False)
+    def health_live():
+        return JSONResponse(
+            {
+                "status": "live",
+                "service": "cope-web",
+                "commit": os.environ.get("COPE_DEPLOY_COMMIT", "dev"),
+            }
+        )
+
+    @app.get("/health/ready", include_in_schema=False)
+    def health_ready():
+        try:
+            connection = connect_database(app.state.db_path)
+            try:
+                connection.execute("SELECT 1").fetchone()
+                schema_version = database_schema_version(connection)
+            finally:
+                connection.close()
+        except sqlite3.Error:
+            return JSONResponse(
+                {"status": "not_ready", "database": "unavailable"},
+                status_code=503,
+            )
+        ready = schema_version == SCHEMA_VERSION
+        return JSONResponse(
+            {
+                "status": "ready" if ready else "not_ready",
+                "database": "ok",
+                "schema_version": schema_version,
+                "expected_schema_version": SCHEMA_VERSION,
+            },
+            status_code=200 if ready else 503,
+        )
 
     @app.middleware("http")
     async def admin_security(request: Request, call_next):
         path = request.url.path
-        if not path.startswith("/admin") or path == "/admin/login":
-            return await call_next(request)
-        token = _admin_token(request)
-        if not token:
-            return HTMLResponse(
-                f"Admin access requires {ADMIN_TOKEN_ENV}.",
-                status_code=503,
-            )
-        if not _request_is_secure_or_local(request):
-            return HTMLResponse("Admin access requires HTTPS.", status_code=403)
-        if not _admin_session_valid(request, token):
-            if request.method == "GET":
-                return RedirectResponse(url="/admin/login", status_code=303)
-            return HTMLResponse("Admin session required.", status_code=403)
-        if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
-            await request.body()
-            form = await request.form()
-            supplied = str(form.get("csrf_token") or "")
-            if not _csrf_token_valid(request, token, supplied):
-                return HTMLResponse("CSRF validation failed.", status_code=403)
+        if time.monotonic() - app.state.last_service_heartbeat >= 10:
+            try:
+                heartbeat_connection = connect_database(app.state.db_path)
+                try:
+                    touch_service_heartbeat(
+                        heartbeat_connection,
+                        "web",
+                        os.environ.get("COPE_DEPLOY_COMMIT", "dev"),
+                    )
+                    heartbeat_connection.commit()
+                    app.state.last_service_heartbeat = time.monotonic()
+                finally:
+                    heartbeat_connection.close()
+            except sqlite3.Error:
+                pass
+        content_length = request.headers.get("content-length")
+        if content_length and content_length.isdigit() and int(content_length) > 2_097_152:
+            return JSONResponse({"detail": "Request body is too large."}, status_code=413)
+        if request.method == "POST":
+            if path in {"/admin/login", "/api/session"} and _rate_limited(
+                request, "login", limit=10, window_s=300
+            ):
+                return JSONResponse({"detail": "Too many login attempts."}, status_code=429)
+            if path.endswith("/chat") and _rate_limited(
+                request, "chat", limit=12, window_s=60
+            ):
+                return JSONResponse({"detail": "Chat rate limit exceeded."}, status_code=429)
+        admin_api = path.startswith("/api/admin")
+        admin_page = path.startswith("/admin") and path != "/admin/login"
+        protected = admin_api or admin_page
+        token = _admin_token(request) if protected else None
+
+        if protected:
+            if not token:
+                return _security_error(
+                    request,
+                    f"Admin access requires {ADMIN_TOKEN_ENV}.",
+                    status_code=503,
+                )
+            if not _request_is_secure_or_local(request):
+                return _security_error(
+                    request,
+                    "Admin access requires HTTPS.",
+                    status_code=403,
+                )
+            if not _admin_session_valid(request, token):
+                if admin_api:
+                    return JSONResponse(
+                        {"detail": "Admin session required."},
+                        status_code=401,
+                    )
+                if request.method == "GET":
+                    next_path = request.url.path
+                    if request.url.query:
+                        next_path = f"{next_path}?{request.url.query}"
+                    return RedirectResponse(
+                        url="/admin/login?next=" + quote(next_path),
+                        status_code=303,
+                    )
+                return HTMLResponse("Admin session required.", status_code=403)
+            if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+                if admin_api:
+                    supplied = request.headers.get("x-csrf-token", "")
+                else:
+                    await request.body()
+                    form = await request.form()
+                    supplied = str(form.get("csrf_token") or "")
+                if not _csrf_token_valid(request, token, supplied):
+                    return _security_error(
+                        request,
+                        "CSRF validation failed.",
+                        status_code=403,
+                    )
+
+        if _is_spa_request(request) and FRONTEND_INDEX.is_file():
+            response = FileResponse(FRONTEND_INDEX, media_type="text/html")
+            response.headers["Cache-Control"] = "no-cache"
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            response.headers["Referrer-Policy"] = "same-origin"
+            response.headers["X-Frame-Options"] = "DENY"
+            return response
+
         response = await call_next(request)
-        if request.method == "POST" and 200 <= response.status_code < 400:
+        if (
+            protected
+            and not admin_api
+            and request.method == "POST"
+            and 200 <= response.status_code < 400
+        ):
             _publish_admin_post_streams(request)
+        if path.startswith("/assets/"):
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("Referrer-Policy", "same-origin")
+        response.headers.setdefault("X-Frame-Options", "DENY")
         return response
 
     @app.get("/admin/login")
@@ -376,9 +567,7 @@ def create_app(
         return templates.TemplateResponse(
             request,
             "admin/login.html",
-            {
-                "error": request.query_params.get("error"),
-            },
+            {"error": None},
         )
 
     @app.post("/admin/login")
@@ -393,9 +582,11 @@ def create_app(
             return HTMLResponse("Admin access requires HTTPS.", status_code=403)
         form = await read_form(request)
         if not hmac.compare_digest(form_value(form, "token"), token):
-            return RedirectResponse(
-                url="/admin/login?error=" + quote("Invalid admin token."),
-                status_code=303,
+            return templates.TemplateResponse(
+                request,
+                "admin/login.html",
+                {"error": "Invalid admin token."},
+                status_code=401,
             )
         response = RedirectResponse(url="/admin", status_code=303)
         nonce = secrets.token_urlsafe(32)
@@ -405,6 +596,7 @@ def create_app(
             httponly=True,
             secure=_request_is_secure(request),
             samesite="lax",
+            max_age=ADMIN_SESSION_MAX_AGE_SECONDS,
         )
         return response
 
@@ -418,29 +610,22 @@ def create_app(
     # Public site
     # ------------------------------------------------------------------
 
-    @app.post("/chat")
-    async def post_chat_message(
-        request: Request,
-        connection: sqlite3.Connection = Depends(_database),
-    ):
-        form = await read_form(request)
-        next_url = _safe_redirect_target(form_value(form, "next"), "/#chat")
-        message = _create_chat_message_from_form(connection, form)
-        if _wants_json(request):
-            return JSONResponse({"ok": True, "message": message})
-        return RedirectResponse(url=next_url, status_code=303)
-
     @app.post("/tournaments/{tournament_id}/chat")
     async def post_tournament_chat_message(
         tournament_id: int,
         request: Request,
         connection: sqlite3.Connection = Depends(_database),
     ):
-        if get_tournament(connection, tournament_id) is None:
-            raise HTTPException(status_code=404, detail="tournament not found")
+        _require_public_chat_tournament(connection, tournament_id)
 
         form = await read_form(request)
-        message = _create_chat_message_from_form(connection, form)
+        message = _create_chat_message_from_form(
+            connection,
+            form,
+            tournament_id=tournament_id,
+        )
+        if message is not None:
+            _publish_chat_message(request, tournament_id, message)
         if _wants_json(request):
             return JSONResponse({"ok": True, "message": message})
         return RedirectResponse(url=f"/tournaments/{tournament_id}#chat", status_code=303)
@@ -467,7 +652,7 @@ def create_app(
             "live.html",
             {
                 "active_nav": None,
-                "live_games": _home_game_cards(connection, engines),
+                "running_tournaments": _home_tournament_cards(connection, engines),
                 "upcoming_rows": _upcoming_rows(connection, engines, limit=16),
                 "recent_games": list_games_by_status(connection, "finished", limit=16),
                 "engines": engines,
@@ -482,7 +667,7 @@ def create_app(
         connection: sqlite3.Connection = Depends(_database),
     ):
         tournament = get_tournament(connection, tournament_id)
-        if tournament is None:
+        if tournament is None or tournament.status == "draft":
             raise HTTPException(status_code=404, detail="tournament not found")
 
         engines = _engine_names(connection)
@@ -494,7 +679,11 @@ def create_app(
             and viewer_game is not None
             and viewer_game.status not in {"assigned", "live"}
         )
-        chat_messages = list_chat_messages(connection, limit=30)
+        chat_messages = list_chat_messages(
+            connection,
+            limit=30,
+            tournament_id=tournament_id,
+        )
         return templates.TemplateResponse(
             request,
             "tournament_detail.html",
@@ -524,27 +713,47 @@ def create_app(
         connection: sqlite3.Connection = Depends(_database),
     ):
         tournament = get_tournament(connection, tournament_id)
-        if tournament is None:
+        if tournament is None or tournament.status == "draft":
             raise HTTPException(status_code=404, detail="tournament not found")
 
         hub: StreamHub = request.app.state.stream_hub
+        selected_game_id = _positive_int(request.query_params.get("game_id"))
         return JSONResponse(
-            _tournament_live_payload(connection, tournament, hub.tournament_live(tournament_id))
+            _tournament_live_payload(
+                connection,
+                tournament,
+                hub.tournament_live(tournament_id),
+                selected_game_id=selected_game_id,
+            )
         )
 
     @app.get("/tournaments/{tournament_id}/events")
     async def tournament_events(tournament_id: int, request: Request):
         hub: StreamHub = request.app.state.stream_hub
         hub.bind_loop()
+        selected_game_id = _positive_int(request.query_params.get("game_id"))
+
+        connection = connect_database(request.app.state.db_path)
+        try:
+            tournament = get_tournament(connection, tournament_id)
+            if tournament is None or tournament.status == "draft":
+                raise HTTPException(status_code=404, detail="tournament not found")
+        finally:
+            connection.close()
 
         def snapshot() -> dict[str, Any]:
             connection = connect_database(request.app.state.db_path)
             try:
                 tournament = get_tournament(connection, tournament_id)
-                if tournament is None:
+                if tournament is None or tournament.status == "draft":
                     return {"error": "tournament not found"}
                 live = hub.tournament_live(tournament_id)
-                return _tournament_live_payload(connection, tournament, live)
+                return _tournament_live_payload(
+                    connection,
+                    tournament,
+                    live,
+                    selected_game_id=selected_game_id,
+                )
             finally:
                 connection.close()
 
@@ -561,7 +770,14 @@ def create_app(
                     )
                 )
                 while True:
-                    event = await subscription.queue.get()
+                    try:
+                        event = await asyncio.wait_for(
+                            subscription.queue.get(),
+                            timeout=20,
+                        )
+                    except TimeoutError:
+                        yield ": keep-alive\n\n"
+                        continue
                     if event is None:
                         break
                     yield sse_stream_event(event)
@@ -768,7 +984,7 @@ def create_app(
         tournament_id = create_tournament(connection, name, config)
         connection.commit()
         return RedirectResponse(
-            url=f"/admin/tournaments/{tournament_id}?notice=" + quote("Tournament created."),
+            url=f"/admin/tournaments/{tournament_id}",
             status_code=303,
         )
 
@@ -843,7 +1059,7 @@ def create_app(
         update_tournament(connection, tournament_id, name=name, config=config)
         connection.commit()
         return RedirectResponse(
-            url=f"/admin/tournaments/{tournament_id}?notice=" + quote("Tournament updated."),
+            url=f"/admin/tournaments/{tournament_id}",
             status_code=303,
         )
 
@@ -869,7 +1085,7 @@ def create_app(
         set_tournament_status(connection, tournament_id, allowed[action])
         connection.commit()
         return RedirectResponse(
-            url=f"/admin/tournaments/{tournament_id}?notice=" + quote(f"Tournament {allowed[action]}."),
+            url=f"/admin/tournaments/{tournament_id}",
             status_code=303,
         )
 
@@ -893,7 +1109,7 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         connection.commit()
         return RedirectResponse(
-            url="/admin/tournaments?notice=" + quote("Tournament deleted."),
+            url="/admin/tournaments",
             status_code=303,
         )
 
@@ -913,9 +1129,8 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         connection.commit()
-        notice = "Rating commit requested." if requested else "Rating commit is already queued or applied."
         return RedirectResponse(
-            url=f"/admin/tournaments/{tournament_id}?notice=" + quote(notice),
+            url=f"/admin/tournaments/{tournament_id}",
             status_code=303,
         )
 
@@ -971,6 +1186,7 @@ def create_app(
                     commit=values["commit"],
                     build_cmd=values["build_cmd"],
                     binary_path=values["binary_path"],
+                    required_dependencies=values["required_dependencies"],
                     uci_options=uci_options,
                 )
                 create_engine(
@@ -998,7 +1214,7 @@ def create_app(
                 status_code=400,
             )
         return RedirectResponse(
-            url="/admin/engines?notice=" + quote("Engine registered."),
+            url="/admin/engines",
             status_code=303,
         )
 
@@ -1027,6 +1243,7 @@ def create_app(
                     "commit": engine.commit,
                     "build_cmd": engine.build_cmd,
                     "binary_path": engine.binary_path,
+                    "required_dependencies": "\n".join(engine.required_dependencies),
                     "active": engine.active,
                 },
                 uci_options_text="\n".join(
@@ -1058,6 +1275,7 @@ def create_app(
                     commit=values["commit"],
                     build_cmd=values["build_cmd"],
                     binary_path=values["binary_path"],
+                    required_dependencies=values["required_dependencies"],
                     uci_options=uci_options,
                 )
                 update_engine(
@@ -1071,6 +1289,7 @@ def create_app(
                     commit=values["commit"],
                     build_cmd=values["build_cmd"],
                     binary_path=values["binary_path"],
+                    required_dependencies=values["required_dependencies"],
                     uci_options=uci_options,
                     active=values["active"],
                 )
@@ -1093,7 +1312,7 @@ def create_app(
                 status_code=400,
             )
         return RedirectResponse(
-            url="/admin/engines?notice=" + quote("Engine updated."),
+            url="/admin/engines",
             status_code=303,
         )
 
@@ -1107,13 +1326,10 @@ def create_app(
         try:
             delete_engine(connection, engine_id)
         except ValueError as exc:
-            return RedirectResponse(
-                url="/admin/engines?error=" + quote(str(exc)),
-                status_code=303,
-            )
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         connection.commit()
         return RedirectResponse(
-            url="/admin/engines?notice=" + quote("Engine deleted."),
+            url="/admin/engines",
             status_code=303,
         )
 
@@ -1163,6 +1379,7 @@ def create_app(
         default_config: dict[str, Any] = {}
         try:
             default_config = forms.settings_as_dict(forms.build_settings(form))
+            default_config.update(engine_threads=1, engine_hash_mb=16)
         except FormError as exc:
             errors.extend(exc.errors)
 
@@ -1187,7 +1404,7 @@ def create_app(
                 status_code=400,
             )
         return RedirectResponse(
-            url="/admin/categories?notice=" + quote("Category created."),
+            url="/admin/categories",
             status_code=303,
         )
 
@@ -1222,6 +1439,10 @@ def create_app(
         default_config: dict[str, Any] = {}
         try:
             default_config = forms.settings_as_dict(forms.build_settings(form))
+            default_config.update(
+                engine_threads=int(category.default_config.get("engine_threads", 1)),
+                engine_hash_mb=int(category.default_config.get("engine_hash_mb", 16)),
+            )
         except FormError as exc:
             errors.extend(exc.errors)
 
@@ -1249,7 +1470,7 @@ def create_app(
                 status_code=400,
             )
         return RedirectResponse(
-            url=f"/admin/categories/{category_id}?notice=" + quote("Category saved."),
+            url=f"/admin/categories/{category_id}",
             status_code=303,
         )
 
@@ -1263,13 +1484,10 @@ def create_app(
         try:
             delete_category(connection, category_id)
         except ValueError as exc:
-            return RedirectResponse(
-                url="/admin/categories?error=" + quote(str(exc)),
-                status_code=303,
-            )
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         connection.commit()
         return RedirectResponse(
-            url="/admin/categories?notice=" + quote("Category deleted."),
+            url="/admin/categories",
             status_code=303,
         )
 
@@ -1317,10 +1535,7 @@ def create_app(
         form, files = await read_form_with_files(request)
         name = form_value(form, "name")
         if not name:
-            return RedirectResponse(
-                url="/admin/openings?error=" + quote("Suite name is required."),
-                status_code=303,
-            )
+            raise HTTPException(status_code=422, detail="Suite name is required.")
         try:
             openings = parse_openings(form_value(form, "positions"))
             openings.extend(parse_opening_uploads(files))
@@ -1332,12 +1547,9 @@ def create_app(
             replace_suite_openings(connection, suite_id, openings)
             connection.commit()
         except (ValueError, sqlite3.IntegrityError) as exc:
-            return RedirectResponse(
-                url="/admin/openings?error=" + quote(_friendly_error(exc)),
-                status_code=303,
-            )
+            raise HTTPException(status_code=409, detail=_friendly_error(exc)) from exc
         return RedirectResponse(
-            url=f"/admin/openings/{suite_id}?notice=" + quote("Suite created."),
+            url=f"/admin/openings/{suite_id}",
             status_code=303,
         )
 
@@ -1377,10 +1589,7 @@ def create_app(
         form, files = await read_form_with_files(request)
         name = form_value(form, "name")
         if not name:
-            return RedirectResponse(
-                url=f"/admin/openings/{suite_id}?error=" + quote("Suite name is required."),
-                status_code=303,
-            )
+            raise HTTPException(status_code=422, detail="Suite name is required.")
         try:
             update_opening_suite(
                 connection,
@@ -1393,12 +1602,9 @@ def create_app(
             replace_suite_openings(connection, suite_id, openings)
             connection.commit()
         except (ValueError, sqlite3.IntegrityError) as exc:
-            return RedirectResponse(
-                url=f"/admin/openings/{suite_id}?error=" + quote(_friendly_error(exc)),
-                status_code=303,
-            )
+            raise HTTPException(status_code=409, detail=_friendly_error(exc)) from exc
         return RedirectResponse(
-            url=f"/admin/openings/{suite_id}?notice=" + quote("Suite saved."),
+            url=f"/admin/openings/{suite_id}",
             status_code=303,
         )
 
@@ -1412,7 +1618,7 @@ def create_app(
         delete_opening_suite(connection, suite_id)
         connection.commit()
         return RedirectResponse(
-            url="/admin/openings?notice=" + quote("Suite deleted."),
+            url="/admin/openings",
             status_code=303,
         )
 
@@ -1458,7 +1664,10 @@ def create_app(
         def snapshot() -> dict[str, Any]:
             connection = connect_database(request.app.state.db_path)
             try:
-                return _workers_snapshot_payload(connection)
+                return _workers_snapshot_payload(
+                    connection,
+                    worker_server_url=_request_worker_server_url(request, connection),
+                )
             finally:
                 connection.close()
 
@@ -1469,7 +1678,14 @@ def create_app(
                     hub.make_private_event("workers", "workers.snapshot", snapshot(), source="web")
                 )
                 while True:
-                    event = await subscription.queue.get()
+                    try:
+                        event = await asyncio.wait_for(
+                            subscription.queue.get(),
+                            timeout=20,
+                        )
+                    except TimeoutError:
+                        yield ": keep-alive\n\n"
+                        continue
                     if event is None:
                         break
                     yield sse_stream_event(event)
@@ -1483,6 +1699,50 @@ def create_app(
                 "Cache-Control": "no-cache",
                 "X-Accel-Buffering": "no",
             },
+        )
+
+    @app.get("/admin/workers/{worker_id:int}/events")
+    async def admin_worker_events(worker_id: int, request: Request):
+        hub: StreamHub = request.app.state.stream_hub
+        hub.bind_loop()
+
+        def snapshot() -> dict[str, Any]:
+            connection = connect_database(request.app.state.db_path)
+            try:
+                row = _worker_admin_row(connection, worker_id)
+                if row is None:
+                    return {"worker_id": worker_id, "deleted": True}
+                return _worker_admin_api_payload(
+                    row,
+                    worker_server_url=_request_worker_server_url(request, connection),
+                )
+            finally:
+                connection.close()
+
+        async def stream():
+            subscription = hub.subscribe("workers")
+            try:
+                yield sse_stream_event(
+                    hub.make_private_event("workers", "worker.snapshot", snapshot(), source="web")
+                )
+                while True:
+                    try:
+                        event = await asyncio.wait_for(subscription.queue.get(), timeout=20)
+                    except TimeoutError:
+                        yield ": keep-alive\n\n"
+                        continue
+                    if event is None:
+                        break
+                    yield sse_stream_event(
+                        hub.make_private_event("workers", "worker.snapshot", snapshot(), source="web")
+                    )
+            finally:
+                hub.unsubscribe(subscription)
+
+        return StreamingResponse(
+            stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
     @app.get("/admin/workers/{worker_id:int}")
@@ -1506,7 +1766,7 @@ def create_app(
                 minted_start_command=None,
                 worker_launch_command=_worker_launch_command(
                     row["worker"],
-                    request.app.state.worker_server_url,
+                    _request_worker_server_url(request, connection),
                 ),
             ),
         )
@@ -1518,18 +1778,34 @@ def create_app(
     ):
         form = await read_form(request)
         label = form_value(form, "label") or "worker"
-        worker_id = create_worker(connection, label=label)
+        raw_assigned_threads = form_value(form, "assigned_threads")
+        raw_assigned_hash_mb = form_value(form, "assigned_hash_mb")
+        assigned_threads = (
+            int(raw_assigned_threads)
+            if raw_assigned_threads and raw_assigned_threads.isdigit() and int(raw_assigned_threads) > 0
+            else 1
+        )
+        assigned_hash_mb = (
+            int(raw_assigned_hash_mb)
+            if raw_assigned_hash_mb and raw_assigned_hash_mb.isdigit() and int(raw_assigned_hash_mb) > 0
+            else 32
+        )
+        worker_id = create_worker(
+            connection,
+            label=label,
+            assigned_threads=assigned_threads,
+            assigned_hash_mb=assigned_hash_mb,
+        )
         connection.commit()
         return RedirectResponse(
-            url=f"/admin/workers/{worker_id}?notice=" + quote("Worker created."),
+            url=f"/admin/workers/{worker_id}",
             status_code=303,
         )
 
     @app.get("/admin/workers/{worker_id:int}/token")
     def admin_worker_token_get(worker_id: int):
         return RedirectResponse(
-            url=f"/admin/workers/{worker_id}?error="
-            + quote("Use Generate one-time token from the worker page."),
+            url=f"/admin/workers/{worker_id}",
             status_code=303,
         )
 
@@ -1552,10 +1828,7 @@ def create_app(
                 ttl_seconds=ttl_seconds,
             )
         except ValueError as exc:
-            return RedirectResponse(
-                url=f"/admin/workers/{worker_id}?error=" + quote(str(exc)),
-                status_code=303,
-            )
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         connection.commit()
         row = _worker_admin_row(connection, worker_id)
         if row is None:
@@ -1570,8 +1843,11 @@ def create_app(
                 worker=row["worker"],
                 minted=minted,
                 minted_start_command=(
-                    f"cope worker --server-url {_command_arg(request.app.state.worker_server_url)} "
-                    f"--token {_command_arg(minted.token)}"
+                    f"cope worker --server-url "
+                    f"{_command_arg(_request_worker_server_url(request, connection))} "
+                    f"--token {_command_arg(minted.token)} "
+                    f"--threads {worker.assigned_threads} "
+                    f"--hash-mb {worker.assigned_hash_mb}"
                 ),
                 worker_launch_command=None,
             ),
@@ -1593,10 +1869,7 @@ def create_app(
             update_worker_label(connection, worker_id, label)
             connection.commit()
         next_url = _safe_redirect_target(form_value(form, "next"), "/admin/workers")
-        return RedirectResponse(
-            url=f"{next_url}?notice=" + quote("Worker renamed."),
-            status_code=303,
-        )
+        return RedirectResponse(url=next_url, status_code=303)
 
     @app.post("/admin/workers/{worker_id}/revoke")
     async def admin_revoke_worker(
@@ -1610,10 +1883,7 @@ def create_app(
         revoke_worker(connection, worker_id)
         connection.commit()
         next_url = _safe_redirect_target(form_value(form, "next"), "/admin/workers")
-        return RedirectResponse(
-            url=f"{next_url}?notice=" + quote("Worker revoked."),
-            status_code=303,
-        )
+        return RedirectResponse(url=next_url, status_code=303)
 
     @app.post("/admin/workers/{worker_id}/delete")
     def admin_delete_worker(
@@ -1625,13 +1895,10 @@ def create_app(
         try:
             delete_worker(connection, worker_id)
         except ValueError as exc:
-            return RedirectResponse(
-                url="/admin/workers?error=" + quote(str(exc)),
-                status_code=303,
-            )
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         connection.commit()
         return RedirectResponse(
-            url="/admin/workers?notice=" + quote("Worker deleted."),
+            url="/admin/workers",
             status_code=303,
         )
 
@@ -1670,29 +1937,77 @@ def create_app(
         )
         update_chat_settings(connection, settings)
         connection.commit()
+        _publish_chat_settings_change(request, connection, settings)
         return RedirectResponse(
-            url="/admin/chat?notice=" + quote("Chat settings saved."),
+            url="/admin/chat",
             status_code=303,
         )
 
     @app.post("/admin/chat/{message_id}/delete")
     def admin_delete_chat_message(
         message_id: int,
+        request: Request,
         connection: sqlite3.Connection = Depends(_database),
     ):
-        delete_chat_message(connection, message_id)
+        deleted = delete_chat_message(connection, message_id)
+        if deleted is None:
+            raise HTTPException(status_code=404, detail="Message not found.")
         connection.commit()
+        _publish_chat_deletion(request, deleted.tournament_id, deleted.id)
         return RedirectResponse(
-            url="/admin/chat?notice=" + quote("Message deleted."),
+            url="/admin/chat",
             status_code=303,
         )
 
+    from cope.web.api import register_api_routes
+
+    register_api_routes(app)
     return app
 
 
 # ----------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------
+
+
+def _is_spa_request(request: Request) -> bool:
+    if request.method != "GET":
+        return False
+    accept = request.headers.get("accept", "")
+    if accept and "text/html" not in accept:
+        return False
+
+    path = request.url.path.rstrip("/") or "/"
+    if path in {
+        "/api",
+        "/assets",
+        "/docs",
+        "/internal",
+        "/openapi.json",
+        "/redoc",
+        "/static",
+    }:
+        return False
+    if path.startswith(
+        ("/api/", "/assets/", "/docs/", "/internal/", "/redoc/", "/static/")
+    ):
+        return False
+    if path.endswith(".json") or path.endswith("/events"):
+        return False
+    if re.fullmatch(r"/admin/workers/\d+/token", path) is not None:
+        return False
+    return True
+
+
+def _security_error(
+    request: Request,
+    detail: str,
+    *,
+    status_code: int,
+) -> HTMLResponse | JSONResponse:
+    if request.url.path.startswith("/api/"):
+        return JSONResponse({"detail": detail}, status_code=status_code)
+    return HTMLResponse(detail, status_code=status_code)
 
 
 def _database(request: Request) -> Iterator[sqlite3.Connection]:
@@ -1773,7 +2088,20 @@ def _tournament_snapshot(app: FastAPI, tournament_id: int) -> dict[str, Any]:
         tournament = get_tournament(connection, tournament_id)
         if tournament is None:
             return {"error": "tournament not found"}
-        return _tournament_live_payload(connection, tournament, hub.tournament_live(tournament_id))
+        payload = _tournament_live_payload(
+            connection,
+            tournament,
+            hub.tournament_live(tournament_id),
+        )
+        hub.prune_tournament_live(
+            tournament_id,
+            {
+                game["id"]
+                for game in payload["games"]
+                if game["status"] in {"assigned", "live"}
+            },
+        )
+        return payload
     finally:
         connection.close()
 
@@ -1786,20 +2114,97 @@ def _event_tournament_id(event: StreamEnvelope) -> int | None:
     value = event.data.get("tournament_id")
     if value is None and event.topic.startswith("tournament."):
         value = event.topic.removeprefix("tournament.")
+    return _positive_int(value)
+
+
+def _event_game_id(event: StreamEnvelope) -> int | None:
+    value = event.data.get("game_id")
+    if value is None:
+        live = event.data.get("live")
+        if isinstance(live, dict):
+            value = live.get("game_id")
+    return _positive_int(value)
+
+
+def _positive_int(value: Any) -> int | None:
     try:
-        tournament_id = int(value)
+        parsed = int(value)
     except (TypeError, ValueError):
         return None
-    return tournament_id if tournament_id > 0 else None
+    return parsed if parsed > 0 else None
 
 
-def _workers_snapshot_payload(connection: sqlite3.Connection) -> dict[str, Any]:
+def _workers_snapshot_payload(
+    connection: sqlite3.Connection,
+    *,
+    worker_server_url: str | None = None,
+) -> dict[str, Any]:
+    rows = _worker_admin_rows(connection)
+    required_dependencies = sorted(
+        {
+            dependency
+            for engine in list_engine_records(connection)
+            if engine.active
+            for dependency in engine.required_dependencies
+        }
+    )
     return {
         "workers": [
             _worker_admin_payload(row)
-            for row in _worker_admin_rows(connection)
-        ]
+            for row in rows
+        ],
+        "machines": _worker_machine_payloads(rows),
+        "pools": _worker_pool_payloads(
+            connection,
+            rows,
+            worker_server_url=worker_server_url,
+        ),
+        "required_dependencies": required_dependencies,
     }
+
+
+def _worker_pool_payloads(
+    connection: sqlite3.Connection,
+    rows: list[dict[str, Any]],
+    *,
+    worker_server_url: str | None = None,
+) -> list[dict[str, Any]]:
+    workers_by_pool: dict[int, list[Any]] = {}
+    for row in rows:
+        worker = row["worker"]
+        if worker.pool_id is not None:
+            workers_by_pool.setdefault(worker.pool_id, []).append(worker)
+    payloads: list[dict[str, Any]] = []
+    for pool in list_worker_pools(connection):
+        if pool.status == "revoked":
+            continue
+        workers = workers_by_pool.get(pool.id, [])
+        active = sum(worker.status in CONNECTED_WORKER_STATUSES for worker in workers)
+        state_file = f".cope-worker/pool-{pool.id}.json"
+        command = None
+        if worker_server_url is not None:
+            command = (
+                f"cope worker-pool --server-url {_command_arg(worker_server_url)} "
+                f"--state-file {_command_arg(state_file)}"
+            )
+        payloads.append(
+            {
+                "id": pool.id,
+                "label": pool.label,
+                "status": pool.status,
+                "enrollment_expires_at": pool.enrollment_expires_at,
+                "machine_id": pool.machine_id,
+                "slot_count": pool.slot_count,
+                "created_worker_count": len(workers),
+                "active_worker_count": active,
+                "assigned_threads": pool.assigned_threads,
+                "assigned_hash_mb": pool.assigned_hash_mb,
+                "reserved_threads": pool.slot_count * pool.assigned_threads,
+                "reserved_hash_mb": pool.slot_count * pool.assigned_hash_mb,
+                "start_command": command,
+            }
+        )
+    return payloads
 
 
 def _publish_admin_post_streams(request: Request) -> None:
@@ -1809,7 +2214,11 @@ def _publish_admin_post_streams(request: Request) -> None:
 
     connection = connect_database(request.app.state.db_path)
     try:
-        if path.startswith("/admin/workers"):
+        if (
+            path.startswith("/admin/workers")
+            or path.startswith("/api/admin/workers")
+            or path.startswith("/api/admin/worker-pools")
+        ):
             hub.publish("workers", "workers.snapshot", _workers_snapshot_payload(connection), source="web")
         tournament_id = _admin_tournament_path_id(path)
         if tournament_id is not None:
@@ -1835,10 +2244,16 @@ def _publish_admin_post_streams(request: Request) -> None:
 
 def _admin_tournament_path_id(path: str) -> int | None:
     parts = path.strip("/").split("/")
-    if len(parts) < 3 or parts[0] != "admin" or parts[1] != "tournaments":
+    try:
+        tournaments_index = parts.index("tournaments")
+    except ValueError:
+        return None
+    if tournaments_index == 0 or parts[tournaments_index - 1] != "admin":
+        return None
+    if len(parts) <= tournaments_index + 1:
         return None
     try:
-        value = int(parts[2])
+        value = int(parts[tournaments_index + 1])
     except ValueError:
         return None
     return value if value > 0 else None
@@ -1849,8 +2264,8 @@ def _admin_context(request: Request, section: str, **extra: Any) -> dict[str, An
     context: dict[str, Any] = {
         "active_nav": "admin",
         "admin_section": section,
-        "notice": request.query_params.get("notice"),
-        "error": request.query_params.get("error"),
+        "notice": None,
+        "error": None,
         "errors": [],
         "csrf_token": _csrf_token(request, token) if token else "",
     }
@@ -1884,19 +2299,38 @@ def _csrf_token_valid(request: Request, token: str, supplied: str) -> bool:
     return bool(expected and supplied and hmac.compare_digest(supplied, expected))
 
 
-def _signed_value(token: str, nonce: str) -> str:
-    signature = hmac.digest(token.encode("utf-8"), nonce.encode("utf-8"), "sha256").hex()
-    return f"{nonce}.{signature}"
+def _signed_value(token: str, nonce: str, *, issued_at: int | None = None) -> str:
+    timestamp = issued_at if issued_at is not None else int(datetime.now(UTC).timestamp())
+    payload = f"{timestamp}.{nonce}"
+    signature = hmac.digest(
+        token.encode("utf-8"),
+        payload.encode("utf-8"),
+        "sha256",
+    ).hex()
+    return f"{payload}.{signature}"
 
 
 def _signed_value_nonce(token: str, value: str) -> str | None:
-    if "." not in value:
+    parts = value.split(".")
+    if len(parts) != 3:
         return None
-    nonce, supplied = value.rsplit(".", 1)
-    if not nonce or not supplied:
+    timestamp_text, nonce, supplied = parts
+    if not timestamp_text or not nonce or not supplied:
         return None
-    expected = _signed_value(token, nonce).rsplit(".", 1)[1]
+    try:
+        issued_at = int(timestamp_text)
+    except ValueError:
+        return None
+    payload = f"{timestamp_text}.{nonce}"
+    expected = hmac.digest(
+        token.encode("utf-8"),
+        payload.encode("utf-8"),
+        "sha256",
+    ).hex()
     if not hmac.compare_digest(supplied, expected):
+        return None
+    now = int(datetime.now(UTC).timestamp())
+    if issued_at > now or now - issued_at >= ADMIN_SESSION_MAX_AGE_SECONDS:
         return None
     return nonce
 
@@ -1911,7 +2345,33 @@ def _csrf_for_nonce(token: str, nonce: str) -> str:
 
 def _request_is_secure(request: Request) -> bool:
     forwarded = request.headers.get("x-forwarded-proto", "")
-    return request.url.scheme == "https" or forwarded.split(",", 1)[0].strip() == "https"
+    peer_is_private = False
+    if request.client is not None:
+        try:
+            peer_is_private = ipaddress.ip_address(request.client.host).is_private
+        except ValueError:
+            peer_is_private = False
+    return request.url.scheme == "https" or (
+        peer_is_private and forwarded.split(",", 1)[0].strip() == "https"
+    )
+
+
+def _rate_limited(
+    request: Request,
+    bucket: str,
+    *,
+    limit: int,
+    window_s: float,
+) -> bool:
+    peer = request.client.host if request.client is not None else "unknown"
+    key = (bucket, peer)
+    now = time.monotonic()
+    attempts = request.app.state.request_limits.setdefault(key, [])
+    attempts[:] = [attempt for attempt in attempts if now - attempt < window_s]
+    if len(attempts) >= limit:
+        return True
+    attempts.append(now)
+    return False
 
 
 def _request_is_secure_or_local(request: Request) -> bool:
@@ -1938,14 +2398,23 @@ def _stream_hello_authorized(websocket: WebSocket, hello: StreamEnvelope) -> boo
 
 def _worker_admin_rows(connection: sqlite3.Connection) -> list[dict[str, Any]]:
     engines = _engine_names(connection)
-    return [_worker_admin_view(connection, worker, engines) for worker in list_workers(connection)]
+    rows: list[dict[str, Any]] = []
+    for worker in list_workers(connection):
+        try:
+            rows.append(_worker_admin_view(connection, worker, engines))
+        except (TypeError, ValueError, ValidationError, sqlite3.Error):
+            continue
+    return rows
 
 
 def _worker_admin_row(connection: sqlite3.Connection, worker_id: int) -> dict[str, Any] | None:
     worker = get_worker(connection, worker_id)
     if worker is None:
         return None
-    return _worker_admin_view(connection, worker, _engine_names(connection))
+    try:
+        return _worker_admin_view(connection, worker, _engine_names(connection))
+    except (TypeError, ValueError, ValidationError, sqlite3.Error):
+        return None
 
 
 def _worker_admin_view(
@@ -1955,6 +2424,11 @@ def _worker_admin_view(
 ) -> dict[str, Any]:
     effective_status = _worker_effective_status(worker)
     activity = _worker_activity(connection, worker.id, engines)
+    active_engines = [engine for engine in list_engine_records(connection) if engine.active]
+    required = sorted(
+        {dependency for engine in active_engines for dependency in engine.required_dependencies}
+    )
+    available = set(worker.available_dependencies)
     return {
         "worker": worker,
         "status": effective_status,
@@ -1962,30 +2436,161 @@ def _worker_admin_view(
         "session": _worker_session_view(worker),
         "machine": _worker_machine_view(worker, effective_status),
         "work": activity or _worker_idle_activity(worker, effective_status),
+        "dependencies": {
+            "required": required,
+            "available": sorted(available),
+            "missing": [dependency for dependency in required if dependency not in available],
+            "runnable_engines": [
+                engine.name
+                for engine in active_engines
+                if set(engine.required_dependencies).issubset(available)
+            ],
+        },
     }
 
 
 def _worker_admin_payload(row: dict[str, Any]) -> dict[str, Any]:
     worker = row["worker"]
     hardware = {
-        "reported": False,
-        "summary": "Not reported",
-        "detail": "",
+        "reported": True,
+        "summary": _worker_resource_summary(worker.assigned_threads),
+        "detail": f"{worker.assigned_hash_mb}MB engine hash",
+        "cores": str(worker.assigned_threads),
+        "memory": f"{worker.assigned_hash_mb}MB",
     }
     if worker.hw is not None:
         hardware = {
             "reported": True,
-            "summary": f"{worker.hw.physical_cores} cores",
-            "detail": f"{worker.hw.ram_gb}GB RAM",
-            "cores": str(worker.hw.physical_cores),
-            "memory": f"{worker.hw.ram_gb}GB",
+            "summary": _worker_resource_summary(worker.assigned_threads),
+            "detail": (
+                f"{worker.hw.ram_gb}GB RAM · reserves {worker.assigned_threads} cores / "
+                f"{worker.assigned_hash_mb}MB hash"
+            ),
+            "cores": str(worker.assigned_threads),
+            "memory": f"{worker.assigned_hash_mb}MB",
         }
+        hardware["detail"] = f"{worker.assigned_hash_mb}MB engine hash"
     return {
         "id": worker.id,
+        "label": worker.label,
         "status": row["status"],
+        "last_seen": worker.last_seen,
+        "pool_id": worker.pool_id,
         "work": row["work"],
         "machine": row["machine"],
         "hardware": hardware,
+        "dependencies": row["dependencies"],
+    }
+
+
+def _worker_resource_summary(threads: int) -> str:
+    return f"{threads} core{'s' if threads != 1 else ''}"
+
+
+def _worker_machine_payloads(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    machines: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        worker = row["worker"]
+        if worker.machine_id:
+            machines.setdefault(worker.machine_id, []).append(row)
+
+    payloads: list[dict[str, Any]] = []
+    for machine_id, machine_rows in machines.items():
+        representative = next(
+            (row["worker"] for row in machine_rows if row["worker"].hw is not None),
+            machine_rows[0]["worker"],
+        )
+        hardware = representative.hw
+        active_workers = sum(
+            row["status"] in CONNECTED_WORKER_STATUSES for row in machine_rows
+        )
+        reserved_threads = sum(row["worker"].assigned_threads for row in machine_rows)
+        reserved_hash_mb = sum(row["worker"].assigned_hash_mb for row in machine_rows)
+        payloads.append(
+            {
+                "id": machine_id,
+                "label": machine_id[:12],
+                "worker_count": len(machine_rows),
+                "active_worker_count": active_workers,
+                "reserved_threads": reserved_threads,
+                "reserved_hash_mb": reserved_hash_mb,
+                "hardware": _machine_hardware_payload(hardware),
+            }
+        )
+    return sorted(payloads, key=lambda machine: machine["label"])
+
+
+def _machine_hardware_payload(hardware) -> dict[str, Any]:
+    if hardware is None:
+        return {"reported": False, "summary": "Not reported", "detail": ""}
+    return {
+        "reported": True,
+        "summary": hardware.cpu_model,
+        "detail": (
+            f"{hardware.physical_cores} physical / {hardware.logical_cores} logical cores · "
+            f"{hardware.ram_gb}GB RAM"
+        ),
+        "gpu": hardware.gpu,
+        "os": hardware.os,
+    }
+
+
+def _worker_record_payload(worker) -> dict[str, Any]:
+    hardware = None
+    if worker.hw is not None:
+        hardware = {
+            "cpu_model": worker.hw.cpu_model,
+            "physical_cores": worker.hw.physical_cores,
+            "logical_cores": worker.hw.logical_cores,
+            "ram_gb": worker.hw.ram_gb,
+            "ram_mb": worker.hw.ram_mb,
+            "gpu": worker.hw.gpu,
+            "os": worker.hw.os,
+            "python": worker.hw.python,
+            "bench": {
+                "nps_probe": worker.hw.bench.nps_probe,
+            },
+        }
+    return {
+        "id": worker.id,
+        "label": worker.label,
+        "token_expires_at": worker.token_expires_at,
+        "status": worker.status,
+        "session_id": worker.session_id,
+        "app_commit": worker.app_commit,
+        "protocol_version": worker.protocol_version,
+        "machine_id": worker.machine_id,
+        "pool_id": worker.pool_id,
+        "assigned_threads": worker.assigned_threads,
+        "assigned_hash_mb": worker.assigned_hash_mb,
+        "hw": hardware,
+        "available_dependencies": list(worker.available_dependencies),
+        "dependency_manifest_revision": worker.dependency_manifest_revision,
+        "dependencies_checked_at": worker.dependencies_checked_at,
+        "last_seen": worker.last_seen,
+    }
+
+
+def _worker_admin_api_payload(
+    row: dict[str, Any],
+    *,
+    worker_server_url: str | None = None,
+) -> dict[str, Any]:
+    worker = row["worker"]
+    return {
+        "row": {
+            "worker": _worker_record_payload(worker),
+            "status": row["status"],
+            "token": row["token"],
+            "session": row["session"],
+            "machine": row["machine"],
+            "work": row["work"],
+        },
+        "worker": _worker_record_payload(worker),
+        "worker_launch_command": _worker_launch_command(worker, worker_server_url)
+        if worker_server_url is not None
+        else None,
+        "dependencies": row["dependencies"],
     }
 
 
@@ -1994,6 +2599,14 @@ def _state_view(status: str, label: str, detail: str) -> dict[str, str]:
 
 
 def _worker_token_view(worker) -> dict[str, str]:
+    if worker.pool_id is not None:
+        if worker.status == "revoked":
+            return _state_view("revoked", "Revoked", "Pool slot credential removed")
+        return _state_view(
+            "active",
+            "Pool managed",
+            "Credential stored by the machine pool",
+        )
     if worker.token_expires_at is None:
         if worker.status == "revoked":
             return _state_view("revoked", "Revoked", "Token removed")
@@ -2017,17 +2630,60 @@ def _worker_session_view(worker) -> dict[str, str]:
 
 
 def _worker_launch_command(worker, worker_server_url: str) -> str | None:
+    if worker.pool_id is not None:
+        return None
     if worker.session_id:
-        return (
+        command = (
             f"cope worker --server-url {_command_arg(worker_server_url)} "
-            f"--session-id {_command_arg(worker.session_id)}"
+            f"--session-id {_command_arg(worker.session_id)} "
+            f"--threads {worker.assigned_threads} "
+            f"--hash-mb {worker.assigned_hash_mb}"
         )
+        if worker.machine_id:
+            command = f"{command} --machine-id {_command_arg(worker.machine_id)}"
+        return command
 
     return None
 
 
 def _command_arg(value: str) -> str:
     return '"' + value.replace('"', '\\"') + '"'
+
+
+def _request_worker_server_url(
+    request: Request,
+    connection: sqlite3.Connection,
+) -> str:
+    configured = getattr(request.app.state, "worker_server_url", None)
+    if configured:
+        return _publicize_configured_worker_url(str(configured), request)
+
+    endpoint = get_service_endpoint(connection, "worker-server")
+    port = endpoint.port if endpoint is not None else default_worker_port()
+    path = endpoint.path if endpoint is not None else DEFAULT_WORKER_PATH
+    scheme = "wss" if _request_is_secure(request) else "ws"
+    host = request.url.hostname or "localhost"
+    return urlunsplit((scheme, _url_authority(host, port), path, "", ""))
+
+
+def _publicize_configured_worker_url(url: str, request: Request) -> str:
+    parsed = urlsplit(url)
+    configured_host = (parsed.hostname or "").lower()
+    if configured_host not in WILDCARD_HOSTS | {"127.0.0.1", "::1", "localhost"}:
+        return url
+    host = request.url.hostname or parsed.hostname or "localhost"
+    port = parsed.port
+    authority = _url_authority(host, port) if port is not None else _url_host_only(host)
+    scheme = "wss" if _request_is_secure(request) and parsed.scheme == "ws" else parsed.scheme
+    return urlunsplit((scheme, authority, parsed.path or DEFAULT_WORKER_PATH, "", ""))
+
+
+def _url_authority(host: str, port: int) -> str:
+    return f"{_url_host_only(host)}:{port}"
+
+
+def _url_host_only(host: str) -> str:
+    return f"[{host}]" if ":" in host and not host.startswith("[") else host
 
 
 def _worker_effective_status(worker) -> str:
@@ -2049,7 +2705,8 @@ def _worker_seen_recently(worker) -> bool:
 def _worker_machine_view(worker, effective_status: str) -> dict[str, str]:
     seen_detail = f"Last worker event {worker.last_seen or 'unknown'}"
     if effective_status in CONNECTED_WORKER_STATUSES:
-        return _state_view(effective_status, "Connected", seen_detail)
+        machine = worker.machine_id[:12] if worker.machine_id else "unknown"
+        return _state_view(effective_status, machine, seen_detail)
     states = {
         "stale": ("No active connection", seen_detail),
         "offline": ("Offline", f"Disconnected {worker.last_seen or 'unknown'}"),
@@ -2259,6 +2916,12 @@ def _engine_form_values(
         "commit": form_value(form, "commit").lower(),
         "build_cmd": form_value(form, "build_cmd"),
         "binary_path": form_value(form, "binary_path"),
+        "required_dependencies": [
+            item.strip()
+            for line in form_value(form, "required_dependencies").splitlines()
+            for item in line.split(",")
+            if item.strip()
+        ],
         "active": form_flag(form, "active"),
     }
     errors = []
@@ -2325,29 +2988,147 @@ def _wants_json(request: Request) -> bool:
 def _create_chat_message_from_form(
     connection: sqlite3.Connection,
     form: dict[str, list[str]],
-) -> dict[str, str] | None:
+    *,
+    tournament_id: int,
+) -> dict[str, Any] | None:
     settings = get_chat_settings(connection)
     if not settings.enabled:
-        return None
+        raise HTTPException(status_code=403, detail="Chat is disabled.")
 
     display_name = form_value(form, "display_name")[:40].strip()
-    if not display_name or not settings.allow_anonymous_names:
-        display_name = "Anonymous"
-    text = form_value(form, "text")[: settings.max_message_length].strip()
+    if not display_name:
+        if settings.allow_anonymous_names:
+            display_name = "Anonymous"
+        else:
+            raise HTTPException(status_code=422, detail="A display name is required.")
+    text = form_value(form, "text").strip()
     if not text:
-        return None
+        raise HTTPException(status_code=422, detail="Enter a message.")
+    if len(text) > settings.max_message_length:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Messages can be at most {settings.max_message_length} characters.",
+        )
 
-    message_id = create_chat_message(connection, display_name=display_name, text=text)
+    try:
+        parsed_command = parse_chat_command(text)
+    except ChatCommandError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    if parsed_command is not None:
+        try:
+            result = DEFAULT_COMMAND_REGISTRY.dispatch(
+                ChatCommandContext(
+                    connection=connection,
+                    tournament_id=tournament_id,
+                    display_name=display_name,
+                ),
+                text,
+            )
+        except ChatCommandError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        if result.broadcast_text is None:
+            return None
+        message_id = create_chat_message(
+            connection,
+            tournament_id=tournament_id,
+            display_name="System",
+            text=result.broadcast_text,
+        )
+        message = get_chat_message(connection, message_id)
+        connection.commit()
+        return None if message is None else _chat_message_payload(message)
+
+    message_id = create_chat_message(
+        connection,
+        tournament_id=tournament_id,
+        display_name=display_name,
+        text=text,
+    )
+    message = get_chat_message(connection, message_id)
     connection.commit()
+    if message is None:
+        raise RuntimeError("chat message disappeared after creation")
+    return _chat_message_payload(message)
+
+
+def _chat_message_payload(message: ChatMessageRecord) -> dict[str, Any]:
     return {
-        "id": str(message_id),
-        "display_name": display_name,
-        "text": text,
+        "id": message.id,
+        "tournament_id": message.tournament_id,
+        "display_name": message.display_name,
+        "text": message.text,
+        "at": message.at,
     }
 
 
+def _require_public_chat_tournament(
+    connection: sqlite3.Connection,
+    tournament_id: int,
+) -> TournamentRecord:
+    tournament = get_tournament(connection, tournament_id)
+    if tournament is None or tournament.status == "draft":
+        raise HTTPException(status_code=404, detail="Tournament not found.")
+    return tournament
+
+
+def _publish_chat_message(
+    request: Request,
+    tournament_id: int,
+    message: dict[str, Any],
+) -> None:
+    request.app.state.stream_hub.publish(
+        f"tournament.{tournament_id}",
+        "chat.message",
+        {"tournament_id": tournament_id, "message": message},
+        source="web",
+    )
+
+
+def _publish_chat_settings_change(
+    request: Request,
+    connection: sqlite3.Connection,
+    settings: ChatSettingsRecord,
+) -> None:
+    payload = {
+        "enabled": settings.enabled,
+        "slowmode_seconds": settings.slowmode_seconds,
+        "max_message_length": settings.max_message_length,
+        "allow_anonymous_names": settings.allow_anonymous_names,
+        "retention_days": settings.retention_days,
+    }
+    for tournament in list_tournaments(connection):
+        if tournament.status == "draft":
+            continue
+        request.app.state.stream_hub.publish(
+            f"tournament.{tournament.id}",
+            "chat.settings",
+            {"tournament_id": tournament.id, "settings": payload},
+            source="web",
+        )
+
+
+def _publish_chat_deletion(
+    request: Request,
+    tournament_id: int,
+    message_id: int,
+) -> None:
+    request.app.state.stream_hub.publish(
+        f"tournament.{tournament_id}",
+        "chat.deleted",
+        {"tournament_id": tournament_id, "message_id": message_id},
+        source="web",
+    )
+
+
 def _engine_names(connection: sqlite3.Connection) -> dict[int, str]:
-    return {engine.engine_id: engine.name for engine in list_engines(connection)}
+    return {
+        engine.engine_id: _engine_display_name(engine.name, engine.version)
+        for engine in list_engines(connection)
+    }
+
+
+def _engine_display_name(name: str, version: str | None) -> str:
+    return " ".join(part for part in (name.strip(), (version or "").strip()) if part)
 
 
 def _tournament_names(connection: sqlite3.Connection) -> dict[int, str]:
@@ -2386,29 +3167,36 @@ def _selected_viewer_game(request: Request, games: tuple[GameRecord, ...]) -> Ga
     return _tournament_viewer_game(games)
 
 
-def _home_game_cards(
+def _home_tournament_cards(
     connection: sqlite3.Connection,
     engines: dict[int, str],
 ) -> list[dict[str, Any]]:
     cards: list[dict[str, Any]] = []
-    for game in list_active_games(connection):
-        tournament = get_tournament(connection, game.tournament_id)
-        if tournament is None:
+    for tournament in list_tournaments(connection):
+        if tournament.status != "running":
             continue
         tournament_games = list_games(connection, tournament.id)
-        moves = list_moves(connection, game.id)
+        game = next((game for game in tournament_games if game.status == "live"), None)
+        moves = list_moves(connection, game.id) if game is not None else ()
         cards.append(
             {
-                "game": game,
-                "tournament": tournament,
-                "moves": moves,
-                "opening": _opening_view(connection, game.opening_id),
-                "summary": _summarize_games(tournament_games),
-                "last_move": moves[-1] if moves else None,
-                "white_name": engines.get(game.white_engine_id, f"Engine {game.white_engine_id}"),
-                "black_name": engines.get(game.black_engine_id, f"Engine {game.black_engine_id}"),
-                "time_control": _time_control_label(tournament.config.time_control),
-                "format": tournament.config.format.value.replace("_", " ").title(),
+                "tournament": _tournament_summary(connection, tournament, engines),
+                "preview": None
+                if game is None
+                else {
+                    "game": game,
+                    "moves": moves,
+                    "opening": _opening_view(connection, game.opening_id),
+                    "last_move": moves[-1] if moves else None,
+                    "white_name": engines.get(
+                        game.white_engine_id,
+                        f"Engine {game.white_engine_id}",
+                    ),
+                    "black_name": engines.get(
+                        game.black_engine_id,
+                        f"Engine {game.black_engine_id}",
+                    ),
+                },
             }
         )
     return cards
@@ -2422,23 +3210,7 @@ def _upcoming_rows(
 ) -> list[dict[str, str]]:
     pending_games = list_upcoming_games(connection, limit=limit)
     tournament_names = _tournament_names(connection)
-    rows: list[dict[str, str]] = []
-    for tournament in list_tournaments(connection):
-        if tournament.status not in {"scheduled", "running", "paused"}:
-            continue
-        summary = _summarize_games(list_games(connection, tournament.id))
-        rows.append(
-            {
-                "href": f"/tournaments/{tournament.id}",
-                "tournament": tournament.name,
-                "round": str(tournament.current_round or "-"),
-                "white": "Tournament page",
-                "black": f"{summary['finished']} / {summary['total']} complete",
-                "status": tournament.status,
-            }
-        )
-
-    rows.extend(
+    rows = [
         {
             "href": f"/tournaments/{game.tournament_id}?game_id={game.id}",
             "tournament": tournament_names.get(game.tournament_id, f"Tournament {game.tournament_id}"),
@@ -2448,7 +3220,7 @@ def _upcoming_rows(
             "status": game.status,
         }
         for game in pending_games
-    )
+    ]
 
     return rows[:limit]
 
@@ -2507,18 +3279,29 @@ def _move_payload(move: MoveRecord) -> dict[str, Any]:
 def _tournament_live_payload(
     connection: sqlite3.Connection,
     tournament: TournamentRecord,
-    live: dict[str, Any] | None = None,
+    live: dict[Any, Any] | None = None,
+    *,
+    selected_game_id: int | None = None,
 ) -> dict[str, Any]:
     engines = _engine_names(connection)
     games = list_games(connection, tournament.id)
-    viewer_game = _tournament_viewer_game(games)
+    viewer_game = next(
+        (game for game in games if game.id == selected_game_id),
+        None,
+    ) if selected_game_id is not None else None
+    if viewer_game is None:
+        viewer_game = _tournament_viewer_game(games)
     viewer_moves = list_moves(connection, viewer_game.id) if viewer_game else ()
     opening = _opening_view(connection, viewer_game.opening_id) if viewer_game else None
     engine_data = _engine_data(viewer_game, viewer_moves)
     clocks = _clock_data(viewer_moves)
-    if live is not None and viewer_game is not None and live.get("game_id") == viewer_game.id:
-        engine_data = _merge_engine_data(engine_data, live.get("engine_data"))
-        clocks = _merge_clock_data(clocks, live.get("clocks"))
+    clock_state = _persisted_clock_state(viewer_game, viewer_moves)
+    game_live = _live_for_game(live, viewer_game.id if viewer_game else None)
+    if game_live is not None and viewer_game is not None:
+        engine_data = _merge_engine_data(engine_data, game_live.get("engine_data"))
+        clocks = _merge_clock_data(clocks, game_live.get("clocks"))
+        if isinstance(game_live.get("clock_state"), dict):
+            clock_state = dict(game_live["clock_state"])
     return {
         "tournament": {
             "id": tournament.id,
@@ -2530,8 +3313,44 @@ def _tournament_live_payload(
         "moves": [_move_payload(move) for move in viewer_moves],
         "engine_data": engine_data,
         "clocks": clocks,
+        "clock_state": clock_state,
         "standings": _standings(connection, tournament, games, engines),
         "games": [_game_payload(game, engines) for game in games],
+    }
+
+
+def _live_for_game(
+    live: dict[Any, Any] | None,
+    game_id: int | None,
+) -> dict[str, Any] | None:
+    if live is None or game_id is None:
+        return None
+    if live.get("game_id") == game_id:
+        return live
+    candidate = live.get(game_id)
+    if candidate is None:
+        candidate = live.get(str(game_id))
+    return candidate if isinstance(candidate, dict) else None
+
+
+def _persisted_clock_state(
+    game: GameRecord | None,
+    moves: tuple[MoveRecord, ...],
+) -> dict[str, Any] | None:
+    if game is None:
+        return None
+    clocks_ms: dict[str, int | None] = {"white": None, "black": None}
+    for move in moves:
+        side = "white" if move.ply % 2 == 1 else "black"
+        clocks_ms[side] = move.clock_after_ms
+    next_side = "black" if moves and moves[-1].ply % 2 == 1 else "white"
+    return {
+        "game_id": game.id,
+        "clocks_ms": clocks_ms,
+        "active_side": next_side,
+        "running": False,
+        "observed_at": None,
+        "sent_at": None,
     }
 
 
@@ -2585,9 +3404,9 @@ def _clock_label(value: Any) -> str:
         milliseconds = max(0, int(value))
     except (TypeError, ValueError):
         return "--:--"
-    total_seconds = milliseconds // 1000
+    total_seconds, remainder = divmod(milliseconds, 1000)
     minutes, seconds = divmod(total_seconds, 60)
-    return f"{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}.{remainder:03d}"
 
 
 def _engine_data(
@@ -2682,6 +3501,7 @@ def _tournament_index_context(
     tournaments = [
         _tournament_summary(connection, tournament, engines)
         for tournament in list_tournaments(connection)
+        if tournament.status != "draft"
     ]
     return {
         "request": request,
@@ -2848,7 +3668,7 @@ def _settings_view(
 
     options = config.format_options
     option_labels = {
-        "double_rr": "Double round robin",
+        "games_per_pairing": "Games per pairing",
         "rounds": "Rounds",
         "games_per_match": "Games per match",
         "tiebreak": "Tiebreak",
@@ -2865,11 +3685,24 @@ def _settings_view(
 
     rows.extend(
         [
-            ("Concurrency", str(config.concurrency)),
+            ("Concurrent games", str(config.concurrency)),
+            ("Threads per engine", str(config.engine_threads)),
+            ("Hash per engine", f"{config.engine_hash_mb}MB"),
+            ("Worker hash required", f"{config.engine_hash_mb * 2}MB"),
             ("Rated", "Yes" if config.rated else "No"),
             ("Lag compensation", f"{config.lag_compensation_ms}ms"),
         ]
     )
+
+    for engine_id in config.participants:
+        engine_name = engines.get(engine_id, f"Engine {engine_id}")
+        for option_name, value in sorted(
+            config.uci_options.get(engine_id, {}).items(),
+            key=lambda item: item[0].lower(),
+        ):
+            if isinstance(value, bool):
+                value = "Yes" if value else "No"
+            rows.append((f"{engine_name} UCI: {option_name}", str(value)))
 
     if config.opening_suite_id:
         suite = get_opening_suite(connection, config.opening_suite_id)
@@ -2900,6 +3733,26 @@ def _settings_view(
     if adjudication.max_moves:
         rows.append(("Maximum moves", str(adjudication.max_moves)))
 
+    if tournament.worker_profile:
+        try:
+            profile = json.loads(tournament.worker_profile)
+        except (TypeError, json.JSONDecodeError):
+            profile = None
+        if isinstance(profile, dict):
+            rows.append(
+                (
+                    "Pinned worker class",
+                    f"{profile.get('cpu_model', 'Unknown CPU')}, "
+                    f"{profile.get('physical_cores', '?')}P/"
+                    f"{profile.get('logical_cores', '?')}T, "
+                    f"{profile.get('os', 'Unknown OS')}",
+                )
+            )
+        else:
+            rows.append(("Pinned worker class", "Unknown worker profile"))
+    else:
+        rows.append(("Pinned worker class", "Selected by the first eligible worker"))
+
     return rows
 
 
@@ -2913,13 +3766,16 @@ def _engine_hardware_view(
 
     for engine_id in tournament.config.participants:
         engine = engine_records.get(engine_id)
-        options = engine.uci_options if engine is not None else {}
         rows.append(
             {
                 "engine_id": str(engine_id),
-                "name": engine.name if engine is not None else f"Engine {engine_id}",
-                "hash": _uci_option_label(options, "Hash", suffix="MB"),
-                "threads": _uci_option_label(options, "Threads"),
+                "name": (
+                    _engine_display_name(engine.name, engine.version)
+                    if engine is not None
+                    else f"Engine {engine_id}"
+                ),
+                "hash": f"{tournament.config.engine_hash_mb}MB",
+                "threads": str(tournament.config.engine_threads),
                 "hardware": _hardware_profiles_label(active_hardware.get(engine_id, ())),
             }
         )

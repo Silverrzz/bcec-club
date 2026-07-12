@@ -1,17 +1,42 @@
 from __future__ import annotations
 
+import re
 from enum import StrEnum
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 4
 UciOptionValue = str | int | bool
+DEPENDENCY_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+:-]{0,79}$")
+
+
+def normalize_required_dependencies(values: list[str]) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_value in values:
+        value = raw_value.strip()
+        if not value or not DEPENDENCY_NAME_PATTERN.fullmatch(value):
+            raise ValueError(
+                "dependency names must be executable names without paths, arguments, or shell syntax"
+            )
+        if value not in seen:
+            seen.add(value)
+            normalized.append(value)
+    return normalized
 
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class WorkerResources(StrictModel):
+    threads: int = Field(gt=0)
+    hash_mb: int = Field(gt=0)
+
+    def can_run(self, required: WorkerResources) -> bool:
+        return self.threads >= required.threads and self.hash_mb >= required.hash_mb
 
 
 class TimeControlCategory(StrEnum):
@@ -80,6 +105,7 @@ class EngineSpec(StrictModel):
     commit: str
     build_cmd: str = Field(min_length=1)
     binary_path: str = Field(min_length=1)
+    required_dependencies: list[str] = Field(default_factory=list)
     uci_options: dict[str, UciOptionValue] = Field(default_factory=dict)
 
     @field_validator("commit")
@@ -97,6 +123,11 @@ class EngineSpec(StrictModel):
                 raise ValueError("uci option names must be non-empty")
         return value
 
+    @field_validator("required_dependencies")
+    @classmethod
+    def validate_required_dependencies(cls, value: list[str]) -> list[str]:
+        return normalize_required_dependencies(value)
+
 
 class TournamentFormat(StrEnum):
     ROUND_ROBIN = "round_robin"
@@ -111,7 +142,7 @@ class KnockoutTiebreak(StrEnum):
 
 
 class RoundRobinFormatOptions(StrictModel):
-    double_rr: bool = True
+    games_per_pairing: int = Field(default=2, gt=0)
 
 
 class SwissFormatOptions(StrictModel):
@@ -134,17 +165,20 @@ FormatOptions = (
 
 
 class TournamentConfig(StrictModel):
-    category_id: int = Field(default=1, gt=0)
+    category_id: int | None = Field(default=1, gt=0)
     category_settings_linked: bool = True
     format: TournamentFormat
     format_options: FormatOptions
     participants: list[int] = Field(min_length=2)
     time_control: TimeControl
-    concurrency: int = Field(gt=0)
+    concurrency: int = Field(default=1, gt=0)
     opening_suite_id: int | None = Field(default=None, gt=0)
     adjudication: AdjudicationConfig
     rated: bool = True
     lag_compensation_ms: int = Field(default=50, ge=0)
+    engine_threads: int = Field(default=1, gt=0)
+    engine_hash_mb: int = Field(default=16, gt=0)
+    uci_options: dict[int, dict[str, UciOptionValue]] = Field(default_factory=dict)
 
     @model_validator(mode="before")
     @classmethod
@@ -154,7 +188,7 @@ class TournamentConfig(StrictModel):
             data.pop("rating_category", None)
             data.pop("hardware_mode", None)
             data.setdefault("category_id", 1)
-            data.setdefault("category_settings_linked", True)
+            data.setdefault("category_settings_linked", data["category_id"] is not None)
         return data
 
     @field_validator("participants")
@@ -166,8 +200,31 @@ class TournamentConfig(StrictModel):
             raise ValueError("participants must be unique")
         return value
 
+    @field_validator("uci_options")
+    @classmethod
+    def validate_tournament_uci_options(
+        cls,
+        value: dict[int, dict[str, UciOptionValue]],
+    ) -> dict[int, dict[str, UciOptionValue]]:
+        for engine_id, options in value.items():
+            if engine_id <= 0:
+                raise ValueError("UCI option engine ids must be positive")
+            for name in options:
+                if not name.strip():
+                    raise ValueError("UCI option names must be non-empty")
+                if name.strip().lower() in {"threads", "hash"}:
+                    raise ValueError(
+                        "Threads and Hash are controlled by tournament resource settings"
+                    )
+        return value
+
     @model_validator(mode="after")
     def validate_format_options(self) -> TournamentConfig:
+        if self.category_settings_linked != (self.category_id is not None):
+            raise ValueError(
+                "category tournaments must use category settings and custom tournaments "
+                "must not have a rating category"
+            )
         expected: dict[TournamentFormat, type[StrictModel]] = {
             TournamentFormat.ROUND_ROBIN: RoundRobinFormatOptions,
             TournamentFormat.SWISS: SwissFormatOptions,
@@ -181,6 +238,10 @@ class TournamentConfig(StrictModel):
         if isinstance(self.format_options, GauntletFormatOptions):
             if self.format_options.hero_engine_id not in self.participants:
                 raise ValueError("gauntlet hero_engine_id must be in participants")
+
+        unknown_option_engines = set(self.uci_options).difference(self.participants)
+        if unknown_option_engines:
+            raise ValueError("UCI options can only target tournament participants")
 
         return self
 
@@ -238,6 +299,7 @@ class WorkerGameAssignment(StrictModel):
     opening_name: str | None = None
     max_plies: int = Field(gt=0)
     engines: dict[int, EngineSpec]
+    required_resources: WorkerResources
 
     @field_validator("engines")
     @classmethod
@@ -283,6 +345,48 @@ class AssignmentComplete(AssignmentMessage):
     pass
 
 
+class AssignmentReady(AssignmentMessage):
+    prepared_engine_ids: list[int] = Field(min_length=1)
+
+    @field_validator("prepared_engine_ids")
+    @classmethod
+    def validate_prepared_engine_ids(cls, value: list[int]) -> list[int]:
+        if any(engine_id <= 0 for engine_id in value):
+            raise ValueError("prepared engine ids must be positive")
+        if len(set(value)) != len(value):
+            raise ValueError("prepared engine ids must be unique")
+        return value
+
+
+class AssignmentRejected(AssignmentMessage):
+    reason: Literal["missing_dependencies"]
+    missing_dependencies: list[str] = Field(min_length=1)
+
+    @field_validator("missing_dependencies")
+    @classmethod
+    def validate_missing_dependencies(cls, value: list[str]) -> list[str]:
+        return normalize_required_dependencies(value)
+
+
+class DependencyProbe(StrictModel):
+    revision: str = Field(min_length=16, max_length=128)
+    required_dependencies: list[str] = Field(default_factory=list)
+
+    @field_validator("required_dependencies")
+    @classmethod
+    def validate_required_dependencies(cls, value: list[str]) -> list[str]:
+        return normalize_required_dependencies(value)
+
+
+class DependencyReport(StrictModel):
+    revision: str = Field(min_length=16, max_length=128)
+    available_dependencies: list[str] = Field(default_factory=list)
+
+    @field_validator("available_dependencies")
+    @classmethod
+    def validate_available_dependencies(cls, value: list[str]) -> list[str]:
+        return normalize_required_dependencies(value)
+
 class BenchInfo(StrictModel):
     nps_probe: int | None = Field(default=None, gt=0)
 
@@ -292,6 +396,7 @@ class HardwareInfo(StrictModel):
     physical_cores: int = Field(gt=0)
     logical_cores: int = Field(gt=0)
     ram_gb: int = Field(gt=0)
+    ram_mb: int | None = Field(default=None, gt=0)
     gpu: str | None = None
     os: str = Field(min_length=1)
     python: str = Field(min_length=1)
@@ -303,9 +408,15 @@ class HardwareInfo(StrictModel):
             raise ValueError("logical_cores must be >= physical_cores")
         return self
 
+    @property
+    def total_ram_mb(self) -> int:
+        return self.ram_mb or self.ram_gb * 1024
+
 
 class WorkerActiveAssignmentsMixin(StrictModel):
     active_assignment_ids: list[int] = Field(default_factory=list)
+    machine_id: str = Field(min_length=8, max_length=128)
+    resources: WorkerResources
 
     @field_validator("active_assignment_ids")
     @classmethod
@@ -330,14 +441,43 @@ class WorkerSessionHello(WorkerActiveAssignmentsMixin):
     app_commit: str = Field(min_length=1)
 
 
+class WorkerPoolSlotHello(WorkerActiveAssignmentsMixin):
+    slot_token: str = Field(min_length=1)
+    hw: HardwareInfo
+    app_commit: str = Field(min_length=1)
+
+
+class WorkerPoolEnrollmentHello(StrictModel):
+    enrollment_token: str = Field(min_length=1)
+    machine_id: str = Field(min_length=8, max_length=128)
+    hw: HardwareInfo
+    app_commit: str = Field(min_length=1)
+
+
+class WorkerPoolSlotCredential(StrictModel):
+    worker_id: int = Field(gt=0)
+    label: str = Field(min_length=1, max_length=80)
+    slot_token: str = Field(min_length=1)
+    resources: WorkerResources
+
+
+class WorkerPoolWelcome(StrictModel):
+    pool_id: int = Field(gt=0)
+    label: str = Field(min_length=1, max_length=80)
+    machine_id: str = Field(min_length=8, max_length=128)
+    slots: list[WorkerPoolSlotCredential] = Field(min_length=1)
+
+
 class WorkerWelcome(StrictModel):
     worker_id: int = Field(gt=0)
     session_id: str = Field(min_length=1)
     heartbeat_interval_ms: int = Field(gt=0)
+    resources: WorkerResources
+    dependency_probe: DependencyProbe
 
 
 class Envelope(StrictModel):
-    v: Literal[1] = PROTOCOL_VERSION
+    v: Literal[4] = PROTOCOL_VERSION
     type: str = Field(min_length=1)
     seq: int = Field(ge=0)
     t_mono_ms: int = Field(ge=0)

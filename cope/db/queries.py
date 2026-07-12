@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import sqlite3
 from dataclasses import dataclass
 
@@ -24,7 +25,10 @@ class OpeningPositionRecord:
 class RatingRowRecord:
     engine: EngineSpec
     elo: float
+    error_margin: float | None
     games_played: int
+    average_opponent_elo: float | None
+    average_opponent_elo_delta: float | None
     updated_at: str | None
 
 
@@ -157,15 +161,72 @@ def list_rating_rows(
         """,
         (category_id,),
     )
+    history = connection.execute(
+        """
+        SELECT
+          rating_history.engine_id,
+          rating_history.elo_before AS engine_elo,
+          opponent.elo_before AS opponent_elo
+        FROM rating_history
+        JOIN rating_history AS opponent
+          ON opponent.game_id = rating_history.game_id
+         AND opponent.category_id = rating_history.category_id
+         AND opponent.engine_id = rating_history.opponent_engine_id
+        WHERE rating_history.category_id = ?
+        """,
+        (category_id,),
+    )
+    metrics: dict[int, dict[str, float]] = {}
+    for item in history:
+        if item["engine_elo"] is None or item["opponent_elo"] is None:
+            continue
+        values = metrics.setdefault(
+            item["engine_id"],
+            {"count": 0.0, "opponent_total": 0.0, "delta_total": 0.0, "information": 0.0},
+        )
+        engine_elo = float(item["engine_elo"])
+        opponent_elo = float(item["opponent_elo"])
+        difference = max(-4000.0, min(4000.0, opponent_elo - engine_elo))
+        expected = 1.0 / (1.0 + 10.0 ** (difference / 400.0))
+        values["count"] += 1
+        values["opponent_total"] += opponent_elo
+        values["delta_total"] += opponent_elo - engine_elo
+        values["information"] += expected * (1.0 - expected)
+
     return tuple(
         RatingRowRecord(
             engine=_engine_from_row(row),
             elo=row["elo"],
+            error_margin=_rating_error_margin(metrics.get(row["id"])),
             games_played=row["games_played"],
+            average_opponent_elo=_rating_metric_average(
+                metrics.get(row["id"]),
+                "opponent_total",
+            ),
+            average_opponent_elo_delta=_rating_metric_average(
+                metrics.get(row["id"]),
+                "delta_total",
+            ),
             updated_at=row["updated_at"],
         )
         for row in rows
     )
+
+
+def _rating_metric_average(
+    values: dict[str, float] | None,
+    field: str,
+) -> float | None:
+    if not values or values["count"] <= 0:
+        return None
+    return round(values[field] / values["count"], 6)
+
+
+def _rating_error_margin(values: dict[str, float] | None) -> float | None:
+    if not values or values["information"] <= 0:
+        return None
+    standard_error = (400.0 / math.log(10.0)) / math.sqrt(values["information"])
+    return round(1.96 * standard_error, 6)
 
 
 def get_worker_activity(
@@ -278,6 +339,7 @@ def list_uncommitted_finished_tournaments(
         for tournament in list_tournaments(connection)
         if tournament.status == "finished"
         and tournament.config.rated
+        and tournament.category_id is not None
         and tournament.id not in active_or_applied_ids
     )
 

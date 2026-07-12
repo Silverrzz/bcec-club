@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 
 DEFAULT_WEB_HOST = "127.0.0.1"
@@ -57,11 +58,11 @@ def default_web_stream_url() -> str:
 
 
 def default_web_event_token() -> str | None:
-    return os.environ.get("COPE_WEB_EVENT_TOKEN") or None
+    return _secret_env("COPE_WEB_EVENT_TOKEN")
 
 
 def default_admin_token() -> str | None:
-    return os.environ.get(ADMIN_TOKEN_ENV) or None
+    return _secret_env(ADMIN_TOKEN_ENV)
 
 
 def default_web_event_timeout_s() -> float:
@@ -86,6 +87,19 @@ def _env_float(name: str, default: float) -> float:
         return float(value)
     except ValueError as exc:
         raise ValueError(f"{name} must be a number") from exc
+
+
+def _secret_env(name: str) -> str | None:
+    value = os.environ.get(name)
+    file_name = os.environ.get(f"{name}_FILE")
+    if value and file_name:
+        raise ValueError(f"set only one of {name} or {name}_FILE")
+    if file_name:
+        try:
+            value = Path(file_name).read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise ValueError(f"could not read {name}_FILE: {exc}") from exc
+    return value or None
 
 
 def _public_host(bind_host: str, fallback: str) -> str:

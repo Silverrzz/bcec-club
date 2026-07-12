@@ -12,6 +12,7 @@ from cope.core.models import (
     EngineSpec,
     HardwareInfo,
     TournamentConfig,
+    WorkerResources,
 )
 
 
@@ -29,11 +30,12 @@ class CategoryRecord:
 class TournamentRecord:
     id: int
     name: str
-    category_id: int
+    category_id: int | None
     settings_unlinked: bool
     config: TournamentConfig
     status: str
     current_round: int
+    worker_profile: str | None
     created_at: str
     started_at: str | None
     finished_at: str | None
@@ -111,8 +113,22 @@ class WorkerRecord:
     session_id: str | None
     app_commit: str | None
     protocol_version: int | None
+    machine_id: str | None
+    pool_id: int | None
+    assigned_threads: int
+    assigned_hash_mb: int
     hw: HardwareInfo | None
+    available_dependencies: tuple[str, ...]
+    dependency_manifest_revision: str | None
+    dependencies_checked_at: str | None
     last_seen: str | None
+
+    @property
+    def resources(self) -> WorkerResources:
+        return WorkerResources(
+            threads=self.assigned_threads,
+            hash_mb=self.assigned_hash_mb,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +142,7 @@ class EngineRecord:
     commit: str
     build_cmd: str
     binary_path: str
+    required_dependencies: tuple[str, ...]
     uci_options: dict[str, Any]
     active: bool
 
@@ -150,6 +167,7 @@ class OpeningRecord:
 @dataclass(frozen=True, slots=True)
 class ChatMessageRecord:
     id: int
+    tournament_id: int
     display_name: str
     text: str
     at: str
@@ -169,6 +187,43 @@ class WorkerToken:
     worker_id: int
     token: str
     expires_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerPoolRecord:
+    id: int
+    label: str
+    enrollment_expires_at: str | None
+    status: str
+    machine_id: str | None
+    slot_count: int
+    assigned_threads: int
+    assigned_hash_mb: int
+    created_at: str
+    enrolled_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerPoolEnrollment:
+    pool_id: int
+    token: str
+    expires_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerPoolSlotCredential:
+    worker_id: int
+    label: str
+    token: str
+
+
+@dataclass(frozen=True, slots=True)
+class ServiceEndpointRecord:
+    service: str
+    host: str
+    port: int
+    path: str
+    updated_at: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,6 +257,75 @@ def utc_now_datetime() -> datetime:
     return datetime.now(UTC)
 
 
+def set_service_endpoint(
+    connection: sqlite3.Connection,
+    *,
+    service: str,
+    host: str,
+    port: int,
+    path: str,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO service_endpoints (service, host, port, path, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(service) DO UPDATE SET
+          host = excluded.host,
+          port = excluded.port,
+          path = excluded.path,
+          updated_at = excluded.updated_at
+        """,
+        (service, host, port, path, utc_now()),
+    )
+
+
+def get_service_endpoint(
+    connection: sqlite3.Connection,
+    service: str,
+) -> ServiceEndpointRecord | None:
+    row = connection.execute(
+        "SELECT * FROM service_endpoints WHERE service = ?",
+        (service,),
+    ).fetchone()
+    if row is None:
+        return None
+    return ServiceEndpointRecord(
+        service=row["service"],
+        host=row["host"],
+        port=row["port"],
+        path=row["path"],
+        updated_at=row["updated_at"],
+    )
+
+
+def touch_service_heartbeat(
+    connection: sqlite3.Connection,
+    service: str,
+    app_commit: str,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO service_heartbeats (service, app_commit, last_seen)
+        VALUES (?, ?, ?)
+        ON CONFLICT(service) DO UPDATE SET
+          app_commit = excluded.app_commit,
+          last_seen = excluded.last_seen
+        """,
+        (service, app_commit, utc_now()),
+    )
+
+
+def list_service_heartbeats(connection: sqlite3.Connection) -> tuple[dict[str, str], ...]:
+    return tuple(
+        {
+            "service": str(row["service"]),
+            "app_commit": str(row["app_commit"]),
+            "last_seen": str(row["last_seen"]),
+        }
+        for row in connection.execute("SELECT * FROM service_heartbeats ORDER BY service")
+    )
+
+
 def create_engine(
     connection: sqlite3.Connection,
     spec: EngineSpec,
@@ -213,9 +337,9 @@ def create_engine(
         """
         INSERT INTO engines (
           id, name, author, version, git_url, branch, commit_hash, build_cmd, binary_path,
-          uci_options, active
+          required_dependencies, uci_options, active
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             spec.engine_id,
@@ -227,6 +351,7 @@ def create_engine(
             spec.commit,
             spec.build_cmd,
             spec.binary_path,
+            _json_dump(spec.required_dependencies),
             _json_dump(spec.uci_options),
             int(active),
         ),
@@ -250,6 +375,7 @@ def update_engine(
     commit: str,
     build_cmd: str,
     binary_path: str,
+    required_dependencies: list[str] | None = None,
     version: str = "",
     uci_options: dict[str, Any] | None = None,
     active: bool = True,
@@ -258,7 +384,7 @@ def update_engine(
         """
         UPDATE engines
         SET name = ?, author = ?, version = ?, git_url = ?, branch = ?, commit_hash = ?, build_cmd = ?,
-            binary_path = ?, uci_options = ?, active = ?
+            binary_path = ?, required_dependencies = ?, uci_options = ?, active = ?
         WHERE id = ?
         """,
         (
@@ -270,6 +396,7 @@ def update_engine(
             commit,
             build_cmd,
             binary_path,
+            _json_dump(required_dependencies or []),
             _json_dump(uci_options or {}),
             int(active),
             engine_id,
@@ -439,6 +566,7 @@ def create_tournament(
     *,
     status: str = "draft",
 ) -> int:
+    config = _resolve_tournament_category_config(connection, config)
     created_at = utc_now()
     cursor = connection.execute(
         """
@@ -529,6 +657,23 @@ def set_tournament_current_round_at_least(
     )
 
 
+def claim_tournament_worker_profile(
+    connection: sqlite3.Connection,
+    tournament_id: int,
+    worker_profile: str,
+) -> bool:
+    cursor = connection.execute(
+        """
+        UPDATE tournaments
+        SET worker_profile = COALESCE(worker_profile, ?)
+        WHERE id = ?
+          AND (worker_profile IS NULL OR worker_profile = ?)
+        """,
+        (worker_profile, tournament_id, worker_profile),
+    )
+    return cursor.rowcount > 0
+
+
 def _abandon_tournament_games(
     connection: sqlite3.Connection,
     tournament_id: int,
@@ -572,6 +717,7 @@ def update_tournament(
     config: TournamentConfig,
 ) -> None:
     """Update a tournament's name, config, and participant list."""
+    config = _resolve_tournament_category_config(connection, config)
     connection.execute(
         """
         UPDATE tournaments
@@ -596,6 +742,53 @@ def update_tournament(
             (tournament_id, engine_id, seed)
             for seed, engine_id in enumerate(config.participants, start=1)
         ),
+    )
+
+
+def _resolve_tournament_category_config(
+    connection: sqlite3.Connection,
+    config: TournamentConfig,
+) -> TournamentConfig:
+    if config.category_id is None:
+        return config.model_copy(update={"rated": False})
+
+    category = get_category(connection, config.category_id)
+    if category is None or not category.active:
+        raise ValueError("tournament rating category must be active")
+
+    settings: dict[str, Any] = {
+        "format": "round_robin",
+        "format_options": {"games_per_pairing": 2},
+        "time_control": {
+            "category": "increment",
+            "initial_ms": 60_000,
+            "increment_ms": 1_000,
+        },
+        "concurrency": 1,
+        "opening_suite_id": None,
+        "adjudication": {
+            "draw": None,
+            "resign": None,
+            "syzygy": None,
+            "max_moves": None,
+        },
+        "rated": True,
+        "lag_compensation_ms": 50,
+        "engine_threads": 1,
+        "engine_hash_mb": 16,
+    }
+    settings.update(category.default_config)
+    settings.update(
+        format=config.format,
+        format_options=config.format_options,
+        concurrency=config.concurrency,
+        opening_suite_id=config.opening_suite_id,
+    )
+    return TournamentConfig(
+        category_id=category.id,
+        category_settings_linked=True,
+        participants=config.participants,
+        **settings,
     )
 
 
@@ -963,6 +1156,22 @@ def mark_game_assignment_live(
     )
 
 
+def acknowledge_game_assignment(
+    connection: sqlite3.Connection,
+    assignment_id: int,
+) -> None:
+    cursor = connection.execute(
+        """
+        UPDATE game_assignments
+        SET status = 'acked', acked_at = COALESCE(acked_at, ?)
+        WHERE id = ? AND status IN ('assigned', 'acked')
+        """,
+        (utc_now(), assignment_id),
+    )
+    if cursor.rowcount != 1:
+        raise RuntimeError(f"assignment {assignment_id} is no longer awaiting readiness")
+
+
 def finish_game_assignment(
     connection: sqlite3.Connection,
     assignment_id: int,
@@ -1007,15 +1216,217 @@ def create_worker(
     connection: sqlite3.Connection,
     *,
     label: str,
+    assigned_threads: int = 1,
+    assigned_hash_mb: int = 32,
 ) -> int:
     cursor = connection.execute(
         """
-        INSERT INTO workers (label, status)
-        VALUES (?, 'minted')
+        INSERT INTO workers (label, assigned_threads, assigned_hash_mb, status)
+        VALUES (?, ?, ?, 'minted')
         """,
-        (label,),
+        (label, assigned_threads, assigned_hash_mb),
     )
     return int(cursor.lastrowid)
+
+
+def create_worker_pool(
+    connection: sqlite3.Connection,
+    *,
+    label: str,
+    slot_count: int,
+    assigned_threads: int,
+    assigned_hash_mb: int,
+    ttl_seconds: int = 900,
+) -> WorkerPoolEnrollment:
+    cursor = connection.execute(
+        """
+        INSERT INTO worker_pools (
+          label, status, slot_count, assigned_threads, assigned_hash_mb, created_at
+        )
+        VALUES (?, 'pending', ?, ?, ?, ?)
+        """,
+        (
+            label,
+            slot_count,
+            assigned_threads,
+            assigned_hash_mb,
+            utc_now(),
+        ),
+    )
+    return mint_worker_pool_token(
+        connection,
+        pool_id=int(cursor.lastrowid),
+        ttl_seconds=ttl_seconds,
+    )
+
+
+def mint_worker_pool_token(
+    connection: sqlite3.Connection,
+    *,
+    pool_id: int,
+    ttl_seconds: int = 900,
+) -> WorkerPoolEnrollment:
+    token = secrets.token_urlsafe(32)
+    expires_at = (utc_now_datetime() + timedelta(seconds=ttl_seconds)).isoformat(
+        timespec="seconds"
+    )
+    cursor = connection.execute(
+        """
+        UPDATE worker_pools
+        SET enrollment_token_hash = ?, enrollment_expires_at = ?
+        WHERE id = ? AND status = 'pending' AND machine_id IS NULL
+        """,
+        (hash_worker_token(token), expires_at, pool_id),
+    )
+    if cursor.rowcount == 0:
+        raise ValueError("worker pool cannot receive an enrollment token")
+    return WorkerPoolEnrollment(pool_id=pool_id, token=token, expires_at=expires_at)
+
+
+def get_worker_pool(
+    connection: sqlite3.Connection,
+    pool_id: int,
+) -> WorkerPoolRecord | None:
+    row = connection.execute(
+        "SELECT * FROM worker_pools WHERE id = ?",
+        (pool_id,),
+    ).fetchone()
+    return _worker_pool_from_row(row) if row is not None else None
+
+
+def get_worker_pool_by_token(
+    connection: sqlite3.Connection,
+    token: str,
+) -> WorkerPoolRecord | None:
+    row = connection.execute(
+        "SELECT * FROM worker_pools WHERE enrollment_token_hash = ?",
+        (hash_worker_token(token),),
+    ).fetchone()
+    return _worker_pool_from_row(row) if row is not None else None
+
+
+def list_worker_pools(connection: sqlite3.Connection) -> tuple[WorkerPoolRecord, ...]:
+    return tuple(
+        _worker_pool_from_row(row)
+        for row in connection.execute("SELECT * FROM worker_pools ORDER BY id")
+    )
+
+
+def worker_pool_token_is_valid(
+    record: WorkerPoolRecord,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    if record.status != "pending" or record.enrollment_expires_at is None:
+        return False
+    expires_at = datetime.fromisoformat(record.enrollment_expires_at)
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=UTC)
+    return expires_at > (now or utc_now_datetime())
+
+
+def enroll_worker_pool(
+    connection: sqlite3.Connection,
+    *,
+    pool: WorkerPoolRecord,
+    machine_id: str,
+    hw: HardwareInfo,
+    app_commit: str,
+    protocol_version: int,
+) -> tuple[WorkerPoolSlotCredential, ...]:
+    if not worker_pool_token_is_valid(pool):
+        raise ValueError("invalid or expired worker pool enrollment token")
+    existing = tuple(
+        _worker_from_row(row)
+        for row in connection.execute(
+            """
+            SELECT * FROM workers
+            WHERE machine_id = ?
+              AND status != 'revoked'
+              AND (
+                pool_id IS NOT NULL
+                OR status IN ('connected', 'building', 'ready', 'busy')
+              )
+            """,
+            (machine_id,),
+        )
+    )
+    for worker in existing:
+        if worker.hw is None:
+            continue
+        if worker.hw.physical_cores != hw.physical_cores:
+            raise ValueError("existing workers on this machine report a different core count")
+        if worker.hw.total_ram_mb != hw.total_ram_mb:
+            raise ValueError("existing workers on this machine report a different RAM capacity")
+
+    required_threads = (
+        pool.slot_count * pool.assigned_threads
+        + sum(worker.assigned_threads for worker in existing)
+    )
+    if required_threads > hw.physical_cores:
+        raise ValueError(
+            f"pool reserves {required_threads} threads but the machine reports "
+            f"only {hw.physical_cores} physical cores"
+        )
+    required_hash_mb = (
+        pool.slot_count * pool.assigned_hash_mb
+        + sum(worker.assigned_hash_mb for worker in existing)
+    )
+    if required_hash_mb > hw.total_ram_mb:
+        raise ValueError(
+            f"pool reserves {required_hash_mb}MB hash but the machine reports "
+            f"only {hw.total_ram_mb}MB RAM"
+        )
+
+    width = max(2, len(str(pool.slot_count)))
+    credentials: list[WorkerPoolSlotCredential] = []
+    for slot_number in range(1, pool.slot_count + 1):
+        token = secrets.token_urlsafe(32)
+        label = f"{pool.label} {slot_number:0{width}d}"
+        cursor = connection.execute(
+            """
+            INSERT INTO workers (
+              label, status, app_commit, protocol_version, machine_id, pool_id,
+              pool_slot_token_hash, assigned_threads, assigned_hash_mb, hw, last_seen
+            )
+            VALUES (?, 'offline', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                label,
+                app_commit,
+                protocol_version,
+                machine_id,
+                pool.id,
+                hash_worker_token(token),
+                pool.assigned_threads,
+                pool.assigned_hash_mb,
+                hw.model_dump_json(),
+                utc_now(),
+            ),
+        )
+        credentials.append(
+            WorkerPoolSlotCredential(
+                worker_id=int(cursor.lastrowid),
+                label=label,
+                token=token,
+            )
+        )
+
+    cursor = connection.execute(
+        """
+        UPDATE worker_pools
+        SET enrollment_token_hash = NULL,
+            enrollment_expires_at = NULL,
+            status = 'enrolled',
+            machine_id = ?,
+            enrolled_at = ?
+        WHERE id = ? AND status = 'pending' AND enrollment_token_hash IS NOT NULL
+        """,
+        (machine_id, utc_now(), pool.id),
+    )
+    if cursor.rowcount == 0:
+        raise ValueError("worker pool enrollment was already consumed")
+    return tuple(credentials)
 
 
 def mint_worker_token(
@@ -1023,8 +1434,15 @@ def mint_worker_token(
     *,
     label: str,
     ttl_seconds: int = 7200,
+    assigned_threads: int = 1,
+    assigned_hash_mb: int = 32,
 ) -> WorkerToken:
-    worker_id = create_worker(connection, label=label)
+    worker_id = create_worker(
+        connection,
+        label=label,
+        assigned_threads=assigned_threads,
+        assigned_hash_mb=assigned_hash_mb,
+    )
     return mint_worker_token_for_worker(
         connection,
         worker_id=worker_id,
@@ -1051,6 +1469,7 @@ def mint_worker_token_for_worker(
         WHERE id = ?
           AND status != 'revoked'
           AND session_id IS NULL
+          AND pool_id IS NULL
         """,
         (hash_worker_token(token), expires_at, worker_id),
     )
@@ -1093,6 +1512,19 @@ def get_worker_by_session_id(
     return _worker_from_row(row)
 
 
+def get_worker_by_pool_slot_token(
+    connection: sqlite3.Connection,
+    token: str,
+) -> WorkerRecord | None:
+    row = connection.execute(
+        "SELECT * FROM workers WHERE pool_slot_token_hash = ?",
+        (hash_worker_token(token),),
+    ).fetchone()
+    if row is None:
+        return None
+    return _worker_from_row(row)
+
+
 def worker_token_is_valid(record: WorkerRecord, *, now: datetime | None = None) -> bool:
     if record.status == "revoked":
         return False
@@ -1115,15 +1547,17 @@ def upsert_worker_connection(
     session_id: str,
     app_commit: str,
     protocol_version: int,
+    machine_id: str,
     hw: HardwareInfo,
     status: str = "connected",
 ) -> int:
     connection.execute(
         """
         INSERT INTO workers (
-          id, label, status, session_id, app_commit, protocol_version, hw, last_seen
+          id, label, status, session_id, app_commit, protocol_version, machine_id,
+          hw, last_seen
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           label = excluded.label,
           token_hash = NULL,
@@ -1132,6 +1566,7 @@ def upsert_worker_connection(
           session_id = excluded.session_id,
           app_commit = excluded.app_commit,
           protocol_version = excluded.protocol_version,
+          machine_id = excluded.machine_id,
           hw = excluded.hw,
           last_seen = excluded.last_seen
         WHERE status != 'revoked'
@@ -1143,6 +1578,7 @@ def upsert_worker_connection(
             session_id,
             app_commit,
             protocol_version,
+            machine_id,
             hw.model_dump_json(),
             utc_now(),
         ),
@@ -1163,7 +1599,9 @@ def get_worker(connection: sqlite3.Connection, worker_id: int) -> WorkerRecord |
 def list_workers(connection: sqlite3.Connection) -> tuple[WorkerRecord, ...]:
     return tuple(
         _worker_from_row(row)
-        for row in connection.execute("SELECT * FROM workers ORDER BY id")
+        for row in connection.execute(
+            "SELECT * FROM workers WHERE status != 'revoked' ORDER BY id"
+        )
     )
 
 
@@ -1216,6 +1654,38 @@ def touch_worker_seen(
     return cursor.rowcount > 0
 
 
+def update_worker_dependencies(
+    connection: sqlite3.Connection,
+    worker_id: int,
+    *,
+    available_dependencies: list[str],
+    manifest_revision: str,
+    session_id: str | None = None,
+) -> bool:
+    now = utc_now()
+    cursor = connection.execute(
+        """
+        UPDATE workers
+        SET available_dependencies = ?,
+            dependency_manifest_revision = ?,
+            dependencies_checked_at = ?,
+            last_seen = ?
+        WHERE id = ? AND status != 'revoked'
+          AND (? IS NULL OR session_id = ?)
+        """,
+        (
+            _json_dump(available_dependencies),
+            manifest_revision,
+            now,
+            now,
+            worker_id,
+            session_id,
+            session_id,
+        ),
+    )
+    return cursor.rowcount > 0
+
+
 def disconnect_worker(
     connection: sqlite3.Connection,
     worker_id: int,
@@ -1253,6 +1723,7 @@ def disconnect_worker(
 
 
 def revoke_worker(connection: sqlite3.Connection, worker_id: int) -> None:
+    """Decommission a worker and remove its credentials and worker record."""
     now = utc_now()
     _release_worker_active_assignments(
         connection,
@@ -1260,17 +1731,28 @@ def revoke_worker(connection: sqlite3.Connection, worker_id: int) -> None:
         now=now,
         reason="worker revoked",
     )
+    connection.execute("DELETE FROM workers WHERE id = ?", (worker_id,))
+
+
+def revoke_worker_pool(connection: sqlite3.Connection, pool_id: int) -> None:
+    worker_ids = tuple(
+        int(row["id"])
+        for row in connection.execute(
+            "SELECT id FROM workers WHERE pool_id = ?",
+            (pool_id,),
+        )
+    )
+    for worker_id in worker_ids:
+        revoke_worker(connection, worker_id)
     connection.execute(
         """
-        UPDATE workers
+        UPDATE worker_pools
         SET status = 'revoked',
-            token_hash = NULL,
-            token_expires_at = NULL,
-            session_id = NULL,
-            last_seen = ?
+            enrollment_token_hash = NULL,
+            enrollment_expires_at = NULL
         WHERE id = ?
         """,
-        (now, worker_id),
+        (pool_id,),
     )
 
 
@@ -1331,6 +1813,12 @@ def _release_worker_active_assignments(
 
 def delete_worker(connection: sqlite3.Connection, worker_id: int) -> None:
     """Delete a worker and return its active assignments to the pending pool."""
+    row = connection.execute(
+        "SELECT pool_id FROM workers WHERE id = ?",
+        (worker_id,),
+    ).fetchone()
+    if row is not None and row["pool_id"] is not None:
+        raise ValueError("pool worker slots cannot be deleted individually; revoke the slot instead")
     connection.execute(
         """
         UPDATE games
@@ -1461,30 +1949,54 @@ def suite_opening_count(connection: sqlite3.Connection, suite_id: int) -> int:
 def create_chat_message(
     connection: sqlite3.Connection,
     *,
+    tournament_id: int,
     display_name: str,
     text: str,
 ) -> int:
     cursor = connection.execute(
         """
-        INSERT INTO chat_messages (display_name, text, at)
-        VALUES (?, ?, ?)
+        INSERT INTO chat_messages (tournament_id, display_name, text, at)
+        VALUES (?, ?, ?, ?)
         """,
-        (display_name, text, utc_now()),
+        (tournament_id, display_name, text, utc_now()),
     )
     return int(cursor.lastrowid)
+
+
+def get_chat_message(
+    connection: sqlite3.Connection,
+    message_id: int,
+) -> ChatMessageRecord | None:
+    row = connection.execute(
+        "SELECT * FROM chat_messages WHERE id = ?",
+        (message_id,),
+    ).fetchone()
+    return None if row is None else _chat_message_from_row(row)
 
 
 def list_chat_messages(
     connection: sqlite3.Connection,
     *,
     limit: int = 50,
+    tournament_id: int | None = None,
 ) -> tuple[ChatMessageRecord, ...]:
-    return tuple(
-        _chat_message_from_row(row)
-        for row in connection.execute(
-            "SELECT * FROM chat_messages ORDER BY id DESC LIMIT ?",
+    if tournament_id is None:
+        rows = connection.execute(
+            "SELECT * FROM chat_messages WHERE tournament_id IS NOT NULL ORDER BY id DESC LIMIT ?",
             (limit,),
         )
+    else:
+        rows = connection.execute(
+            """
+            SELECT * FROM chat_messages
+            WHERE tournament_id = ?
+            ORDER BY id DESC LIMIT ?
+            """,
+            (tournament_id, limit),
+        )
+    return tuple(
+        _chat_message_from_row(row)
+        for row in rows
     )
 
 
@@ -1525,8 +2037,18 @@ def update_chat_settings(
     )
 
 
-def delete_chat_message(connection: sqlite3.Connection, message_id: int) -> None:
+def delete_chat_message(
+    connection: sqlite3.Connection,
+    message_id: int,
+) -> ChatMessageRecord | None:
+    row = connection.execute(
+        "SELECT * FROM chat_messages WHERE id = ?",
+        (message_id,),
+    ).fetchone()
+    if row is None:
+        return None
     connection.execute("DELETE FROM chat_messages WHERE id = ?", (message_id,))
+    return _chat_message_from_row(row)
 
 
 def enqueue_runner_command(
@@ -1624,6 +2146,8 @@ def request_tournament_rating_commit(
         raise ValueError("tournament is not complete")
     if not tournament.config.rated:
         raise ValueError("unrated tournament results cannot be committed")
+    if tournament.category_id is None or not tournament.config.category_settings_linked:
+        raise ValueError("custom tournament results cannot be committed to ratings")
 
     existing = get_tournament_rating_commit(connection, tournament.id)
     if existing is not None:
@@ -1699,6 +2223,7 @@ def _engine_from_row(row: sqlite3.Row) -> EngineSpec:
         commit=row["commit_hash"],
         build_cmd=row["build_cmd"],
         binary_path=row["binary_path"],
+        required_dependencies=json.loads(row["required_dependencies"]),
         uci_options=json.loads(row["uci_options"]),
     )
 
@@ -1714,6 +2239,7 @@ def _engine_record_from_row(row: sqlite3.Row) -> EngineRecord:
         commit=row["commit_hash"],
         build_cmd=row["build_cmd"],
         binary_path=row["binary_path"],
+        required_dependencies=tuple(json.loads(row["required_dependencies"])),
         uci_options=json.loads(row["uci_options"]),
         active=bool(row["active"]),
     )
@@ -1741,6 +2267,7 @@ def _opening_from_row(row: sqlite3.Row) -> OpeningRecord:
 def _chat_message_from_row(row: sqlite3.Row) -> ChatMessageRecord:
     return ChatMessageRecord(
         id=row["id"],
+        tournament_id=row["tournament_id"],
         display_name=row["display_name"],
         text=row["text"],
         at=row["at"],
@@ -1748,21 +2275,22 @@ def _chat_message_from_row(row: sqlite3.Row) -> ChatMessageRecord:
 
 
 def _tournament_from_row(row: sqlite3.Row) -> TournamentRecord:
-    config = TournamentConfig.model_validate_json(row["config"])
-    config = config.model_copy(
-        update={
-            "category_id": row["category_id"],
-            "category_settings_linked": not bool(row["settings_unlinked"]),
-        }
+    is_custom = row["category_id"] is None
+    config_data = json.loads(row["config"])
+    config_data.update(
+        category_id=row["category_id"],
+        category_settings_linked=not is_custom,
     )
+    config = TournamentConfig.model_validate(config_data)
     return TournamentRecord(
         id=row["id"],
         name=row["name"],
         category_id=row["category_id"],
-        settings_unlinked=bool(row["settings_unlinked"]),
+        settings_unlinked=is_custom,
         config=config,
         status=row["status"],
         current_round=row["current_round"],
+        worker_profile=row["worker_profile"],
         created_at=row["created_at"],
         started_at=row["started_at"],
         finished_at=row["finished_at"],
@@ -1861,8 +2389,41 @@ def _worker_from_row(row: sqlite3.Row) -> WorkerRecord:
         session_id=row["session_id"],
         app_commit=row["app_commit"],
         protocol_version=row["protocol_version"],
+        machine_id=row["machine_id"],
+        pool_id=row["pool_id"],
+        assigned_threads=row["assigned_threads"],
+        assigned_hash_mb=row["assigned_hash_mb"],
         hw=hw,
+        available_dependencies=tuple(json.loads(row["available_dependencies"])),
+        dependency_manifest_revision=row["dependency_manifest_revision"],
+        dependencies_checked_at=row["dependencies_checked_at"],
         last_seen=row["last_seen"],
+    )
+
+
+def _worker_pool_from_row(row: sqlite3.Row) -> WorkerPoolRecord:
+    return WorkerPoolRecord(
+        id=row["id"],
+        label=row["label"],
+        enrollment_expires_at=row["enrollment_expires_at"],
+        status=row["status"],
+        machine_id=row["machine_id"],
+        slot_count=row["slot_count"],
+        assigned_threads=row["assigned_threads"],
+        assigned_hash_mb=row["assigned_hash_mb"],
+        created_at=row["created_at"],
+        enrolled_at=row["enrolled_at"],
+    )
+
+
+def worker_hardware_profile(hw: HardwareInfo) -> str:
+    return _json_dump(
+        {
+            "cpu_model": hw.cpu_model.strip(),
+            "physical_cores": hw.physical_cores,
+            "logical_cores": hw.logical_cores,
+            "os": hw.os.strip(),
+        }
     )
 
 
