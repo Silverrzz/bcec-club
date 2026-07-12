@@ -692,19 +692,8 @@ def _next_playable_game_for_worker(
     games: tuple[GameRecord, ...],
     worker: WorkerRecord,
 ) -> GameRecord | None:
-    available = set(worker.available_dependencies)
-    for game in games:
-        if game.status != "pending":
-            continue
-        engines = _assignment_engines(connection, game)
-        required = {
-            dependency
-            for engine in engines.values()
-            for dependency in engine.required_dependencies
-        }
-        if required.issubset(available):
-            return game
-    return None
+    del connection, worker
+    return _next_playable_game(games)
 
 
 def _finish_tournament_if_complete(

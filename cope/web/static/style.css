@@ -414,7 +414,7 @@ tbody tr[data-href]:hover {
   background: rgba(62, 207, 142, 0.14);
 }
 
-.badge--building {
+.badge--downloading {
   color: #f0b429;
   background: rgba(240, 180, 41, 0.14);
 }
@@ -1957,7 +1957,7 @@ textarea.input {
   color: #3ecf8e;
 }
 
-.worker-state--minted, .worker-state--pending, .worker-state--building {
+.worker-state--minted, .worker-state--pending, .worker-state--downloading {
   color: #f0b429;
 }
 

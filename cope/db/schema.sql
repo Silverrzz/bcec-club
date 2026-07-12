@@ -3,22 +3,32 @@ CREATE TABLE IF NOT EXISTS schema_metadata (
   value INTEGER NOT NULL
 );
 
-INSERT INTO schema_metadata (key, value) VALUES ('schema_version', 3)
-ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'engines' AND column_name = 'git_url') THEN
+    RAISE EXCEPTION 'legacy source-built engine schema is unsupported; create a fresh database for schema 4';
+  END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS engines (
   id BIGSERIAL PRIMARY KEY,
   name TEXT NOT NULL UNIQUE,
   author TEXT NOT NULL DEFAULT '',
-  version TEXT NOT NULL DEFAULT '',
-  git_url TEXT NOT NULL,
-  branch TEXT NOT NULL DEFAULT '',
-  commit_hash TEXT NOT NULL,
-  build_cmd TEXT NOT NULL,
-  binary_path TEXT NOT NULL,
-  required_dependencies TEXT NOT NULL DEFAULT '[]',
-  uci_options TEXT NOT NULL DEFAULT '{}',
   active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1))
+);
+
+CREATE TABLE IF NOT EXISTS engine_versions (
+  id BIGSERIAL PRIMARY KEY,
+  engine_id BIGINT NOT NULL REFERENCES engines(id) ON DELETE CASCADE,
+  version TEXT NOT NULL,
+  binary_filename TEXT NOT NULL,
+  binary_sha256 TEXT NOT NULL CHECK (binary_sha256 ~ '^[0-9a-f]{64}$'),
+  binary_size BIGINT NOT NULL CHECK (binary_size > 0),
+  storage_key TEXT NOT NULL CHECK (storage_key ~ '^[0-9a-f]{64}$'),
+  uci_options TEXT NOT NULL DEFAULT '{}',
+  active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+  created_at TEXT NOT NULL,
+  UNIQUE (engine_id, version)
 );
 
 CREATE TABLE IF NOT EXISTS categories (
@@ -55,7 +65,7 @@ CREATE TABLE IF NOT EXISTS tournaments (
 
 CREATE TABLE IF NOT EXISTS participants (
   tournament_id BIGINT NOT NULL REFERENCES tournaments(id) ON DELETE CASCADE,
-  engine_id BIGINT NOT NULL REFERENCES engines(id),
+  engine_id BIGINT NOT NULL REFERENCES engine_versions(id),
   seed INTEGER NOT NULL,
   PRIMARY KEY (tournament_id, engine_id),
   UNIQUE (tournament_id, seed)
@@ -66,11 +76,11 @@ CREATE TABLE IF NOT EXISTS tournament_matches (
   tournament_id BIGINT NOT NULL REFERENCES tournaments(id) ON DELETE CASCADE,
   round INTEGER NOT NULL,
   match_index INTEGER NOT NULL,
-  engine1_id BIGINT NOT NULL REFERENCES engines(id),
-  engine2_id BIGINT REFERENCES engines(id),
+  engine1_id BIGINT NOT NULL REFERENCES engine_versions(id),
+  engine2_id BIGINT REFERENCES engine_versions(id),
   status TEXT NOT NULL DEFAULT 'pending'
     CHECK (status IN ('pending', 'finished', 'bye')),
-  winner_engine_id BIGINT REFERENCES engines(id),
+  winner_engine_id BIGINT REFERENCES engine_versions(id),
   UNIQUE (tournament_id, round, match_index)
 );
 
@@ -79,8 +89,8 @@ CREATE TABLE IF NOT EXISTS games (
   tournament_id BIGINT NOT NULL REFERENCES tournaments(id) ON DELETE CASCADE,
   round INTEGER NOT NULL,
   pair_index INTEGER NOT NULL,
-  white_engine_id BIGINT NOT NULL REFERENCES engines(id),
-  black_engine_id BIGINT NOT NULL REFERENCES engines(id),
+  white_engine_id BIGINT NOT NULL REFERENCES engine_versions(id),
+  black_engine_id BIGINT NOT NULL REFERENCES engine_versions(id),
   match_id BIGINT REFERENCES tournament_matches(id) ON DELETE SET NULL,
   game_number INTEGER NOT NULL DEFAULT 1,
   tiebreak_kind TEXT CHECK (tiebreak_kind IS NULL OR tiebreak_kind IN ('extra_pair', 'armageddon')),
@@ -118,7 +128,7 @@ CREATE TABLE IF NOT EXISTS workers (
   token_hash TEXT,
   token_expires_at TEXT,
   status TEXT NOT NULL DEFAULT 'minted'
-    CHECK (status IN ('minted', 'connected', 'building', 'ready', 'busy', 'offline', 'revoked')),
+    CHECK (status IN ('minted', 'connected', 'downloading', 'ready', 'busy', 'offline', 'revoked')),
   session_id TEXT,
   app_commit TEXT,
   protocol_version INTEGER,
@@ -128,9 +138,6 @@ CREATE TABLE IF NOT EXISTS workers (
   assigned_threads INTEGER NOT NULL DEFAULT 1 CHECK (assigned_threads > 0),
   assigned_hash_mb INTEGER NOT NULL DEFAULT 32 CHECK (assigned_hash_mb > 0),
   hw TEXT,
-  available_dependencies TEXT NOT NULL DEFAULT '[]',
-  dependency_manifest_revision TEXT,
-  dependencies_checked_at TEXT,
   last_seen TEXT
 );
 
@@ -155,10 +162,10 @@ CREATE TABLE IF NOT EXISTS worker_failures (
   machine_id TEXT,
   assignment_id BIGINT REFERENCES game_assignments(id) ON DELETE SET NULL,
   game_id BIGINT REFERENCES games(id) ON DELETE SET NULL,
-  engine_id BIGINT REFERENCES engines(id) ON DELETE SET NULL,
+  engine_id BIGINT REFERENCES engine_versions(id) ON DELETE SET NULL,
   engine_name TEXT NOT NULL,
   stage TEXT NOT NULL
-    CHECK (stage IN ('cache', 'clone', 'checkout', 'build', 'verify', 'start', 'runtime')),
+    CHECK (stage IN ('cache', 'download', 'verify', 'start', 'runtime')),
   error TEXT NOT NULL,
   occurred_at TEXT NOT NULL
 );
@@ -187,7 +194,7 @@ CREATE TABLE IF NOT EXISTS moves (
 );
 
 CREATE TABLE IF NOT EXISTS ratings (
-  engine_id BIGINT NOT NULL REFERENCES engines(id),
+  engine_id BIGINT NOT NULL REFERENCES engine_versions(id),
   category_id BIGINT NOT NULL REFERENCES categories(id),
   elo REAL NOT NULL DEFAULT 1500,
   games_played INTEGER NOT NULL DEFAULT 0,
@@ -197,10 +204,10 @@ CREATE TABLE IF NOT EXISTS ratings (
 
 CREATE TABLE IF NOT EXISTS rating_history (
   id BIGSERIAL PRIMARY KEY,
-  engine_id BIGINT NOT NULL REFERENCES engines(id),
+  engine_id BIGINT NOT NULL REFERENCES engine_versions(id),
   category_id BIGINT NOT NULL REFERENCES categories(id),
   tournament_id BIGINT NOT NULL REFERENCES tournaments(id),
-  opponent_engine_id BIGINT NOT NULL REFERENCES engines(id),
+  opponent_engine_id BIGINT NOT NULL REFERENCES engine_versions(id),
   elo_before REAL NOT NULL,
   elo REAL NOT NULL,
   elo_change REAL NOT NULL,
@@ -296,6 +303,9 @@ CREATE INDEX IF NOT EXISTS idx_games_tournament_status ON games(tournament_id, s
 CREATE INDEX IF NOT EXISTS idx_games_round_pair ON games(tournament_id, round, pair_index);
 CREATE INDEX IF NOT EXISTS idx_tournament_matches_round ON tournament_matches(tournament_id, round, match_index);
 CREATE INDEX IF NOT EXISTS idx_rating_history_engine_category_at ON rating_history(engine_id, category_id, at);
+
+INSERT INTO schema_metadata (key, value) VALUES ('schema_version', 4)
+ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
 CREATE INDEX IF NOT EXISTS idx_runner_commands_status_created ON runner_commands(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_workers_status ON workers(status);
 CREATE INDEX IF NOT EXISTS idx_workers_machine_active ON workers(machine_id, status);

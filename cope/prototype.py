@@ -1,22 +1,5 @@
 from __future__ import annotations
 
-from .core.models import (
-    AdjudicationConfig,
-    EngineSpec,
-    IncrementTimeControl,
-    RoundRobinFormatOptions,
-    TournamentConfig,
-    TournamentFormat,
-)
-from .db import (
-    connect_database,
-    create_engine,
-    create_tournament,
-    get_engine,
-    initialize_database,
-    list_engines,
-    list_tournaments,
-)
 from .tournament.engine_instance import EngineInstance
 from .tournament.time_control import RuntimeTimeControl, TimeControlCategory
 from .tournament.tournament import Tournament
@@ -69,60 +52,4 @@ def run_prototype_tournament() -> None:
 
 
 def run_prototype_data_setup() -> None:
-    initialize_database()
-
-    connection = connect_database()
-    try:
-        _seed_engine(
-            connection,
-            EngineSpec(
-                engine_id=1,
-                name="sable",
-                git_url="local",
-                commit="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                build_cmd="true",
-                binary_path="engine",
-            ),
-        )
-        _seed_engine(
-            connection,
-            EngineSpec(
-                engine_id=2,
-                name="lacrima",
-                git_url="local",
-                commit="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                build_cmd="true",
-                binary_path="engine",
-            ),
-        )
-
-        config = TournamentConfig(
-            category_id=1,
-            format=TournamentFormat.ROUND_ROBIN,
-            format_options=RoundRobinFormatOptions(games_per_pairing=2),
-            participants=[1, 2],
-            time_control=IncrementTimeControl(initial_ms=60_000, increment_ms=1_000),
-            concurrency=1,
-            adjudication=AdjudicationConfig(),
-        )
-        tournament_id = create_tournament(
-            connection,
-            "Prototype Persistent RR",
-            config,
-            status="scheduled",
-        )
-        connection.commit()
-
-        print("Database: PostgreSQL")
-        print(f"Persistent engines: {len(list_engines(connection))}")
-        print(f"Persistent tournaments: {len(list_tournaments(connection))}")
-        print(f"Created persistent tournament: {tournament_id}")
-    finally:
-        connection.close()
-
-
-def _seed_engine(connection, spec: EngineSpec) -> None:
-    if get_engine(connection, spec.engine_id) is not None:
-        return
-
-    create_engine(connection, spec)
+    print("Persistent prototype seeding was removed. Register engines and upload versions in the admin app.")

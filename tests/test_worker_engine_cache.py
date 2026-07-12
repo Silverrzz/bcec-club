@@ -1,9 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import tempfile
-import threading
-import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -13,75 +12,79 @@ from cope.core.models import EngineSpec
 from cope.worker.uci_engine import EnginePreparationError, UciEngineProcess
 
 
+BINARY = b"#!/bin/sh\nexit 0\n"
+
+
 def engine_spec() -> EngineSpec:
     return EngineSpec(
         engine_id=1,
         name="Test Engine",
-        git_url="https://example.invalid/engine.git",
-        commit="a" * 40,
-        build_cmd="make",
-        binary_path="bin/engine",
+        author="COPE",
+        version="1.0",
+        binary_url="/api/worker/engine-binaries/1",
+        binary_sha256=hashlib.sha256(BINARY).hexdigest(),
+        binary_size=len(BINARY),
+    )
+
+
+def process(spec: EngineSpec | None = None) -> UciEngineProcess:
+    return UciEngineProcess(
+        spec or engine_spec(),
+        server_url="wss://cope.invalid/worker",
+        credential="worker-session",
     )
 
 
 class MachineEngineCacheTests(unittest.TestCase):
-    def test_concurrent_slots_build_exact_engine_once(self) -> None:
+    def test_concurrent_slots_download_exact_binary_once(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_root:
-            clone_count = 0
-            count_lock = threading.Lock()
+            downloads = 0
 
-            def fake_run(command, *, cwd, shell=False):
-                nonlocal clone_count
-                if isinstance(command, list) and command[:2] == ["git", "clone"]:
-                    with count_lock:
-                        clone_count += 1
-                    checkout = Path(command[-1])
-                    (checkout / "bin").mkdir(parents=True)
-                    (checkout / "bin" / "engine").write_text("engine", encoding="utf-8")
-                    time.sleep(0.05)
+            def fake_download(url, destination, **kwargs):
+                nonlocal downloads
+                downloads += 1
+                self.assertEqual(url, "https://cope.invalid/api/worker/engine-binaries/1")
+                self.assertEqual(kwargs["credential"], "worker-session")
+                destination.write_bytes(BINARY)
 
             with (
                 patch.dict(os.environ, {"COPE_WORKER_ENGINE_DIR": temporary_root}),
-                patch("cope.worker.uci_engine._run_checked", side_effect=fake_run),
+                patch("cope.worker.uci_engine._download_binary", side_effect=fake_download),
             ):
-                engines = [UciEngineProcess(engine_spec()) for _ in range(32)]
+                engines = [process() for _ in range(32)]
                 with ThreadPoolExecutor(max_workers=32) as executor:
                     list(executor.map(lambda engine: engine.prepare(), engines))
 
-                self.assertEqual(clone_count, 1)
+                self.assertEqual(downloads, 1)
                 self.assertEqual(len({engine._source_dir for engine in engines}), 1)
-                self.assertTrue(engines[0]._binary_path.is_file())
+                self.assertEqual(engines[0]._binary_path.read_bytes(), BINARY)
 
-    def test_concurrent_slots_share_recent_build_failure(self) -> None:
+    def test_hash_mismatch_is_shared_as_recent_machine_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_root:
-            attempt_count = 0
-            count_lock = threading.Lock()
-
-            def failed_run(command, *, cwd, shell=False):
-                nonlocal attempt_count
-                if isinstance(command, list) and command[:2] == ["git", "clone"]:
-                    with count_lock:
-                        attempt_count += 1
-                    time.sleep(0.05)
-                    raise RuntimeError("expected build failure")
+            def bad_download(url, destination, **kwargs):
+                destination.write_bytes(b"corrupt")
 
             def prepare_and_capture(engine: UciEngineProcess) -> str:
                 try:
                     engine.prepare()
                 except EnginePreparationError as error:
-                    return str(error)
+                    return f"{error.stage}: {error.detail}"
                 self.fail("engine preparation unexpectedly succeeded")
 
             with (
                 patch.dict(os.environ, {"COPE_WORKER_ENGINE_DIR": temporary_root}),
-                patch("cope.worker.uci_engine._run_checked", side_effect=failed_run),
+                patch("cope.worker.uci_engine._download_binary", side_effect=bad_download),
             ):
-                engines = [UciEngineProcess(engine_spec()) for _ in range(32)]
-                with ThreadPoolExecutor(max_workers=32) as executor:
-                    errors = list(executor.map(prepare_and_capture, engines))
+                errors = [prepare_and_capture(process()), prepare_and_capture(process())]
 
-                self.assertEqual(attempt_count, 1)
-                self.assertTrue(all("expected build failure" in error for error in errors))
+            self.assertIn("verify: SHA-256 mismatch", errors[0])
+            self.assertIn("recent machine-wide download attempt failed", errors[1])
+
+    def test_same_artifact_is_shared_between_registered_versions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_root:
+            second = engine_spec().model_copy(update={"engine_id": 2, "version": "2.0", "binary_url": "/api/worker/engine-binaries/2"})
+            with patch.dict(os.environ, {"COPE_WORKER_ENGINE_DIR": temporary_root}):
+                self.assertEqual(process()._source_dir, process(second)._source_dir)
 
 
 if __name__ == "__main__":

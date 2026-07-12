@@ -1,30 +1,13 @@
 from __future__ import annotations
 
-import re
 from enum import StrEnum
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
-PROTOCOL_VERSION = 5
+PROTOCOL_VERSION = 6
 UciOptionValue = str | int | bool
-DEPENDENCY_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+:-]{0,79}$")
-
-
-def normalize_required_dependencies(values: list[str]) -> list[str]:
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for raw_value in values:
-        value = raw_value.strip()
-        if not value or not DEPENDENCY_NAME_PATTERN.fullmatch(value):
-            raise ValueError(
-                "dependency names must be executable names without paths, arguments, or shell syntax"
-            )
-        if value not in seen:
-            seen.add(value)
-            normalized.append(value)
-    return normalized
 
 
 class StrictModel(BaseModel):
@@ -99,21 +82,12 @@ class AdjudicationConfig(StrictModel):
 class EngineSpec(StrictModel):
     engine_id: int = Field(gt=0)
     name: str = Field(min_length=1, max_length=80)
-    version: str = Field(default="", max_length=80)
-    git_url: str = Field(min_length=1)
-    branch: str = Field(default="", max_length=120)
-    commit: str
-    build_cmd: str = Field(min_length=1)
-    binary_path: str = Field(min_length=1)
-    required_dependencies: list[str] = Field(default_factory=list)
+    author: str = Field(default="", max_length=120)
+    version: str = Field(min_length=1, max_length=80)
+    binary_url: str = Field(min_length=1, max_length=500)
+    binary_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    binary_size: int = Field(gt=0)
     uci_options: dict[str, UciOptionValue] = Field(default_factory=dict)
-
-    @field_validator("commit")
-    @classmethod
-    def validate_commit(cls, value: str) -> str:
-        if len(value) != 40 or any(char not in "0123456789abcdefABCDEF" for char in value):
-            raise ValueError("commit must be a full 40-character hex SHA")
-        return value.lower()
 
     @field_validator("uci_options")
     @classmethod
@@ -123,10 +97,6 @@ class EngineSpec(StrictModel):
                 raise ValueError("uci option names must be non-empty")
         return value
 
-    @field_validator("required_dependencies")
-    @classmethod
-    def validate_required_dependencies(cls, value: list[str]) -> list[str]:
-        return normalize_required_dependencies(value)
 
 
 class TournamentFormat(StrEnum):
@@ -358,41 +328,12 @@ class AssignmentReady(AssignmentMessage):
         return value
 
 
-class AssignmentRejected(AssignmentMessage):
-    reason: Literal["missing_dependencies"]
-    missing_dependencies: list[str] = Field(min_length=1)
-
-    @field_validator("missing_dependencies")
-    @classmethod
-    def validate_missing_dependencies(cls, value: list[str]) -> list[str]:
-        return normalize_required_dependencies(value)
-
-
 class AssignmentFailed(AssignmentMessage):
     engine_id: int = Field(gt=0)
     engine_name: str = Field(min_length=1, max_length=80)
-    stage: Literal["cache", "clone", "checkout", "build", "verify", "start", "runtime"]
+    stage: Literal["cache", "download", "verify", "start", "runtime"]
     error: str = Field(min_length=1, max_length=8000)
 
-
-class DependencyProbe(StrictModel):
-    revision: str = Field(min_length=16, max_length=128)
-    required_dependencies: list[str] = Field(default_factory=list)
-
-    @field_validator("required_dependencies")
-    @classmethod
-    def validate_required_dependencies(cls, value: list[str]) -> list[str]:
-        return normalize_required_dependencies(value)
-
-
-class DependencyReport(StrictModel):
-    revision: str = Field(min_length=16, max_length=128)
-    available_dependencies: list[str] = Field(default_factory=list)
-
-    @field_validator("available_dependencies")
-    @classmethod
-    def validate_available_dependencies(cls, value: list[str]) -> list[str]:
-        return normalize_required_dependencies(value)
 
 class BenchInfo(StrictModel):
     nps_probe: int | None = Field(default=None, gt=0)
@@ -480,11 +421,10 @@ class WorkerWelcome(StrictModel):
     session_id: str = Field(min_length=1)
     heartbeat_interval_ms: int = Field(gt=0)
     resources: WorkerResources
-    dependency_probe: DependencyProbe
 
 
 class Envelope(StrictModel):
-    v: Literal[5] = PROTOCOL_VERSION
+    v: Literal[6] = PROTOCOL_VERSION
     type: str = Field(min_length=1)
     seq: int = Field(ge=0)
     t_mono_ms: int = Field(ge=0)

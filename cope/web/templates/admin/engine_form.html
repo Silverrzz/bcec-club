@@ -1,83 +1,15 @@
 {% extends "admin/base.html" %}
-{% from "_macros.html" import flash %}
-
-{% block title %}{{ engine.name if engine else "New engine" }} - COPE Admin{% endblock %}
-
+{% block title %}Engine - COPE Admin{% endblock %}
 {% block content %}
-  <header class="admin-page-title">
-    <h1>{{ "Edit " ~ engine.name if engine else "Register engine" }}</h1>
-    <a class="button button--ghost" href="/admin/engines">&larr; All engines</a>
-  </header>
-
-  {{ flash(notice, error, errors) }}
-
-  <form class="panel settings-form" method="post"
-        action="{{ '/admin/engines/' ~ engine.id if engine else '/admin/engines' }}">
-    <fieldset class="form-section">
-      <legend>Identity</legend>
-      <div class="field-row">
-        <div class="field">
-          <label for="name">Name</label>
-          <input class="input" id="name" name="name" value="{{ values.get('name', '') }}" required>
-        </div>
-        <div class="field">
-          <label for="author">Author <span class="field-optional">(optional)</span></label>
-          <input class="input" id="author" name="author" value="{{ values.get('author', '') }}">
-        </div>
-        <div class="field">
-          <label for="version">Version <span class="field-optional">(optional)</span></label>
-          <input class="input" id="version" name="version" value="{{ values.get('version', '') }}" placeholder="e.g. 17.1, 2026-07, nnue-abc123">
-        </div>
-      </div>
-      <div class="field field--checkbox">
-        <label>
-          <input type="checkbox" name="active" {% if values.get('active', true) %}checked{% endif %}>
-          Active (selectable for new tournaments)
-        </label>
-      </div>
-    </fieldset>
-
-    <fieldset class="form-section">
-      <legend>Source &amp; build</legend>
-      <div class="field">
-        <label for="git_url">Git URL</label>
-        <input class="input" id="git_url" name="git_url" value="{{ values.get('git_url', '') }}" required placeholder="https://github.com/user/engine">
-      </div>
-      <div class="field">
-        <label for="branch">Branch <span class="field-optional">(optional)</span></label>
-        <input class="input" id="branch" name="branch" value="{{ values.get('branch', '') }}" placeholder="main">
-      </div>
-      <div class="field">
-        <label for="commit">Commit SHA</label>
-        <input class="input" id="commit" name="commit" value="{{ values.get('commit', '') }}" required
-               pattern="[0-9a-fA-F]{40}" title="Full 40-character commit SHA" placeholder="40-character commit hash">
-      </div>
-      <div class="field">
-        <label for="build_cmd">Build command</label>
-        <input class="input" id="build_cmd" name="build_cmd" value="{{ values.get('build_cmd', '') }}" required placeholder="make release">
-      </div>
-      <div class="field">
-        <label for="binary_path">Binary path</label>
-        <input class="input" id="binary_path" name="binary_path" value="{{ values.get('binary_path', '') }}" required placeholder="build/engine.exe">
-        <p class="field-help">Path to the built UCI binary, relative to the repository root.</p>
-      </div>
-      <div class="field">
-        <label for="required_dependencies">Required executables <span class="field-optional">(optional)</span></label>
-        <textarea class="input" id="required_dependencies" name="required_dependencies" rows="4" placeholder="clang++&#10;cmake&#10;cargo">{{ values.get('required_dependencies', '') }}</textarea>
-        <p class="field-help">One executable name per line. COPE checks the worker service PATH but never installs software.</p>
-      </div>
-    </fieldset>
-
-    <fieldset class="form-section">
-      <legend>UCI options</legend>
-      <div class="field">
-        <label for="uci_options">One option per line, as <code>Name = value</code></label>
-        <textarea class="input" id="uci_options" name="uci_options" rows="4" placeholder="Hash = 256&#10;Threads = 1">{{ uci_options_text }}</textarea>
-      </div>
-    </fieldset>
-
-    <div class="form-actions">
-      <button class="button button--primary" type="submit">{{ "Save changes" if engine else "Register engine" }}</button>
-    </div>
-  </form>
+<h1>{{ "Edit engine" if engine else "Register engine" }}</h1>
+<form class="panel settings-form" method="post" action="{{ '/admin/engines/' ~ engine.id if engine else '/admin/engines' }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <label for="name">Engine name</label>
+  <input class="input" id="name" name="name" value="{{ values.get('name', '') }}" required maxlength="80">
+  <label for="author">Author</label>
+  <input class="input" id="author" name="author" value="{{ values.get('author', '') }}" maxlength="120">
+  <label><input type="checkbox" name="active" {% if values.get('active', true) %}checked{% endif %}> Active</label>
+  <p class="muted">Save the identity, then use the current admin app to upload and manage runnable versions.</p>
+  <button class="button" type="submit">Save engine</button>
+</form>
 {% endblock %}

@@ -118,9 +118,6 @@ class WorkerRecord:
     assigned_threads: int
     assigned_hash_mb: int
     hw: HardwareInfo | None
-    available_dependencies: tuple[str, ...]
-    dependency_manifest_revision: str | None
-    dependencies_checked_at: str | None
     last_seen: str | None
 
     @property
@@ -152,15 +149,25 @@ class EngineRecord:
     id: int
     name: str
     author: str
+    active: bool
+
+
+@dataclass(frozen=True, slots=True)
+class EngineVersionRecord:
+    id: int
+    engine_id: int
+    name: str
+    author: str
     version: str
-    git_url: str
-    branch: str
-    commit: str
-    build_cmd: str
-    binary_path: str
-    required_dependencies: tuple[str, ...]
+    binary_filename: str
+    binary_sha256: str
+    binary_size: int
+    storage_key: str
     uci_options: dict[str, Any]
     active: bool
+    version_active: bool
+    engine_active: bool
+    created_at: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -344,40 +351,16 @@ def list_service_heartbeats(connection: sqlite3.Connection) -> tuple[dict[str, s
 
 def create_engine(
     connection: sqlite3.Connection,
-    spec: EngineSpec,
     *,
+    name: str,
     author: str = "",
     active: bool = True,
 ) -> int:
-    connection.execute(
-        """
-        INSERT INTO engines (
-          id, name, author, version, git_url, branch, commit_hash, build_cmd, binary_path,
-          required_dependencies, uci_options, active
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            spec.engine_id,
-            spec.name,
-            author,
-            spec.version,
-            spec.git_url,
-            spec.branch,
-            spec.commit,
-            spec.build_cmd,
-            spec.binary_path,
-            _json_dump(spec.required_dependencies),
-            _json_dump(spec.uci_options),
-            int(active),
-        ),
+    cursor = connection.execute(
+        "INSERT INTO engines (name, author, active) VALUES (?, ?, ?)",
+        (name, author, int(active)),
     )
-    return spec.engine_id
-
-
-def next_engine_id(connection: sqlite3.Connection) -> int:
-    row = connection.execute("SELECT COALESCE(MAX(id), 0) AS max_id FROM engines").fetchone()
-    return int(row["max_id"]) + 1
+    return int(cursor.lastrowid)
 
 
 def update_engine(
@@ -386,37 +369,47 @@ def update_engine(
     *,
     name: str,
     author: str = "",
-    git_url: str,
-    branch: str = "",
-    commit: str,
-    build_cmd: str,
-    binary_path: str,
-    required_dependencies: list[str] | None = None,
-    version: str = "",
-    uci_options: dict[str, Any] | None = None,
     active: bool = True,
 ) -> None:
     connection.execute(
-        """
-        UPDATE engines
-        SET name = ?, author = ?, version = ?, git_url = ?, branch = ?, commit_hash = ?, build_cmd = ?,
-            binary_path = ?, required_dependencies = ?, uci_options = ?, active = ?
-        WHERE id = ?
-        """,
-        (
-            name,
-            author,
-            version,
-            git_url,
-            branch,
-            commit,
-            build_cmd,
-            binary_path,
-            _json_dump(required_dependencies or []),
-            _json_dump(uci_options or {}),
-            int(active),
-            engine_id,
-        ),
+        "UPDATE engines SET name = ?, author = ?, active = ? WHERE id = ?",
+        (name, author, int(active), engine_id),
+    )
+
+
+def create_engine_version(
+    connection: sqlite3.Connection,
+    *,
+    engine_id: int,
+    version: str,
+    binary_filename: str,
+    binary_sha256: str,
+    binary_size: int,
+    storage_key: str,
+    uci_options: dict[str, Any] | None = None,
+    active: bool = True,
+) -> int:
+    cursor = connection.execute(
+        """INSERT INTO engine_versions
+           (engine_id, version, binary_filename, binary_sha256, binary_size, storage_key,
+            uci_options, active, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (engine_id, version, binary_filename, binary_sha256, binary_size, storage_key,
+         _json_dump(uci_options or {}), int(active), utc_now()),
+    )
+    return int(cursor.lastrowid)
+
+
+def update_engine_version(
+    connection: sqlite3.Connection,
+    version_id: int,
+    *,
+    uci_options: dict[str, Any],
+    active: bool,
+) -> None:
+    connection.execute(
+        "UPDATE engine_versions SET uci_options = ?, active = ? WHERE id = ?",
+        (_json_dump(uci_options), int(active), version_id),
     )
 
 
@@ -429,37 +422,70 @@ def engine_game_count(connection: sqlite3.Connection, engine_id: int) -> int:
 
 
 def delete_engine(connection: sqlite3.Connection, engine_id: int) -> None:
-    """Delete an engine. Raises ValueError if it has recorded games or participations."""
-    if engine_game_count(connection, engine_id) > 0:
-        raise ValueError("engine has recorded games; deactivate it instead of deleting")
-    row = connection.execute(
-        "SELECT COUNT(*) AS count FROM participants WHERE engine_id = ?",
-        (engine_id,),
-    ).fetchone()
+    row = connection.execute("SELECT COUNT(*) AS count FROM engine_versions WHERE engine_id = ?", (engine_id,)).fetchone()
     if int(row["count"]) > 0:
-        raise ValueError("engine participates in tournaments; deactivate it instead of deleting")
-    connection.execute("DELETE FROM ratings WHERE engine_id = ?", (engine_id,))
+        raise ValueError("engine has versions; delete those versions first")
     connection.execute("DELETE FROM engines WHERE id = ?", (engine_id,))
+
+
+def delete_engine_version(connection: sqlite3.Connection, version_id: int) -> str:
+    if engine_game_count(connection, version_id) > 0:
+        raise ValueError("engine version has recorded games; deactivate it instead of deleting")
+    row = connection.execute("SELECT COUNT(*) AS count FROM participants WHERE engine_id = ?", (version_id,)).fetchone()
+    if int(row["count"]) > 0:
+        raise ValueError("engine version participates in tournaments; deactivate it instead")
+    record = get_engine_version_record(connection, version_id)
+    if record is None:
+        raise ValueError("engine version not found")
+    connection.execute("DELETE FROM ratings WHERE engine_id = ?", (version_id,))
+    connection.execute("DELETE FROM engine_versions WHERE id = ?", (version_id,))
+    return record.storage_key
 
 
 def get_engine_record(
     connection: sqlite3.Connection,
     engine_id: int,
-) -> EngineRecord | None:
+) -> EngineVersionRecord | None:
+    return get_engine_version_record(connection, engine_id)
+
+
+def get_engine_family(connection: sqlite3.Connection, engine_id: int) -> EngineRecord | None:
+    row = connection.execute("SELECT * FROM engines WHERE id = ?", (engine_id,)).fetchone()
+    return None if row is None else _engine_record_from_row(row)
+
+
+def get_engine_version_record(connection: sqlite3.Connection, version_id: int) -> EngineVersionRecord | None:
     row = connection.execute(
-        "SELECT * FROM engines WHERE id = ?",
-        (engine_id,),
+        """SELECT version.*, engine.name, engine.author, engine.active AS engine_active
+           FROM engine_versions version JOIN engines engine ON engine.id = version.engine_id
+           WHERE version.id = ?""",
+        (version_id,),
     ).fetchone()
     if row is None:
         return None
-    return _engine_record_from_row(row)
+    return _engine_version_from_row(row)
 
 
-def list_engine_records(connection: sqlite3.Connection) -> tuple[EngineRecord, ...]:
+def list_engine_families(connection: sqlite3.Connection) -> tuple[EngineRecord, ...]:
     return tuple(
         _engine_record_from_row(row)
         for row in connection.execute("SELECT * FROM engines ORDER BY name")
     )
+
+
+def list_engine_records(connection: sqlite3.Connection) -> tuple[EngineVersionRecord, ...]:
+    return tuple(
+        _engine_version_from_row(row)
+        for row in connection.execute(
+            """SELECT version.*, engine.name, engine.author, engine.active AS engine_active
+               FROM engine_versions version JOIN engines engine ON engine.id = version.engine_id
+               ORDER BY engine.name, version.created_at DESC, version.id DESC"""
+        )
+    )
+
+
+def list_engine_versions(connection: sqlite3.Connection, engine_id: int) -> tuple[EngineVersionRecord, ...]:
+    return tuple(record for record in list_engine_records(connection) if record.engine_id == engine_id)
 
 
 def create_category(
@@ -557,7 +583,9 @@ def delete_category(connection: sqlite3.Connection, category_id: int) -> None:
 
 def get_engine(connection: sqlite3.Connection, engine_id: int) -> EngineSpec | None:
     row = connection.execute(
-        "SELECT * FROM engines WHERE id = ?",
+        """SELECT version.*, engine.name, engine.author, engine.active AS engine_active
+           FROM engine_versions version JOIN engines engine ON engine.id = version.engine_id
+           WHERE version.id = ?""",
         (engine_id,),
     ).fetchone()
     if row is None:
@@ -566,12 +594,13 @@ def get_engine(connection: sqlite3.Connection, engine_id: int) -> EngineSpec | N
 
 
 def list_engines(connection: sqlite3.Connection, *, active_only: bool = False) -> tuple[EngineSpec, ...]:
-    sql = "SELECT * FROM engines"
+    sql = """SELECT version.*, engine.name, engine.author, engine.active AS engine_active
+             FROM engine_versions version JOIN engines engine ON engine.id = version.engine_id"""
     params: tuple[Any, ...] = ()
     if active_only:
-        sql = f"{sql} WHERE active = ?"
-        params = (1,)
-    sql = f"{sql} ORDER BY id"
+        sql = f"{sql} WHERE version.active = ? AND engine.active = ?"
+        params = (1, 1)
+    sql = f"{sql} ORDER BY version.id"
     return tuple(_engine_from_row(row) for row in connection.execute(sql, params))
 
 
@@ -1367,7 +1396,7 @@ def enroll_worker_pool(
               AND status != 'revoked'
               AND (
                 pool_id IS NOT NULL
-                OR status IN ('connected', 'building', 'ready', 'busy')
+                OR status IN ('connected', 'downloading', 'ready', 'busy')
               )
             """,
             (machine_id,),
@@ -1737,7 +1766,7 @@ def touch_worker_seen(
         UPDATE workers
         SET last_seen = ?
         WHERE id = ?
-          AND status IN ('connected', 'building', 'ready', 'busy')
+          AND status IN ('connected', 'downloading', 'ready', 'busy')
           AND (CAST(? AS TEXT) IS NULL OR session_id = ?)
         """,
         (utc_now(), worker_id, session_id, session_id),
@@ -1764,62 +1793,12 @@ def touch_workers_seen(
         FROM (VALUES {values}) AS live(worker_id, session_id)
         WHERE worker.id = live.worker_id
           AND worker.session_id = live.session_id
-          AND worker.status IN ('connected', 'building', 'ready', 'busy')
+          AND worker.status IN ('connected', 'downloading', 'ready', 'busy')
         RETURNING worker.id
         """,
         parameters,
     ).fetchall()
     return {int(row["id"]) for row in rows}
-
-
-def update_worker_dependencies(
-    connection: sqlite3.Connection,
-    worker_id: int,
-    *,
-    available_dependencies: list[str],
-    manifest_revision: str,
-    session_id: str | None = None,
-) -> tuple[bool, bool]:
-    now = utc_now()
-    current = connection.execute(
-        """
-        SELECT available_dependencies, dependency_manifest_revision
-        FROM workers
-        WHERE id = ? AND status != 'revoked'
-          AND (CAST(? AS TEXT) IS NULL OR session_id = ?)
-        """,
-        (worker_id, session_id, session_id),
-    ).fetchone()
-    if current is None:
-        return False, False
-    serialized = _json_dump(available_dependencies)
-    changed = (
-        current["available_dependencies"] != serialized
-        or current["dependency_manifest_revision"] != manifest_revision
-    )
-    if not changed:
-        return True, False
-    cursor = connection.execute(
-        """
-        UPDATE workers
-        SET available_dependencies = ?,
-            dependency_manifest_revision = ?,
-            dependencies_checked_at = ?,
-            last_seen = ?
-        WHERE id = ? AND status != 'revoked'
-          AND (CAST(? AS TEXT) IS NULL OR session_id = ?)
-        """,
-        (
-            serialized,
-            manifest_revision,
-            now,
-            now,
-            worker_id,
-            session_id,
-            session_id,
-        ),
-    )
-    return cursor.rowcount > 0, True
 
 
 def disconnect_worker(
@@ -2353,13 +2332,11 @@ def _engine_from_row(row: sqlite3.Row) -> EngineSpec:
     return EngineSpec(
         engine_id=row["id"],
         name=row["name"],
+        author=row["author"],
         version=row["version"],
-        git_url=row["git_url"],
-        branch=row["branch"],
-        commit=row["commit_hash"],
-        build_cmd=row["build_cmd"],
-        binary_path=row["binary_path"],
-        required_dependencies=json.loads(row["required_dependencies"]),
+        binary_url=f"/api/worker/engine-binaries/{row['id']}",
+        binary_sha256=row["binary_sha256"],
+        binary_size=row["binary_size"],
         uci_options=json.loads(row["uci_options"]),
     )
 
@@ -2369,15 +2346,19 @@ def _engine_record_from_row(row: sqlite3.Row) -> EngineRecord:
         id=row["id"],
         name=row["name"],
         author=row["author"],
-        version=row["version"],
-        git_url=row["git_url"],
-        branch=row["branch"],
-        commit=row["commit_hash"],
-        build_cmd=row["build_cmd"],
-        binary_path=row["binary_path"],
-        required_dependencies=tuple(json.loads(row["required_dependencies"])),
-        uci_options=json.loads(row["uci_options"]),
         active=bool(row["active"]),
+    )
+
+
+def _engine_version_from_row(row: sqlite3.Row) -> EngineVersionRecord:
+    return EngineVersionRecord(
+        id=row["id"], engine_id=row["engine_id"], name=row["name"], author=row["author"],
+        version=row["version"], binary_filename=row["binary_filename"],
+        binary_sha256=row["binary_sha256"], binary_size=row["binary_size"],
+        storage_key=row["storage_key"], uci_options=json.loads(row["uci_options"]),
+        active=bool(row["active"]) and bool(row.get("engine_active", True)),
+        version_active=bool(row["active"]), engine_active=bool(row.get("engine_active", True)),
+        created_at=row["created_at"],
     )
 
 
@@ -2530,9 +2511,6 @@ def _worker_from_row(row: sqlite3.Row) -> WorkerRecord:
         assigned_threads=row["assigned_threads"],
         assigned_hash_mb=row["assigned_hash_mb"],
         hw=hw,
-        available_dependencies=tuple(json.loads(row["available_dependencies"])),
-        dependency_manifest_revision=row["dependency_manifest_revision"],
-        dependencies_checked_at=row["dependencies_checked_at"],
         last_seen=row["last_seen"],
     )
 

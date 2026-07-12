@@ -56,12 +56,14 @@ _DB_STAT_TABLES = (
 
 def get_engine_name(connection: sqlite3.Connection, engine_id: int) -> str:
     row = connection.execute(
-        "SELECT name FROM engines WHERE id = ?",
+        """SELECT engine.name, version.version
+           FROM engine_versions version JOIN engines engine ON engine.id = version.engine_id
+           WHERE version.id = ?""",
         (engine_id,),
     ).fetchone()
     if row is None:
         return f"Engine {engine_id}"
-    return row["name"]
+    return " ".join(part for part in (row["name"], row["version"]) if part)
 
 
 def get_opening_position(
@@ -153,11 +155,13 @@ def list_rating_rows(
 
     rows = connection.execute(
         """
-        SELECT engines.*, ratings.elo, ratings.games_played, ratings.updated_at
+        SELECT version.*, engine.name, engine.author, engine.active AS engine_active,
+               ratings.elo, ratings.games_played, ratings.updated_at
         FROM ratings
-        JOIN engines ON engines.id = ratings.engine_id
+        JOIN engine_versions version ON version.id = ratings.engine_id
+        JOIN engines engine ON engine.id = version.engine_id
         WHERE ratings.category_id = ?
-        ORDER BY ratings.elo DESC, engines.name
+        ORDER BY ratings.elo DESC, engine.name, version.version
         """,
         (category_id,),
     )
@@ -327,7 +331,7 @@ def active_engine_hardware_profiles(
         JOIN games ON games.id = game_assignments.game_id
         LEFT JOIN workers
           ON workers.id = game_assignments.worker_id
-          AND workers.status IN ('connected', 'building', 'ready', 'busy')
+          AND workers.status IN ('connected', 'downloading', 'ready', 'busy')
         WHERE games.tournament_id = ?
           AND games.status IN ('assigned', 'live')
           AND game_assignments.status IN ('assigned', 'acked', 'live')

@@ -5,7 +5,6 @@ import hashlib
 import logging
 import os
 import platform
-import shutil
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -17,9 +16,6 @@ from websockets.exceptions import ConnectionClosed
 from cope.core.models import (
     AssignmentComplete,
     AssignmentFailed,
-    AssignmentRejected,
-    DependencyProbe,
-    DependencyReport,
     AssignmentReady,
     BenchInfo,
     EngineCommand,
@@ -116,7 +112,6 @@ async def _run_worker_connection(
                 "runner accepted a different resource reservation than the worker requested"
             )
         state.session_id = welcome.session_id
-        await _send_dependency_report(websocket, welcome.dependency_probe)
         state.connected = True
         LOG.info(
             "accepted by runner worker_id=%s session=%s",
@@ -125,10 +120,6 @@ async def _run_worker_connection(
         )
         while True:
             envelope = await _recv_envelope(websocket)
-            if envelope.type == "dependency_probe":
-                probe = DependencyProbe.model_validate(envelope.data)
-                await _send_dependency_report(websocket, probe)
-                continue
             if envelope.type != "assignment":
                 raise ProtocolValidationError(f"unexpected runner message: {envelope.type}")
             assignment = WorkerGameAssignment.model_validate(envelope.data)
@@ -140,7 +131,12 @@ async def _run_worker_connection(
                     f"{connection_config.resources.threads} threads and "
                     f"{connection_config.resources.hash_mb}MB hash"
                 )
-            await _serve_assignment(websocket, assignment)
+            await _serve_assignment(
+                websocket,
+                assignment,
+                server_url=connection_config.server_url,
+                credential=welcome.session_id,
+            )
 
 
 def _build_hello(
@@ -189,34 +185,12 @@ def _build_hello(
 async def _serve_assignment(
     websocket,
     assignment: WorkerGameAssignment,
+    *,
+    server_url: str,
+    credential: str,
 ) -> None:
-    missing_dependencies = sorted(
-        {
-            dependency
-            for engine in assignment.engines.values()
-            for dependency in engine.required_dependencies
-            if shutil.which(dependency) is None
-        }
-    )
-    if missing_dependencies:
-        await _send_message(
-            websocket,
-            "assignment_rejected",
-            AssignmentRejected(
-                **assignment.assignment.message_fields(),
-                reason="missing_dependencies",
-                missing_dependencies=missing_dependencies,
-            ),
-        )
-        LOG.warning(
-            "assignment rejected assignment_id=%s missing_dependencies=%s",
-            assignment.assignment.assignment_id,
-            ",".join(missing_dependencies),
-        )
-        return
-
     engines = {
-        engine_id: UciEngineProcess(engine)
+        engine_id: UciEngineProcess(engine, server_url=server_url, credential=credential)
         for engine_id, engine in assignment.engines.items()
     }
     engine_names = ", ".join(engine.name for engine in assignment.engines.values())
@@ -388,22 +362,6 @@ async def _wait_for_failed_assignment_complete(
         raise ProtocolValidationError(
             f"unexpected runner message after engine failure: {envelope.type}"
         )
-
-
-async def _send_dependency_report(websocket, probe: DependencyProbe) -> None:
-    available = [
-        dependency
-        for dependency in probe.required_dependencies
-        if shutil.which(dependency) is not None
-    ]
-    await _send_message(
-        websocket,
-        "dependency_report",
-        DependencyReport(
-            revision=probe.revision,
-            available_dependencies=available,
-        ),
-    )
 
 
 def _validate_assignment_message(

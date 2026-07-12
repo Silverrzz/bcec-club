@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hashlib
 import logging
 import secrets
 import threading
@@ -19,10 +18,7 @@ from websockets.server import WebSocketServerProtocol, serve
 from cope.core.models import (
     AssignmentComplete,
     AssignmentFailed,
-    AssignmentRejected,
     AssignmentReady,
-    DependencyProbe,
-    DependencyReport,
     EngineCommand,
     EngineCommandResult,
     EngineInfo,
@@ -59,13 +55,11 @@ from cope.db import (
     get_worker_pool_by_token,
     enroll_worker_pool,
     list_workers,
-    list_engine_records,
     record_worker_failure,
     set_service_endpoint,
     touch_workers_seen,
     touch_service_heartbeat,
     update_worker_status,
-    update_worker_dependencies,
     upsert_worker_connection,
     worker_token_is_valid,
 )
@@ -84,13 +78,8 @@ from cope.runner.events import (
 
 LOG = logging.getLogger("cope.worker_server")
 WORKER_CONNECTION_REPLACED_CLOSE_CODE = 4001
-ASSIGNABLE_WORKER_STATUSES = {"connected", "building", "ready", "busy"}
-DEPENDENCY_PROBE_CACHE_S = 5.0
+ASSIGNABLE_WORKER_STATUSES = {"connected", "downloading", "ready", "busy"}
 ENGINE_FAILURE_BACKOFF_S = 60.0
-
-
-class AssignmentDependencyRejected(RuntimeError):
-    pass
 
 
 class AssignmentPreparationFailed(RuntimeError):
@@ -110,7 +99,6 @@ class WorkerServerConfig:
     heartbeat_interval_ms: int = 5000
     assignment_poll_interval_s: float = 10.0
     presence_flush_interval_s: float = 15.0
-    dependency_probe_interval_s: float = 300.0
     game_thread_count: int = 2048
 
 
@@ -192,8 +180,6 @@ class WorkerHandshakeServer:
         ] = {}
         self._worker_capabilities: dict[int, tuple] = {}
         self._background_tasks: list[asyncio.Task] = []
-        self._dependency_probe_cache: DependencyProbe | None = None
-        self._dependency_probe_cached_at = 0.0
 
     async def start_background_tasks(self) -> None:
         self._background_tasks = [
@@ -321,16 +307,13 @@ class WorkerHandshakeServer:
             label = _worker_label(authenticated_worker, hello)
             worker = self._record_connection(authenticated_worker, label, session_id, hello)
 
-            dependency_probe = self._dependency_probe()
             welcome = WorkerWelcome(
                 worker_id=worker.id,
                 session_id=session_id,
                 heartbeat_interval_ms=self._config.heartbeat_interval_ms,
                 resources=worker.resources,
-                dependency_probe=dependency_probe,
             )
             await _send_message(websocket, "welcome", welcome)
-            await self._receive_dependency_report(websocket, worker, dependency_probe)
             self._connections[worker.id] = (worker.session_id or "", websocket)
             LOG.info("worker accepted worker_id=%s label=%s", worker.id, label)
             publish_workers_changed("worker.connected", {"worker_id": worker.id})
@@ -364,19 +347,10 @@ class WorkerHandshakeServer:
         wake_generation = self._work_generation
         closed = asyncio.create_task(websocket.wait_closed())
         worker_status = "connected"
-        probe_interval = max(self._config.dependency_probe_interval_s, 30.0)
-        probe_jitter = ((worker.id * 2654435761) % 1000) / 1000
-        next_dependency_probe_at = time.monotonic() + probe_interval * (
-            0.5 + probe_jitter
-        )
         try:
             while True:
                 if websocket.closed:
                     return
-
-                if time.monotonic() >= next_dependency_probe_at:
-                    await self._refresh_worker_dependencies(websocket, worker)
-                    next_dependency_probe_at = time.monotonic() + probe_interval
 
                 try:
                     assignment = await self._claim_next_assignment(
@@ -417,7 +391,7 @@ class WorkerHandshakeServer:
 
                 if not self._record_worker_status(
                     worker.id,
-                    "building",
+                    "downloading",
                     session_id=worker.session_id,
                 ):
                     self._fail_assignment(
@@ -425,7 +399,7 @@ class WorkerHandshakeServer:
                         RuntimeError("worker session is no longer current"),
                     )
                     raise WorkerConnectionInactive("worker session is no longer current")
-                worker_status = "building"
+                worker_status = "downloading"
 
                 payload = assignment.assignment
                 LOG.info(
@@ -477,16 +451,6 @@ class WorkerHandshakeServer:
                     )
                     await self._wake_workers()
                     await asyncio.sleep(ENGINE_FAILURE_BACKOFF_S)
-                    continue
-                except AssignmentDependencyRejected as error:
-                    self._fail_assignment(assignment, error)
-                    LOG.warning(
-                        "assignment rejected worker_id=%s assignment_id=%s reason=%s",
-                        worker.id,
-                        payload.assignment_id,
-                        error,
-                    )
-                    await self._wake_workers()
                     continue
                 except asyncio.CancelledError:
                     try:
@@ -590,79 +554,6 @@ class WorkerHandshakeServer:
                 await work
             return None
         return work.result()
-
-    def _dependency_probe(self) -> DependencyProbe:
-        now = time.monotonic()
-        if (
-            self._dependency_probe_cache is not None
-            and now - self._dependency_probe_cached_at < DEPENDENCY_PROBE_CACHE_S
-        ):
-            return self._dependency_probe_cache
-        connection = connect_database(self._config.db_path)
-        try:
-            dependencies = sorted(
-                {
-                    dependency
-                    for engine in list_engine_records(connection)
-                    if engine.active
-                    for dependency in engine.required_dependencies
-                }
-            )
-        finally:
-            connection.close()
-        revision = hashlib.sha256("\0".join(dependencies).encode("utf-8")).hexdigest()
-        probe = DependencyProbe(
-            revision=revision,
-            required_dependencies=dependencies,
-        )
-        self._dependency_probe_cache = probe
-        self._dependency_probe_cached_at = now
-        return probe
-
-    async def _refresh_worker_dependencies(
-        self,
-        websocket: WebSocketServerProtocol,
-        worker: WorkerRecord,
-    ) -> None:
-        probe = self._dependency_probe()
-        await _send_message(websocket, "dependency_probe", probe)
-        await self._receive_dependency_report(websocket, worker, probe)
-
-    async def _receive_dependency_report(
-        self,
-        websocket: WebSocketServerProtocol,
-        worker: WorkerRecord,
-        probe: DependencyProbe,
-    ) -> None:
-        raw_message = await websocket.recv()
-        report = decode_message(raw_message, "dependency_report", DependencyReport)
-        if report.revision != probe.revision:
-            raise ProtocolValidationError("dependency report revision mismatch")
-        unexpected = set(report.available_dependencies).difference(
-            probe.required_dependencies
-        )
-        if unexpected:
-            raise ProtocolValidationError("dependency report contains unrequested names")
-        connection = connect_database(self._config.db_path)
-        try:
-            valid, changed = update_worker_dependencies(
-                connection,
-                worker.id,
-                available_dependencies=report.available_dependencies,
-                manifest_revision=report.revision,
-                session_id=worker.session_id,
-            )
-            connection.commit()
-        finally:
-            connection.close()
-        if not valid:
-            raise WorkerConnectionInactive("worker session is no longer current")
-        self._worker_capabilities[worker.id] = _worker_capability_key(
-            worker,
-            report.available_dependencies,
-        )
-        if changed:
-            publish_workers_changed("worker.dependencies", {"worker_id": worker.id})
 
     def _validate_app_commit(
         self,
@@ -810,7 +701,7 @@ class WorkerHandshakeServer:
             WHERE id != ?
               AND machine_id = ?
               AND status != 'revoked'
-              AND (pool_id IS NOT NULL OR status IN ('connected', 'building', 'ready', 'busy'))
+              AND (pool_id IS NOT NULL OR status IN ('connected', 'downloading', 'ready', 'busy'))
             """,
             (expected_hardware, worker.id, hello.machine_id),
         ).fetchone()
@@ -954,13 +845,6 @@ class WorkerHandshakeServer:
     ) -> AssignmentReady:
         raw_message = await websocket.recv()
         envelope = decode_envelope(raw_message)
-        if envelope.type == "assignment_rejected":
-            rejected = AssignmentRejected.model_validate(envelope.data)
-            if not rejected.matches_assignment(assignment.assignment):
-                raise ProtocolValidationError("assignment rejection mismatch")
-            raise AssignmentDependencyRejected(
-                "worker missing dependencies: " + ", ".join(rejected.missing_dependencies)
-            )
         if envelope.type == "assignment_failed":
             failure = AssignmentFailed.model_validate(envelope.data)
             if not failure.matches_assignment(assignment.assignment):
@@ -1107,22 +991,12 @@ class WorkerHandshakeServer:
         )
 
 
-def _worker_capability_key(
-    worker: WorkerRecord,
-    available_dependencies: list[str] | None = None,
-) -> tuple:
+def _worker_capability_key(worker: WorkerRecord) -> tuple:
     hardware = worker.hw.model_dump_json() if worker.hw is not None else ""
     return (
         worker.assigned_threads,
         worker.assigned_hash_mb,
         hardware,
-        tuple(
-            sorted(
-                worker.available_dependencies
-                if available_dependencies is None
-                else available_dependencies
-            )
-        ),
     )
 
 

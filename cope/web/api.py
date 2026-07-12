@@ -1,25 +1,30 @@
 from __future__ import annotations
 
 import hmac
+import hashlib
+import json
 import logging
 import os
 import secrets
 import sqlite3
+import uuid
+from pathlib import Path
 from typing import Any
 
 import chess
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field, ValidationError, field_validator
 from starlette.datastructures import UploadFile
 
-from cope.core.models import EngineSpec, TournamentConfig
+from cope.core.models import TournamentConfig
 from cope.db import (
     ChatSettingsRecord,
     category_tournament_count,
     create_category,
     create_engine,
+    create_engine_version,
     create_opening_suite,
     create_tournament,
     create_worker,
@@ -29,6 +34,7 @@ from cope.db import (
     delete_category,
     delete_chat_message,
     delete_engine,
+    delete_engine_version,
     delete_opening_suite,
     delete_tournament,
     delete_worker,
@@ -36,16 +42,21 @@ from cope.db import (
     get_category,
     get_chat_settings,
     get_engine_record,
+    get_engine_family,
+    get_engine_version_record,
     get_game,
     get_opening_suite,
     get_tournament,
     get_tournament_rating_commit,
     get_worker,
+    get_worker_by_session_id,
     get_worker_pool,
     list_categories,
     list_chat_messages,
     list_engine_games,
     list_engine_records,
+    list_engine_families,
+    list_engine_versions,
     list_games,
     list_games_by_status,
     list_opening_suites,
@@ -57,7 +68,6 @@ from cope.db import (
     list_workers,
     mint_worker_pool_token,
     mint_worker_token_for_worker,
-    next_engine_id,
     replace_suite_openings,
     request_tournament_rating_commit,
     revoke_worker,
@@ -67,6 +77,7 @@ from cope.db import (
     update_category,
     update_chat_settings,
     update_engine,
+    update_engine_version,
     update_opening_suite,
     update_tournament,
     update_worker_label,
@@ -77,6 +88,76 @@ from cope.web.requests import read_form
 
 
 LOG = logging.getLogger("cope.web.api")
+ENGINE_UPLOAD_CHUNK_BYTES = 1024 * 1024
+
+
+def _engine_binary_root() -> Path:
+    return Path(os.environ.get("COPE_ENGINE_BINARY_DIR", "/var/lib/cope/engine-binaries")).expanduser().resolve()
+
+
+async def _store_engine_upload(upload: UploadFile) -> tuple[str, int]:
+    root = _engine_binary_root()
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    maximum = int(os.environ.get("COPE_ENGINE_BINARY_MAX_BYTES", str(1024 * 1024 * 1024)))
+    temporary = root / f".upload-{uuid.uuid4().hex}"
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with temporary.open("xb") as output:
+            while True:
+                chunk = await upload.read(ENGINE_UPLOAD_CHUNK_BYTES)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > maximum:
+                    raise HTTPException(status_code=413, detail=f"Engine binary exceeds the {maximum}-byte upload limit.")
+                digest.update(chunk)
+                output.write(chunk)
+            if size == 0:
+                raise HTTPException(status_code=422, detail="The uploaded engine binary is empty.")
+            output.flush()
+            os.fsync(output.fileno())
+        sha256 = digest.hexdigest()
+        destination = root / sha256
+        if destination.exists():
+            temporary.unlink()
+            if destination.stat().st_size != size:
+                raise HTTPException(status_code=500, detail="Stored engine artifact failed an integrity check.")
+        else:
+            os.replace(temporary, destination)
+            destination.chmod(0o600)
+        return sha256, size
+    finally:
+        await upload.close()
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _remove_unreferenced_artifact(connection: sqlite3.Connection, storage_key: str) -> None:
+    row = connection.execute(
+        "SELECT COUNT(*) AS count FROM engine_versions WHERE storage_key = ?", (storage_key,)
+    ).fetchone()
+    if row is not None and int(row["count"]) == 0:
+        try:
+            (_engine_binary_root() / storage_key).unlink(missing_ok=True)
+        except OSError:
+            LOG.exception("could not remove unreferenced engine artifact storage_key=%s", storage_key)
+
+
+def _engine_version_admin_payload(version) -> dict[str, Any]:
+    payload = jsonable_encoder(version)
+    payload["active"] = version.version_active
+    payload["storage_status"] = _engine_artifact_status(version)
+    return payload
+
+
+def _engine_artifact_status(version) -> str:
+    path = _engine_binary_root() / version.storage_key
+    if not path.is_file():
+        return "missing"
+    if path.stat().st_size != version.binary_size:
+        return "corrupt"
+    return "ready"
 
 
 class TournamentPayload(BaseModel):
@@ -92,13 +173,23 @@ class TournamentPayload(BaseModel):
 class EnginePayload(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     author: str = Field(default="", max_length=120)
-    version: str = Field(default="", max_length=80)
-    git_url: str = Field(min_length=1)
-    branch: str = Field(default="", max_length=120)
-    commit: str
-    build_cmd: str = Field(min_length=1)
-    binary_path: str = Field(min_length=1)
-    required_dependencies: list[str] = Field(default_factory=list)
+    active: bool = True
+
+    @field_validator("name")
+    @classmethod
+    def strip_engine_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("engine name cannot be blank")
+        return value
+
+    @field_validator("author")
+    @classmethod
+    def strip_engine_author(cls, value: str) -> str:
+        return value.strip()
+
+
+class EngineVersionUpdatePayload(BaseModel):
     uci_options: dict[str, str | int | bool] = Field(default_factory=dict)
     active: bool = True
 
@@ -505,7 +596,6 @@ def register_api_routes(app: FastAPI) -> None:
             "settings": _settings_rows(web_app._settings_view(connection, tournament)),
             "commit": get_tournament_rating_commit(connection, tournament.id),
             "actions": web_app.TOURNAMENT_ACTIONS.get(tournament.status, {}),
-            "dependency_status": _tournament_dependency_status(connection, tournament),
             "capabilities": {
                 "editable": tournament.status == "draft",
                 "deletable": tournament.status not in {"scheduled", "running"},
@@ -619,14 +709,18 @@ def register_api_routes(app: FastAPI) -> None:
 
     @app.get("/api/admin/engines")
     def admin_engines(connection: sqlite3.Connection = Depends(web_app._database)):
-        engines = list_engine_records(connection)
+        engines = list_engine_families(connection)
         return _json(
             {
-                "engines": engines,
-                "game_counts": {
-                    engine.id: engine_game_count(connection, engine.id)
+                "engines": [
+                    {
+                        **jsonable_encoder(engine),
+                        "versions": [_engine_version_admin_payload(version) for version in list_engine_versions(connection, engine.id)],
+                    }
                     for engine in engines
-                },
+                ],
+                "game_counts": {version.id: engine_game_count(connection, version.id)
+                                for version in list_engine_records(connection)},
             }
         )
 
@@ -638,14 +732,6 @@ def register_api_routes(app: FastAPI) -> None:
                 "defaults": {
                     "name": "",
                     "author": "",
-                    "version": "",
-                    "git_url": "",
-                    "branch": "",
-                    "commit": "",
-                    "build_cmd": "",
-                    "binary_path": "",
-                    "required_dependencies": [],
-                    "uci_options": {},
                     "active": True,
                 },
             }
@@ -656,13 +742,13 @@ def register_api_routes(app: FastAPI) -> None:
         engine_id: int,
         connection: sqlite3.Connection = Depends(web_app._database),
     ):
-        engine = get_engine_record(connection, engine_id)
+        engine = get_engine_family(connection, engine_id)
         if engine is None:
             raise HTTPException(status_code=404, detail="Engine not found.")
         return _json(
             {
                 "engine": engine,
-                "game_count": engine_game_count(connection, engine_id),
+                "versions": [_engine_version_admin_payload(version) for version in list_engine_versions(connection, engine_id)],
             }
         )
 
@@ -672,10 +758,10 @@ def register_api_routes(app: FastAPI) -> None:
         request: Request,
         connection: sqlite3.Connection = Depends(web_app._database),
     ):
-        engine_id = next_engine_id(connection)
-        spec = _engine_spec(engine_id, payload)
         try:
-            create_engine(connection, spec, author=payload.author, active=payload.active)
+            engine_id = create_engine(
+                connection, name=payload.name.strip(), author=payload.author.strip(), active=payload.active
+            )
             connection.commit()
         except sqlite3.IntegrityError as exc:
             raise HTTPException(status_code=409, detail=web_app._friendly_error(exc)) from exc
@@ -692,23 +778,14 @@ def register_api_routes(app: FastAPI) -> None:
         request: Request,
         connection: sqlite3.Connection = Depends(web_app._database),
     ):
-        if get_engine_record(connection, engine_id) is None:
+        if get_engine_family(connection, engine_id) is None:
             raise HTTPException(status_code=404, detail="Engine not found.")
-        _engine_spec(engine_id, payload)
         try:
             update_engine(
                 connection,
                 engine_id,
-                name=payload.name,
-                author=payload.author,
-                version=payload.version,
-                git_url=payload.git_url,
-                branch=payload.branch,
-                commit=payload.commit,
-                build_cmd=payload.build_cmd,
-                binary_path=payload.binary_path,
-                required_dependencies=payload.required_dependencies,
-                uci_options=payload.uci_options,
+                name=payload.name.strip(),
+                author=payload.author.strip(),
                 active=payload.active,
             )
             connection.commit()
@@ -723,7 +800,7 @@ def register_api_routes(app: FastAPI) -> None:
         request: Request,
         connection: sqlite3.Connection = Depends(web_app._database),
     ):
-        if get_engine_record(connection, engine_id) is None:
+        if get_engine_family(connection, engine_id) is None:
             raise HTTPException(status_code=404, detail="Engine not found.")
         try:
             delete_engine(connection, engine_id)
@@ -732,6 +809,117 @@ def register_api_routes(app: FastAPI) -> None:
         connection.commit()
         _publish_admin_change(web_app, request)
         return _json({"message": "Engine deleted."})
+
+    @app.post("/api/admin/engines/{engine_id}/versions")
+    async def admin_create_engine_version(
+        engine_id: int,
+        request: Request,
+        connection: sqlite3.Connection = Depends(web_app._database),
+    ):
+        if get_engine_family(connection, engine_id) is None:
+            raise HTTPException(status_code=404, detail="Engine not found.")
+        form = await request.form()
+        upload = form.get("binary")
+        if not isinstance(upload, UploadFile) or not upload.filename:
+            raise HTTPException(status_code=422, detail="Choose an engine binary to upload.")
+        version = str(form.get("version") or "").strip()
+        if not version or len(version) > 80:
+            raise HTTPException(status_code=422, detail="Version is required and must be at most 80 characters.")
+        try:
+            options = json.loads(str(form.get("uci_options") or "{}"))
+            if not isinstance(options, dict) or any(not str(name).strip() for name in options):
+                raise ValueError
+            if any(not isinstance(value, (str, int, bool)) for value in options.values()):
+                raise ValueError
+        except (json.JSONDecodeError, ValueError):
+            raise HTTPException(status_code=422, detail="Default UCI options must be a JSON object.")
+        active = str(form.get("active") or "true").lower() in {"1", "true", "yes", "on"}
+        binary_filename = upload.filename.replace("\\", "/").rsplit("/", 1)[-1].strip()
+        if not binary_filename or len(binary_filename) > 255 or any(ord(char) < 32 for char in binary_filename):
+            raise HTTPException(status_code=422, detail="The uploaded binary filename is invalid.")
+        artifact = await _store_engine_upload(upload)
+        try:
+            version_id = create_engine_version(
+                connection,
+                engine_id=engine_id,
+                version=version,
+                binary_filename=binary_filename,
+                binary_sha256=artifact[0],
+                binary_size=artifact[1],
+                storage_key=artifact[0],
+                uci_options=options,
+                active=active,
+            )
+            connection.commit()
+        except sqlite3.IntegrityError as exc:
+            connection.rollback()
+            _remove_unreferenced_artifact(connection, artifact[0])
+            raise HTTPException(status_code=409, detail=web_app._friendly_error(exc)) from exc
+        except Exception:
+            connection.rollback()
+            _remove_unreferenced_artifact(connection, artifact[0])
+            raise
+        _publish_admin_change(web_app, request)
+        return _json({"id": version_id, "message": f"Version {version} uploaded and verified."}, status_code=201)
+
+    @app.put("/api/admin/engine-versions/{version_id}")
+    def admin_update_engine_version(
+        version_id: int,
+        payload: EngineVersionUpdatePayload,
+        request: Request,
+        connection: sqlite3.Connection = Depends(web_app._database),
+    ):
+        if get_engine_version_record(connection, version_id) is None:
+            raise HTTPException(status_code=404, detail="Engine version not found.")
+        options = payload.uci_options
+        if any(not str(name).strip() for name in options):
+            raise HTTPException(status_code=422, detail="Default UCI options must be an object with non-empty names.")
+        update_engine_version(connection, version_id, uci_options=options, active=payload.active)
+        connection.commit()
+        _publish_admin_change(web_app, request)
+        return _json({"id": version_id, "message": "Engine version updated."})
+
+    @app.delete("/api/admin/engine-versions/{version_id}")
+    def admin_delete_engine_version(
+        version_id: int,
+        request: Request,
+        connection: sqlite3.Connection = Depends(web_app._database),
+    ):
+        try:
+            storage_key = delete_engine_version(connection, version_id)
+            connection.commit()
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        _remove_unreferenced_artifact(connection, storage_key)
+        _publish_admin_change(web_app, request)
+        return _json({"message": "Engine version deleted."})
+
+    @app.get("/api/worker/engine-binaries/{version_id}")
+    def worker_engine_binary(
+        version_id: int,
+        request: Request,
+        connection: sqlite3.Connection = Depends(web_app._database),
+    ):
+        authorization = request.headers.get("authorization", "")
+        scheme, _, credential = authorization.partition(" ")
+        worker = get_worker_by_session_id(connection, credential) if scheme.lower() == "bearer" and credential else None
+        if worker is None or worker.status not in {"connected", "downloading", "ready", "busy"}:
+            raise HTTPException(status_code=401, detail="A current worker session is required.")
+        version = get_engine_version_record(connection, version_id)
+        if version is None or not version.active:
+            raise HTTPException(status_code=404, detail="Engine version is unavailable.")
+        path = _engine_binary_root() / version.storage_key
+        if not path.is_file():
+            LOG.error("registered engine binary is missing version_id=%s path=%s", version_id, path)
+            raise HTTPException(status_code=503, detail="Engine binary is missing from server storage.")
+        response = FileResponse(
+            path,
+            media_type="application/octet-stream",
+            filename=version.binary_filename,
+        )
+        response.headers["Cache-Control"] = "private, max-age=31536000, immutable"
+        response.headers["X-Engine-SHA256"] = version.binary_sha256
+        return response
 
     # Categories
 
@@ -1317,64 +1505,6 @@ def _require_tournament(connection: sqlite3.Connection, tournament_id: int):
     return tournament
 
 
-def _engine_spec(engine_id: int, payload: EnginePayload) -> EngineSpec:
-    try:
-        return EngineSpec(
-            engine_id=engine_id,
-            name=payload.name.strip(),
-            version=payload.version.strip(),
-            git_url=payload.git_url.strip(),
-            branch=payload.branch.strip(),
-            commit=payload.commit.strip().lower(),
-            build_cmd=payload.build_cmd.strip(),
-            binary_path=payload.binary_path.strip(),
-            required_dependencies=payload.required_dependencies,
-            uci_options=payload.uci_options,
-        )
-    except ValidationError as exc:
-        raise HTTPException(
-            status_code=422,
-            detail=[error["msg"] for error in exc.errors()],
-        ) from exc
-
-
-def _tournament_dependency_status(connection: sqlite3.Connection, tournament) -> dict[str, Any]:
-    engine_records = {
-        engine.id: engine for engine in list_engine_records(connection)
-    }
-    workers = [
-        worker
-        for worker in list_workers(connection)
-        if worker.status in {"connected", "building", "ready", "busy"}
-    ]
-    available_anywhere = {
-        dependency
-        for worker in workers
-        for dependency in worker.available_dependencies
-    }
-    blocked_games = 0
-    required_for_blocked: set[str] = set()
-    for game in list_games(connection, tournament.id):
-        if game.status != "pending":
-            continue
-        required = {
-            dependency
-            for engine_id in {game.white_engine_id, game.black_engine_id}
-            if engine_id in engine_records
-            for dependency in engine_records[engine_id].required_dependencies
-        }
-        if required and not any(
-            required.issubset(worker.available_dependencies) for worker in workers
-        ):
-            blocked_games += 1
-            required_for_blocked.update(required)
-    return {
-        "blocked_games": blocked_games,
-        "required_dependencies": sorted(required_for_blocked),
-        "missing_dependencies": sorted(required_for_blocked - available_anywhere),
-    }
-
-
 def _category_settings(value: dict[str, Any]) -> dict[str, Any]:
     defaults: dict[str, Any] = {
         "format": "round_robin",
@@ -1437,6 +1567,12 @@ def _validated_tournament_config(
     missing = [engine_id for engine_id in submitted.participants if engine_id not in records]
     if missing:
         raise HTTPException(status_code=422, detail="One or more selected engines no longer exist.")
+    unavailable = [
+        engine_id for engine_id in submitted.participants
+        if not records[engine_id].active or _engine_artifact_status(records[engine_id]) != "ready"
+    ]
+    if unavailable:
+        raise HTTPException(status_code=422, detail="Every participant must be active with a healthy binary artifact on the main server.")
 
     if submitted.category_id is None:
         _validate_opening_suite_reference(connection, submitted.opening_suite_id)
@@ -1544,7 +1680,7 @@ def _tournament_form_payload(
     engines = [
         engine
         for engine in list_engine_records(connection)
-        if engine.active or engine.id in participant_ids
+        if (engine.active and _engine_artifact_status(engine) == "ready") or engine.id in participant_ids
     ]
     category_defaults = {
         str(category.id): _category_settings(category.default_config)

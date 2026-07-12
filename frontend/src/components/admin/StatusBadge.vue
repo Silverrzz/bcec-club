@@ -7,7 +7,7 @@ const props = defineProps<{ status?: string | null; label?: string }>()
 const tone = computed(() => {
   const status = props.status?.toLowerCase() ?? ''
   if (['ready', 'running', 'connected', 'applied', 'active', 'finished', 'complete'].includes(status)) return 'positive'
-  if (['scheduled', 'building', 'busy', 'pending', 'minted', 'requested'].includes(status)) return 'info'
+  if (['scheduled', 'downloading', 'busy', 'pending', 'minted', 'requested'].includes(status)) return 'info'
   if (['paused', 'idle', 'offline', 'draft', 'expired'].includes(status)) return 'neutral'
   if (['failed', 'aborted', 'revoked', 'error', 'disconnected'].includes(status)) return 'danger'
   return 'neutral'

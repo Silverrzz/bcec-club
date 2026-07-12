@@ -11,7 +11,7 @@ const tone = computed(() => {
   const status = props.status?.toLowerCase() || ''
   if (['live', 'running', 'connected', 'ready', 'finished'].includes(status)) return 'positive'
   if (['scheduled', 'pending', 'assigned', 'minted'].includes(status)) return 'neutral'
-  if (['paused', 'building', 'reconnecting'].includes(status)) return 'warning'
+  if (['paused', 'downloading', 'reconnecting'].includes(status)) return 'warning'
   if (['aborted', 'abandoned', 'failed', 'revoked', 'offline'].includes(status)) return 'negative'
   return 'neutral'
 })
@@ -58,4 +58,3 @@ const tone = computed(() => {
   .status-pill { border-color: currentColor; }
 }
 </style>
-

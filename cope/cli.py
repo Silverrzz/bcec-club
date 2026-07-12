@@ -221,12 +221,6 @@ def main(argv: list[str] | None = None) -> int:
         help="seconds between batched worker presence writes",
     )
     worker_server_parser.add_argument(
-        "--dependency-probe-interval-s",
-        type=float,
-        default=float(os.environ.get("COPE_WORKER_DEPENDENCY_PROBE_INTERVAL_S", "300")),
-        help="seconds between staggered worker dependency refreshes",
-    )
-    worker_server_parser.add_argument(
         "--game-threads",
         type=_positive_int,
         default=int(os.environ.get("COPE_WORKER_GAME_THREADS", "2048")),
@@ -346,7 +340,6 @@ def main(argv: list[str] | None = None) -> int:
             expected_app_commit=args.app_commit,
             assignment_poll_interval_s=args.poll_interval_s,
             presence_flush_interval_s=args.presence_flush_interval_s,
-            dependency_probe_interval_s=args.dependency_probe_interval_s,
             game_thread_count=args.game_threads,
         )
         try:

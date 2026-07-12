@@ -21,8 +21,8 @@ COPY pyproject.toml MANIFEST.in ./
 COPY cope/ ./cope/
 COPY --from=frontend-build /src/cope/web/frontend_dist/ ./cope/web/frontend_dist/
 RUN python -m pip install --no-cache-dir ".[database,web,runner,worker]" \
-    && mkdir -p /backups \
-    && chown -R cope:cope /backups /app
+    && mkdir -p /backups /var/lib/cope/engine-binaries \
+    && chown -R cope:cope /backups /var/lib/cope /app
 USER cope
 EXPOSE 8701 8702
 ENTRYPOINT ["cope"]

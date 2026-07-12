@@ -22,7 +22,6 @@ interface Response {
   commit?: Commit | null
   actions: Record<string, string>
   form?: FormSeed
-  dependency_status?: { blocked_games: number; required_dependencies: string[]; missing_dependencies: string[] }
 }
 
 const route = useRoute()
@@ -120,7 +119,6 @@ onMounted(load)
         <template #actions><RouterLink class="button button--ghost" to="/admin/tournaments">All tournaments</RouterLink><RouterLink class="button button--secondary" :to="`/tournaments/${id}`">Public page</RouterLink></template>
       </AdminPageHeader>
       <InlineFeedback :message="error" />
-      <section v-if="data.dependency_status?.blocked_games" class="panel dependency-warning" role="status"><div><h2>Waiting for worker dependencies</h2><p>{{ data.dependency_status.blocked_games }} pending game{{ data.dependency_status.blocked_games === 1 ? '' : 's' }} currently has no capable connected worker.</p></div><code>{{ (data.dependency_status.missing_dependencies.length ? data.dependency_status.missing_dependencies : data.dependency_status.required_dependencies).join(', ') }}</code></section>
 
       <section class="panel control-bar">
         <div class="control-bar__status"><span>Current state</span><StatusBadge :status="data.tournament.status" /></div>
@@ -174,7 +172,6 @@ onMounted(load)
 <style scoped>
 .detail-loading { color: var(--color-text-muted, #64748b); min-height: 18rem; padding: 2rem; }
 .control-bar { align-items: center; display: flex; gap: 1rem; justify-content: space-between; padding: .8rem 1rem; }
-.dependency-warning { align-items: center; background: color-mix(in srgb, var(--color-warning, #b7791f) 8%, var(--color-surface, #fff)); border-color: color-mix(in srgb, var(--color-warning, #b7791f) 30%, var(--color-border, #d9e0ea)); display: flex; gap: 1rem; justify-content: space-between; padding: .85rem 1rem; }.dependency-warning h2 { font-size: .85rem; margin: 0; }.dependency-warning p { color: var(--color-text-muted, #64748b); font-size: .72rem; margin: .2rem 0 0; }.dependency-warning code { font-size: .72rem; }
 .control-bar__status { align-items: center; display: flex; gap: .65rem; }
 .control-bar__status > span { color: var(--color-text-muted, #64748b); font-size: .72rem; font-weight: 650; }
 .control-bar__actions { display: flex; flex-wrap: wrap; gap: .5rem; justify-content: flex-end; }

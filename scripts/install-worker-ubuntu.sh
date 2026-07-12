@@ -13,7 +13,7 @@ if [ ! -f "$repo_dir/pyproject.toml" ]; then
 fi
 
 apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates git python3 python3-pip python3-venv
+DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates python3 python3-pip python3-venv
 
 id cope-worker >/dev/null 2>&1 || useradd --system --home-dir /var/lib/cope-worker --create-home --shell /usr/sbin/nologin cope-worker
 install -d -o cope-worker -g cope-worker -m 0700 /var/lib/cope-worker

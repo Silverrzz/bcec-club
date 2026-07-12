@@ -55,9 +55,6 @@ async function load(): Promise<void> {
   }
 }
 
-function isWebUrl(value?: string | null): boolean {
-  return Boolean(value && /^https?:\/\//i.test(value))
-}
 </script>
 
 <template>
@@ -71,9 +68,6 @@ function isWebUrl(value?: string | null): boolean {
           <RouterLink class="back-link" to="/ratings">Back to ratings</RouterLink>
           <h1>{{ data.engine.name }}</h1>
           <p v-if="data.engine.author">By {{ data.engine.author }}</p>
-          <a v-if="isWebUrl(data.engine.git_url)" class="source-link" :href="data.engine.git_url || ''" target="_blank" rel="noopener noreferrer">
-            View source repository
-          </a>
         </div>
 
         <dl class="record-stats" aria-label="Game record">
@@ -88,15 +82,14 @@ function isWebUrl(value?: string | null): boolean {
         <section class="panel build-panel" aria-labelledby="build-title">
           <header>
             <div>
-              <h2 id="build-title">Build information</h2>
+              <h2 id="build-title">Version artifact</h2>
             </div>
           </header>
           <dl class="build-details">
             <div><dt>Version</dt><dd>{{ data.engine.version || '-' }}</dd></div>
-            <div><dt>Branch</dt><dd><code>{{ data.engine.branch || '-' }}</code></dd></div>
-            <div><dt>Commit</dt><dd><code :title="data.engine.commit || undefined">{{ data.engine.commit ? data.engine.commit.slice(0, 12) : '-' }}</code></dd></div>
-            <div class="detail-wide"><dt>Build command</dt><dd><code>{{ data.engine.build_cmd || '-' }}</code></dd></div>
-            <div class="detail-wide"><dt>Binary path</dt><dd><code>{{ data.engine.binary_path || '-' }}</code></dd></div>
+            <div><dt>Binary</dt><dd><code>{{ data.engine.binary_filename || '-' }}</code></dd></div>
+            <div class="detail-wide"><dt>SHA-256</dt><dd><code :title="data.engine.binary_sha256 || undefined">{{ data.engine.binary_sha256 || '-' }}</code></dd></div>
+            <div><dt>Size</dt><dd>{{ data.engine.binary_size ? `${data.engine.binary_size.toLocaleString()} bytes` : '-' }}</dd></div>
           </dl>
         </section>
 

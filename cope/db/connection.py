@@ -18,7 +18,7 @@ DEFAULT_DATABASE_URL = "postgresql://cope@127.0.0.1:5432/cope"
 # Kept as an import alias while the rest of the application moves from the old
 # path-shaped setting to a PostgreSQL URL.
 DEFAULT_DB_PATH = DEFAULT_DATABASE_URL
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _PLACEHOLDER = re.compile(r"\?")
 _pools: dict[tuple[str, str | None], ConnectionPool] = {}

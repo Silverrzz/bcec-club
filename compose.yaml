@@ -16,6 +16,8 @@ x-cope-service: &cope-service
     COPE_WEB_STREAM_URL: ws://web:8701/internal/stream
     COPE_WORKER_SERVER_URL: wss://${COPE_DOMAIN:?Set COPE_DOMAIN}/worker
     COPE_OPENING_IMPORT_MAX_BYTES: ${COPE_OPENING_IMPORT_MAX_BYTES:-67108864}
+    COPE_ENGINE_BINARY_DIR: /var/lib/cope/engine-binaries
+    COPE_ENGINE_BINARY_MAX_BYTES: ${COPE_ENGINE_BINARY_MAX_BYTES:-1073741824}
   secrets:
     - cope_admin_token
     - cope_event_token
@@ -79,6 +81,8 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+    volumes:
+      - engine-binaries:/var/lib/cope/engine-binaries
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8701/health/ready', timeout=3)"]
       interval: 15s
@@ -109,8 +113,6 @@ services:
       - "10"
       - --presence-flush-interval-s
       - "15"
-      - --dependency-probe-interval-s
-      - "300"
       - --game-threads
       - ${COPE_WORKER_GAME_THREADS:-2048}
     depends_on:
@@ -165,5 +167,6 @@ secrets:
 
 volumes:
   postgres-data:
+  engine-binaries:
   caddy-data:
   caddy-config:

@@ -2,18 +2,28 @@ export type Id = number
 
 export interface Engine {
   id: Id
-  engine_id?: Id
+  engine_id: Id
   name: string
   author?: string
-  version?: string
-  git_url: string
-  branch?: string
-  commit: string
-  build_cmd: string
-  binary_path: string
-  required_dependencies: string[]
+  version: string
+  binary_filename: string
+  binary_sha256: string
+  binary_size: number
+  storage_key?: string
   uci_options: Record<string, string | number | boolean>
   active: boolean
+  version_active?: boolean
+  engine_active?: boolean
+  created_at?: string
+  storage_status?: 'ready' | 'missing' | 'corrupt'
+}
+
+export interface EngineFamily {
+  id: Id
+  name: string
+  author?: string
+  active: boolean
+  versions: Engine[]
 }
 
 export interface Category {
@@ -115,9 +125,6 @@ export interface Worker {
   pool_id?: number | null
   assigned_threads: number
   assigned_hash_mb: number
-  available_dependencies: string[]
-  dependency_manifest_revision?: string | null
-  dependencies_checked_at?: string | null
   last_seen?: string | null
   hw?: {
     cpu_model: string

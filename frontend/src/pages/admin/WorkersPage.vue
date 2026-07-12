@@ -41,7 +41,6 @@ const totalWorkers = ref(0)
 const connectedWorkers = ref(0)
 const machines = ref<MachineListItem[]>([])
 const pools = ref<WorkerPoolItem[]>([])
-const requiredDependencies = ref<string[]>([])
 const loading = ref(true)
 const error = ref('')
 const streamConnected = ref(false)
@@ -67,13 +66,12 @@ const totalPages = computed(() => Math.max(1, Math.ceil(totalWorkers.value / per
 async function load(): Promise<void> {
   loading.value = true
   try {
-    const response = await api.get<{ workers: WorkerListItem[]; machines: MachineListItem[]; pools: WorkerPoolItem[]; required_dependencies: string[]; total_workers: number; connected_workers: number }>(`/api/admin/workers?page=${page.value}&per_page=${perPage}`)
+    const response = await api.get<{ workers: WorkerListItem[]; machines: MachineListItem[]; pools: WorkerPoolItem[]; total_workers: number; connected_workers: number }>(`/api/admin/workers?page=${page.value}&per_page=${perPage}`)
     workers.value = response.workers
     totalWorkers.value = response.total_workers ?? response.workers.length
     connectedWorkers.value = response.connected_workers ?? 0
     machines.value = response.machines
     pools.value = response.pools
-    requiredDependencies.value = response.required_dependencies ?? []
   } catch (cause) { error.value = errorText(cause) }
   finally { loading.value = false }
 }
@@ -90,7 +88,6 @@ function connectStream(): void {
         workers.value = envelope.data.workers
         totalWorkers.value = envelope.data.total_workers ?? workers.value.length
         connectedWorkers.value = envelope.data.connected_workers ?? 0
-        requiredDependencies.value = Array.isArray(envelope.data?.required_dependencies) ? envelope.data.required_dependencies : requiredDependencies.value
         machines.value = Array.isArray(envelope.data?.machines) ? envelope.data.machines : []
         if (Array.isArray(envelope.data?.pools)) {
           const commands = new Map(pools.value.map((pool) => [pool.id, pool.start_command]))
@@ -199,11 +196,6 @@ onBeforeUnmount(() => source?.close())
       <template #actions><button class="button button--secondary" type="button" @click="showCreate = !showCreate; showPoolCreate = false">New worker</button><button class="button button--primary" type="button" @click="showPoolCreate = !showPoolCreate; showCreate = false">New machine pool</button></template>
     </AdminPageHeader>
     <InlineFeedback :message="error" />
-    <section class="panel dependency-panel">
-      <div class="panel-heading"><div><h2>Active engine dependencies</h2><p>Install these executables on worker hosts. COPE only detects them through each worker service PATH.</p></div></div>
-      <div v-if="requiredDependencies.length" class="dependency-list"><code v-for="dependency in requiredDependencies" :key="dependency">{{ dependency }}</code></div>
-      <p v-else class="dependency-empty">No active engine declares an external executable dependency.</p>
-    </section>
     <WorkerTokenPanel
       v-if="poolEnrollment"
       :token="poolEnrollment.token"
@@ -300,7 +292,6 @@ onBeforeUnmount(() => source?.close())
 .worker-panel { overflow: hidden; padding: 0; }.table-scroll { overflow-x: auto; }.data-table { border-collapse: collapse; min-width: 66rem; width: 100%; }.data-table th { color: var(--color-text-muted, #64748b); font-size: .65rem; letter-spacing: .04em; padding: .65rem .75rem; text-align: left; text-transform: uppercase; }.data-table td { border-top: 1px solid var(--color-border, #d9e0ea); font-size: .74rem; padding: .7rem .75rem; vertical-align: middle; }.worker-row--warning { background: color-mix(in srgb, var(--color-warning, #b7791f) 6%, transparent); }.data-table td:first-child a { color: inherit; display: grid; text-decoration: none; }.data-table small { color: var(--color-text-muted, #64748b); display: block; font-size: .64rem; margin-top: .15rem; }.work-cell { max-width: 18rem; }.work-cell strong, .work-cell small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.state-label { background: var(--color-surface-subtle, #f1f5f9); border-radius: 999px; font-size: .66rem; padding: .28rem .45rem; }.row-actions { align-items: center; display: flex; gap: .3rem; justify-content: flex-end; }.row-actions svg { fill: none; height: 1rem; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.7; width: 1rem; }.index-loading { color: var(--color-text-muted, #64748b); min-height: 14rem; padding: 2rem; }
 .worker-pagination { align-items: center; border-top: 1px solid var(--color-border, #d9e0ea); display: flex; gap: .75rem; justify-content: flex-end; padding: .65rem .75rem; }.worker-pagination span { color: var(--color-text-muted, #64748b); font-size: .7rem; }
 .machine-panel { overflow: hidden; padding: 0; }.panel-heading { border-bottom: 1px solid var(--color-border, #d9e0ea); padding: .85rem 1rem; }.panel-heading h2 { font-size: .9rem; margin: 0; }.panel-heading p { color: var(--color-text-muted, #64748b); font-size: .72rem; margin: .2rem 0 0; }.machine-table { min-width: 44rem; }.machine-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .7rem; }
-.dependency-panel { overflow: hidden; padding: 0; }.dependency-list { display: flex; flex-wrap: wrap; gap: .45rem; padding: .85rem 1rem; }.dependency-list code { background: var(--color-surface-subtle, #f1f5f9); border: 1px solid var(--color-border, #d9e0ea); border-radius: .35rem; font-size: .72rem; padding: .3rem .45rem; }.dependency-empty { color: var(--color-text-muted, #64748b); font-size: .72rem; margin: 0; padding: .85rem 1rem; }
 .pool-panel { overflow: hidden; padding: 0; }.pool-list { display: grid; }.pool-row { align-items: center; border-top: 1px solid var(--color-border, #d9e0ea); display: grid; gap: 1rem; grid-template-columns: minmax(10rem, 1fr) auto minmax(6rem, auto) minmax(9rem, auto) minmax(16rem, auto); padding: .75rem 1rem; }.pool-row:first-child { border-top: 0; }.pool-row > div { display: grid; }.pool-row small { color: var(--color-text-muted, #64748b); font-size: .64rem; margin-top: .15rem; }.pool-row strong { font-size: .76rem; }.pool-actions { display: flex !important; flex-wrap: wrap; gap: .35rem; justify-content: flex-end; }
 @media (max-width: 64rem) { .create-pool { grid-template-columns: repeat(2, minmax(0, 1fr)); }.create-pool > div:first-child, .create-pool .button-row { grid-column: 1 / -1; }.pool-row { grid-template-columns: minmax(10rem, 1fr) auto minmax(6rem, auto); }.pool-actions { grid-column: 1 / -1; justify-content: flex-start; } }
 @media (max-width: 50rem) { .create-worker, .create-pool { align-items: stretch; grid-template-columns: 1fr; }.create-worker .button-row, .create-pool .button-row { grid-column: auto; justify-content: flex-start; }.worker-summary { grid-template-columns: 1fr; }.pool-row { align-items: flex-start; grid-template-columns: 1fr auto; } }

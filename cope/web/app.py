@@ -64,6 +64,7 @@ from cope.db import (
     get_chat_message,
     get_engine,
     get_engine_record,
+    get_engine_family,
     get_opening_position,
     get_opening_suite,
     get_tournament,
@@ -93,7 +94,6 @@ from cope.db import (
     list_worker_activities,
     touch_service_heartbeat,
     mint_worker_token_for_worker,
-    next_engine_id,
     replace_suite_openings,
     request_tournament_rating_commit,
     revoke_worker,
@@ -106,7 +106,7 @@ from cope.db import (
     update_tournament,
     update_worker_label,
 )
-from cope.core.models import EngineSpec, HardwareInfo, TournamentFormat
+from cope.core.models import HardwareInfo, TournamentFormat
 from cope.core.stream import (
     StreamEnvelope,
     StreamProtocolError,
@@ -138,6 +138,9 @@ MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
 MAX_OPENING_IMPORT_BODY_BYTES = int(
     os.environ.get("COPE_OPENING_IMPORT_MAX_BYTES", str(64 * 1024 * 1024))
 )
+MAX_ENGINE_BINARY_BODY_BYTES = int(
+    os.environ.get("COPE_ENGINE_BINARY_MAX_BYTES", str(1024 * 1024 * 1024))
+) + 1024 * 1024
 templates = Jinja2Templates(directory=str(PACKAGE_DIR / "templates"))
 
 # Valid admin actions on a tournament, per current status.
@@ -147,7 +150,7 @@ TOURNAMENT_ACTIONS: dict[str, dict[str, str]] = {
     "running": {"pause": "paused", "abort": "aborted"},
     "paused": {"resume": "scheduled", "abort": "aborted"},
 }
-CONNECTED_WORKER_STATUSES = {"connected", "building", "ready", "busy"}
+CONNECTED_WORKER_STATUSES = {"connected", "downloading", "ready", "busy"}
 WORKER_RECENT_SECONDS = 60
 
 
@@ -449,11 +452,13 @@ def create_app(
                 {"status": "not_ready", "database": "unavailable"},
                 status_code=503,
             )
-        ready = schema_version == SCHEMA_VERSION
+        storage_ready = _engine_storage_ready()
+        ready = schema_version == SCHEMA_VERSION and storage_ready
         return JSONResponse(
             {
                 "status": "ready" if ready else "not_ready",
                 "database": "ok",
+                "engine_binary_storage": "ok" if storage_ready else "unavailable",
                 "schema_version": schema_version,
                 "expected_schema_version": SCHEMA_VERSION,
             },
@@ -479,11 +484,11 @@ def create_app(
             except sqlite3.Error:
                 pass
         content_length = request.headers.get("content-length")
-        request_body_limit = (
-            MAX_OPENING_IMPORT_BODY_BYTES
-            if _is_opening_import_request(request)
-            else MAX_REQUEST_BODY_BYTES
-        )
+        request_body_limit = MAX_REQUEST_BODY_BYTES
+        if _is_opening_import_request(request):
+            request_body_limit = MAX_OPENING_IMPORT_BODY_BYTES
+        elif _is_engine_binary_upload_request(request):
+            request_body_limit = MAX_ENGINE_BINARY_BODY_BYTES
         if (
             content_length
             and content_length.isdigit()
@@ -1191,24 +1196,12 @@ def create_app(
         connection: sqlite3.Connection = Depends(_database),
     ):
         form = await read_form(request)
-        values, uci_options, errors = _engine_form_values(form)
+        values, _uci_options, errors = _engine_form_values(form)
         if not errors:
             try:
-                spec = EngineSpec(
-                    engine_id=next_engine_id(connection),
-                    name=values["name"],
-                    version=values["version"],
-                    git_url=values["git_url"],
-                    branch=values["branch"],
-                    commit=values["commit"],
-                    build_cmd=values["build_cmd"],
-                    binary_path=values["binary_path"],
-                    required_dependencies=values["required_dependencies"],
-                    uci_options=uci_options,
-                )
                 create_engine(
                     connection,
-                    spec,
+                    name=values["name"],
                     author=values["author"],
                     active=values["active"],
                 )
@@ -1241,7 +1234,7 @@ def create_app(
         request: Request,
         connection: sqlite3.Connection = Depends(_database),
     ):
-        engine = get_engine_record(connection, engine_id)
+        engine = get_engine_family(connection, engine_id)
         if engine is None:
             raise HTTPException(status_code=404, detail="engine not found")
         return templates.TemplateResponse(
@@ -1254,18 +1247,9 @@ def create_app(
                 values={
                     "name": engine.name,
                     "author": engine.author,
-                    "version": engine.version,
-                    "git_url": engine.git_url,
-                    "branch": engine.branch,
-                    "commit": engine.commit,
-                    "build_cmd": engine.build_cmd,
-                    "binary_path": engine.binary_path,
-                    "required_dependencies": "\n".join(engine.required_dependencies),
                     "active": engine.active,
                 },
-                uci_options_text="\n".join(
-                    f"{key} = {value}" for key, value in engine.uci_options.items()
-                ),
+                uci_options_text="",
             ),
         )
 
@@ -1275,39 +1259,19 @@ def create_app(
         request: Request,
         connection: sqlite3.Connection = Depends(_database),
     ):
-        engine = get_engine_record(connection, engine_id)
+        engine = get_engine_family(connection, engine_id)
         if engine is None:
             raise HTTPException(status_code=404, detail="engine not found")
 
         form = await read_form(request)
-        values, uci_options, errors = _engine_form_values(form)
+        values, _uci_options, errors = _engine_form_values(form)
         if not errors:
             try:
-                EngineSpec(
-                    engine_id=engine_id,
-                    name=values["name"],
-                    version=values["version"],
-                    git_url=values["git_url"],
-                    branch=values["branch"],
-                    commit=values["commit"],
-                    build_cmd=values["build_cmd"],
-                    binary_path=values["binary_path"],
-                    required_dependencies=values["required_dependencies"],
-                    uci_options=uci_options,
-                )
                 update_engine(
                     connection,
                     engine_id,
                     name=values["name"],
                     author=values["author"],
-                    version=values["version"],
-                    git_url=values["git_url"],
-                    branch=values["branch"],
-                    commit=values["commit"],
-                    build_cmd=values["build_cmd"],
-                    binary_path=values["binary_path"],
-                    required_dependencies=values["required_dependencies"],
-                    uci_options=uci_options,
                     active=values["active"],
                 )
                 connection.commit()
@@ -1338,7 +1302,7 @@ def create_app(
         engine_id: int,
         connection: sqlite3.Connection = Depends(_database),
     ):
-        if get_engine_record(connection, engine_id) is None:
+        if get_engine_family(connection, engine_id) is None:
             raise HTTPException(status_code=404, detail="engine not found")
         try:
             delete_engine(connection, engine_id)
@@ -2042,6 +2006,27 @@ def _is_opening_import_request(request: Request) -> bool:
     )
 
 
+def _is_engine_binary_upload_request(request: Request) -> bool:
+    return request.method == "POST" and bool(
+        re.fullmatch(r"/api/admin/engines/\d+/versions", request.url.path)
+    )
+
+
+def _engine_storage_ready() -> bool:
+    root = Path(os.environ.get("COPE_ENGINE_BINARY_DIR", "/var/lib/cope/engine-binaries")).expanduser()
+    probe = root / f".health-{os.getpid()}-{threading.get_ident()}"
+    try:
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with probe.open("xb") as stream:
+            stream.write(b"ok")
+        return True
+    except OSError:
+        return False
+    finally:
+        with contextlib.suppress(OSError):
+            probe.unlink()
+
+
 def _security_error(
     request: Request,
     detail: str,
@@ -2214,14 +2199,6 @@ def _workers_snapshot_payload(
         {"worker": worker, "status": _worker_effective_status(worker)}
         for worker in workers
     ]
-    required_dependencies = sorted(
-        {
-            dependency
-            for engine in list_engine_records(connection)
-            if engine.active
-            for dependency in engine.required_dependencies
-        }
-    )
     return {
         "workers": [
             _worker_admin_payload(row)
@@ -2237,7 +2214,6 @@ def _workers_snapshot_payload(
             summary_rows,
             worker_server_url=worker_server_url,
         ),
-        "required_dependencies": required_dependencies,
     }
 
 
@@ -2481,10 +2457,6 @@ def _worker_admin_rows(
     workers: list[Any] | None = None,
 ) -> list[dict[str, Any]]:
     engines = _engine_names(connection)
-    active_engines = [engine for engine in list_engine_records(connection) if engine.active]
-    required = sorted(
-        {dependency for engine in active_engines for dependency in engine.required_dependencies}
-    )
     activities = list_worker_activities(connection)
     rows: list[dict[str, Any]] = []
     source = workers if workers is not None else list_workers(connection)
@@ -2497,8 +2469,6 @@ def _worker_admin_rows(
                     worker,
                     engines,
                     activity=activities.get(worker.id),
-                    active_engines=active_engines,
-                    required=required,
                 )
             )
         except (TypeError, ValueError, ValidationError, sqlite3.Error):
@@ -2511,20 +2481,10 @@ def _worker_admin_row(connection: sqlite3.Connection, worker_id: int) -> dict[st
     if worker is None:
         return None
     try:
-        active_engines = [engine for engine in list_engine_records(connection) if engine.active]
-        required = sorted(
-            {
-                dependency
-                for engine in active_engines
-                for dependency in engine.required_dependencies
-            }
-        )
         row = _worker_admin_view(
             worker,
             _engine_names(connection),
             activity=get_worker_activity(connection, worker.id),
-            active_engines=active_engines,
-            required=required,
         )
         row["failures"] = list_worker_failures(connection, worker.id, limit=20)
         return row
@@ -2537,12 +2497,9 @@ def _worker_admin_view(
     engines: dict[int, str],
     *,
     activity,
-    active_engines,
-    required: list[str],
 ) -> dict[str, Any]:
     effective_status = _worker_effective_status(worker)
     activity_view = _worker_activity_view(activity, engines)
-    available = set(worker.available_dependencies)
     return {
         "worker": worker,
         "status": effective_status,
@@ -2550,16 +2507,6 @@ def _worker_admin_view(
         "session": _worker_session_view(worker),
         "machine": _worker_machine_view(worker, effective_status),
         "work": activity_view or _worker_idle_activity(worker, effective_status),
-        "dependencies": {
-            "required": required,
-            "available": sorted(available),
-            "missing": [dependency for dependency in required if dependency not in available],
-            "runnable_engines": [
-                engine.name
-                for engine in active_engines
-                if set(engine.required_dependencies).issubset(available)
-            ],
-        },
     }
 
 
@@ -2593,7 +2540,6 @@ def _worker_admin_payload(row: dict[str, Any]) -> dict[str, Any]:
         "work": row["work"],
         "machine": row["machine"],
         "hardware": hardware,
-        "dependencies": row["dependencies"],
     }
 
 
@@ -2678,9 +2624,6 @@ def _worker_record_payload(worker) -> dict[str, Any]:
         "assigned_threads": worker.assigned_threads,
         "assigned_hash_mb": worker.assigned_hash_mb,
         "hw": hardware,
-        "available_dependencies": list(worker.available_dependencies),
-        "dependency_manifest_revision": worker.dependency_manifest_revision,
-        "dependencies_checked_at": worker.dependencies_checked_at,
         "last_seen": worker.last_seen,
     }
 
@@ -2704,7 +2647,6 @@ def _worker_admin_api_payload(
         "worker_launch_command": _worker_launch_command(worker, worker_server_url)
         if worker_server_url is not None
         else None,
-        "dependencies": row["dependencies"],
         "failures": [
             {
                 "id": failure.id,
@@ -2891,7 +2833,7 @@ def _worker_idle_activity(worker, effective_status: str) -> dict[str, Any]:
         "minted": ("pending", "Awaiting registration", "Token has not been used", "No worker process has connected with this token.", False),
         "ready": ("ready", "Idle", "Waiting for an eligible game", "The worker server is waiting for stream wake events or the next fallback scan.", False),
         "connected": ("connected", "Connected", "Preparing to accept work", "The machine is connected but has not started a game.", False),
-        "building": ("building", "Building", "Preparing to accept work", "The machine is connected but has not started a game.", False),
+        "downloading": ("downloading", "Downloading", "Preparing engine binary", "The machine is securely downloading and verifying an engine version.", False),
         "stale": ("stale", "Stale", "No active machine connection", "The worker has not reported a recent connection event.", True),
         "busy": ("busy", "Busy", "Marked busy with no active assignment", "This can indicate a stale worker state after an interruption.", True),
         "offline": ("offline", "Offline", "Worker process is not connected", "The reconnect session remains issued unless the worker is revoked.", bool(worker.session_id)),
@@ -3048,52 +2990,12 @@ def _engine_form_values(
     values = {
         "name": form_value(form, "name"),
         "author": form_value(form, "author"),
-        "version": form_value(form, "version"),
-        "git_url": form_value(form, "git_url"),
-        "branch": form_value(form, "branch"),
-        "commit": form_value(form, "commit").lower(),
-        "build_cmd": form_value(form, "build_cmd"),
-        "binary_path": form_value(form, "binary_path"),
-        "required_dependencies": [
-            item.strip()
-            for line in form_value(form, "required_dependencies").splitlines()
-            for item in line.split(",")
-            if item.strip()
-        ],
         "active": form_flag(form, "active"),
     }
     errors = []
     if not values["name"]:
         errors.append("Engine name is required.")
-    if not values["git_url"]:
-        errors.append("Git URL is required.")
-    if len(values["commit"]) != 40 or any(
-        char not in "0123456789abcdef" for char in values["commit"]
-    ):
-        errors.append("Commit must be a full 40-character hex SHA.")
-    if not values["build_cmd"]:
-        errors.append("Build command is required.")
-    if not values["binary_path"]:
-        errors.append("Binary path is required.")
-
-    uci_options: dict[str, Any] = {}
-    for line in form_value(form, "uci_options").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        key, separator, raw = line.partition("=")
-        if not separator or not key.strip():
-            errors.append(f'UCI option "{line}" must use the form "Name = value".')
-            continue
-        raw = raw.strip()
-        value: Any = raw
-        if raw.lower() in {"true", "false"}:
-            value = raw.lower() == "true"
-        elif raw.lstrip("-").isdigit():
-            value = int(raw)
-        uci_options[key.strip()] = value
-
-    return values, uci_options, errors
+    return values, {}, errors
 
 
 def _int_form_value(form: dict[str, list[str]], key: str, default: int) -> int:

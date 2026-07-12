@@ -8,6 +8,9 @@ import shutil
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
+from urllib.parse import urljoin, urlsplit, urlunsplit
 from contextlib import contextmanager
 from collections.abc import Callable
 from pathlib import Path
@@ -18,9 +21,9 @@ from cope.core.stream import clamp_uci_info_line
 
 
 LOG = logging.getLogger("cope.worker.engine")
-_BUILD_FAILURE_COOLDOWN_S = 60.0
-_BUILD_LOCKS: dict[Path, threading.Lock] = {}
-_BUILD_LOCKS_GUARD = threading.Lock()
+_ARTIFACT_FAILURE_COOLDOWN_S = 60.0
+_ARTIFACT_LOCKS: dict[Path, threading.Lock] = {}
+_ARTIFACT_LOCKS_GUARD = threading.Lock()
 
 
 class EnginePreparationError(RuntimeError):
@@ -33,15 +36,17 @@ class EnginePreparationError(RuntimeError):
 
 
 class UciEngineProcess:
-    def __init__(self, spec: EngineSpec):
+    def __init__(self, spec: EngineSpec, *, server_url: str, credential: str):
         self._spec = spec
         self._source_dir = _engine_source_dir(spec)
-        self._binary_path = self._source_dir / spec.binary_path
+        self._binary_path = self._source_dir / "engine"
+        self._download_url = _absolute_download_url(server_url, spec.binary_url)
+        self._credential = credential
         self._process: subprocess.Popen[str] | None = None
         self._stdout: queue.Queue[str | None] = queue.Queue()
         self._stdout_thread: threading.Thread | None = None
         self._io_lock = threading.Lock()
-        self._built = False
+        self._prepared = False
         LOG.info(
             "engine wrapper created engine_id=%s engine=%s source_dir=%s binary=%s",
             self._spec.engine_id,
@@ -55,10 +60,10 @@ class UciEngineProcess:
         return self._process is not None
 
     def prepare(self) -> None:
-        """Install and build this engine without starting a UCI game process."""
+        """Download and verify this version without starting a UCI process."""
         with self._io_lock:
             try:
-                self._ensure_built()
+                self._ensure_artifact()
             except EnginePreparationError:
                 raise
             except Exception as exc:
@@ -223,7 +228,7 @@ class UciEngineProcess:
                 f"{self._spec.name} exited with code {self._process.returncode}"
             )
 
-        self._ensure_built()
+        self._ensure_artifact()
         if not self._binary_path.exists():
             raise RuntimeError(f"{self._spec.name} binary does not exist: {self._binary_path}")
 
@@ -262,59 +267,61 @@ class UciEngineProcess:
         self._stdout_thread.start()
         return self._process
 
-    def _ensure_built(self) -> None:
-        if self._built and self._binary_path.exists():
+    def _ensure_artifact(self) -> None:
+        if self._prepared and self._binary_path.exists():
             LOG.info(
-                "engine build already prepared engine_id=%s engine=%s binary=%s",
+                "engine artifact already prepared engine_id=%s engine=%s binary=%s",
                 self._spec.engine_id,
                 self._spec.name,
                 self._binary_path,
             )
             return
 
-        build_key = _build_key(self._spec)
+        artifact_key = self._spec.binary_sha256
         cache_root = self._source_dir.parent
         cache_name = self._source_dir.name
         lock_path = cache_root / ".locks" / f"{cache_name}.lock"
         failure_path = cache_root / ".failures" / f"{cache_name}.txt"
 
         LOG.info(
-            "engine build waiting for machine cache engine_id=%s engine=%s cache=%s",
+            "engine download waiting for machine cache engine_id=%s engine=%s cache=%s",
             self._spec.engine_id,
             self._spec.name,
             self._source_dir,
         )
-        with _exclusive_build_lock(lock_path):
-            if _build_is_ready(self._source_dir, self._binary_path, build_key):
-                self._built = True
+        with _exclusive_artifact_lock(lock_path):
+            if _artifact_is_ready(
+                self._source_dir, self._binary_path, artifact_key, self._spec.binary_size
+            ):
+                self._prepared = True
                 LOG.info(
-                    "engine machine cache hit engine_id=%s engine=%s source_dir=%s commit=%s",
+                    "engine machine cache hit engine_id=%s engine=%s source_dir=%s sha256=%s",
                     self._spec.engine_id,
                     self._spec.name,
                     self._source_dir,
-                    self._spec.commit,
+                    self._spec.binary_sha256,
                 )
                 return
 
-            cached_failure = _recent_build_failure(failure_path)
+            cached_failure = _recent_artifact_failure(failure_path)
             if cached_failure is not None:
                 stage, detail = cached_failure
                 raise EnginePreparationError(
                     self._spec,
                     stage,
-                    "a recent machine-wide build attempt failed; retry is temporarily "
+                    "a recent machine-wide download attempt failed; retry is temporarily "
                     f"suppressed:\n{detail}",
                 )
 
             LOG.info(
-                "engine machine build starting engine_id=%s engine=%s source_dir=%s commit=%s",
+                "engine machine download starting engine_id=%s engine=%s cache=%s sha256=%s",
                 self._spec.engine_id,
                 self._spec.name,
                 self._source_dir,
-                self._spec.commit,
+                self._spec.binary_sha256,
             )
-            # The name is deterministic because the build lock guarantees one
-            # writer. A process killed mid-build leaves a directory that the
+            # The name is deterministic because the artifact lock guarantees one
+            # writer. A process killed mid-download leaves a directory that the
             # next attempt can identify and remove.
             temporary = cache_root / ".tmp" / cache_name
             stage = "cache"
@@ -325,45 +332,40 @@ class UciEngineProcess:
                     shutil.rmtree(temporary)
                 temporary.parent.mkdir(parents=True, exist_ok=True)
 
-                stage = "clone"
-                command = ["git", "clone"]
-                if self._spec.branch:
-                    command.extend(["--branch", self._spec.branch])
-                command.extend([self._spec.git_url, str(temporary)])
-                _run_checked(command, cwd=None)
-                stage = "checkout"
-                _run_checked(
-                    ["git", "checkout", "--force", "--detach", self._spec.commit],
-                    cwd=temporary,
+                temporary.mkdir(parents=True)
+                stage = "download"
+                temporary_binary = temporary / "engine"
+                _download_binary(
+                    self._download_url,
+                    temporary_binary,
+                    credential=self._credential,
+                    expected_size=self._spec.binary_size,
                 )
-                stage = "build"
-                _run_checked(self._spec.build_cmd, cwd=temporary, shell=True)
-
                 stage = "verify"
-                temporary_binary = temporary / self._spec.binary_path
-                if not temporary_binary.is_file():
-                    raise RuntimeError(
-                        f"{self._spec.name} build completed but binary was not found: "
-                        f"{temporary_binary}"
-                    )
-                (temporary / ".cope-build").write_text(build_key, encoding="utf-8")
+                digest = _sha256_file(temporary_binary)
+                if digest != self._spec.binary_sha256:
+                    raise RuntimeError(f"SHA-256 mismatch: expected {self._spec.binary_sha256}, got {digest}")
+                if temporary_binary.stat().st_size != self._spec.binary_size:
+                    raise RuntimeError("downloaded binary size does not match the registered artifact")
+                temporary_binary.chmod(0o700)
+                (temporary / ".cope-artifact").write_text(artifact_key, encoding="utf-8")
                 os.replace(temporary, self._source_dir)
                 if failure_path.exists():
                     failure_path.unlink()
             except Exception as exc:
                 error = EnginePreparationError(self._spec, stage, str(exc))
-                _record_build_failure(failure_path, error.stage, error.detail)
+                _record_artifact_failure(failure_path, error.stage, error.detail)
                 raise error from exc
             finally:
                 if temporary.exists():
                     try:
                         shutil.rmtree(temporary)
                     except OSError:
-                        LOG.exception("could not remove temporary engine build %s", temporary)
+                        LOG.exception("could not remove temporary engine download %s", temporary)
 
-            self._built = True
+            self._prepared = True
             LOG.info(
-                "engine machine build ready engine_id=%s engine=%s binary=%s",
+                "engine machine artifact ready engine_id=%s engine=%s binary=%s",
                 self._spec.engine_id,
                 self._spec.name,
                 self._binary_path,
@@ -470,7 +472,7 @@ def _engine_source_dir(spec: EngineSpec) -> Path:
         cache_root = Path(configured_cache_root).expanduser().resolve()
     else:
         cache_root = (_effective_home_dir() / ".cope-worker" / "engines").resolve()
-    return cache_root / f"engine-{_build_key(spec)}"
+    return cache_root / f"sha256-{spec.binary_sha256}"
 
 
 def _effective_home_dir() -> Path:
@@ -481,45 +483,52 @@ def _effective_home_dir() -> Path:
     return Path.home()
 
 
-def _build_is_ready(source_dir: Path, binary_path: Path, build_key: str) -> bool:
-    marker = source_dir / ".cope-build"
+def _artifact_is_ready(
+    source_dir: Path,
+    binary_path: Path,
+    artifact_key: str,
+    expected_size: int,
+) -> bool:
+    marker = source_dir / ".cope-artifact"
     try:
         return (
             source_dir.is_dir()
             and binary_path.is_file()
-            and marker.read_text(encoding="utf-8") == build_key
+            and binary_path.stat().st_size == expected_size
+            and marker.read_text(encoding="utf-8") == artifact_key
+            and _sha256_file(binary_path) == artifact_key
         )
     except (OSError, UnicodeError):
         return False
 
 
-def _recent_build_failure(path: Path) -> tuple[str, str] | None:
+def _recent_artifact_failure(path: Path) -> tuple[str, str] | None:
     try:
         age = time.time() - path.stat().st_mtime
-        if age >= _BUILD_FAILURE_COOLDOWN_S:
+        if age >= _ARTIFACT_FAILURE_COOLDOWN_S:
             path.unlink(missing_ok=True)
             return None
         stage, separator, detail = path.read_text(encoding="utf-8").partition("\n")
-        return (stage, detail.strip()) if separator else ("build", stage.strip())
+        return (stage, detail.strip()) if separator else ("cache", stage.strip())
     except (FileNotFoundError, OSError, UnicodeError):
         return None
 
 
-def _record_build_failure(path: Path, stage: str, detail: str) -> None:
+def _record_artifact_failure(path: Path, stage: str, detail: str) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(f"{stage}\n{detail[-8000:]}\n", encoding="utf-8")
     except OSError:
-        # Preserve the actual clone/build exception, especially when the
+        # Preserve the actual download/verification exception, especially when the
         # reason the failure cannot be recorded is a full filesystem.
-        LOG.exception("could not record engine build failure in %s", path)
+        LOG.exception("could not record engine artifact failure in %s", path)
 
 
 @contextmanager
-def _exclusive_build_lock(path: Path) -> Iterator[None]:
-    """Serialize one engine build across pool threads and Linux processes."""
-    with _BUILD_LOCKS_GUARD:
-        thread_lock = _BUILD_LOCKS.setdefault(path, threading.Lock())
+def _exclusive_artifact_lock(path: Path) -> Iterator[None]:
+    """Serialize one artifact download across pool threads and Linux processes."""
+    with _ARTIFACT_LOCKS_GUARD:
+        thread_lock = _ARTIFACT_LOCKS.setdefault(path, threading.Lock())
 
     with thread_lock:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -537,18 +546,53 @@ def _exclusive_build_lock(path: Path) -> Iterator[None]:
                     fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
-def _build_key(spec: EngineSpec) -> str:
-    digest = hashlib.blake2s(digest_size=16)
-    for value in (
-        spec.git_url,
-        spec.branch,
-        spec.commit,
-        spec.build_cmd,
-        spec.binary_path,
-        *spec.required_dependencies,
-    ):
-        digest.update(value.encode("utf-8"))
-        digest.update(b"\0")
+def _absolute_download_url(server_url: str, path: str) -> str:
+    if path.startswith(("https://", "http://")):
+        return path
+    parsed = urlsplit(server_url)
+    scheme = "https" if parsed.scheme in {"wss", "https"} else "http"
+    origin = urlunsplit((scheme, parsed.netloc, "/", "", ""))
+    return urljoin(origin, path.lstrip("/"))
+
+
+def _download_binary(
+    url: str,
+    destination: Path,
+    *,
+    credential: str,
+    expected_size: int,
+) -> None:
+    request = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {credential}", "Accept": "application/octet-stream"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response, destination.open("xb") as output:
+            declared = response.headers.get("Content-Length")
+            if declared and int(declared) != expected_size:
+                raise RuntimeError("server reported an unexpected binary size")
+            received = 0
+            while True:
+                chunk = response.read(min(1024 * 1024, expected_size - received + 1))
+                if not chunk:
+                    break
+                received += len(chunk)
+                if received > expected_size:
+                    raise RuntimeError("server sent more binary data than registered")
+                output.write(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"binary server returned HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"could not reach binary server: {exc.reason}") from exc
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
     return digest.hexdigest()
 
 

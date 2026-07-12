@@ -64,11 +64,10 @@ export interface EngineRecord {
   name: string
   author?: string | null
   version?: string | null
-  git_url?: string | null
-  branch?: string | null
-  commit?: string | null
-  build_cmd?: string | null
-  binary_path?: string | null
+  binary_filename?: string | null
+  binary_sha256?: string | null
+  binary_size?: number | null
+  created_at?: string | null
   uci_options?: Record<string, unknown>
   active?: boolean
 }
