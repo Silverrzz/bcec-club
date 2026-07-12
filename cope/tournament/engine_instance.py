@@ -11,7 +11,7 @@ from typing import Protocol, runtime_checkable
 
 import chess
 
-from cope.core.stream import clamp_uci_info_line
+from cope.core.stream import clamp_uci_info_line, parse_worker_command_elapsed
 
 from .uci import position_command, setoption_command
 
@@ -19,6 +19,7 @@ from .uci import position_command, setoption_command
 @dataclass(frozen=True, slots=True)
 class EngineSearchResult:
     bestmove: chess.Move
+    command_elapsed_ms: int | None = None
     eval_cp: int | None = None
     eval_mate: int | None = None
     depth: int | None = None
@@ -153,6 +154,9 @@ class EngineInstance:
 
     def _is_remote(self) -> bool:
         return isinstance(self._host, EngineCommandTransport)
+
+    def uses_worker_search_clock(self) -> bool:
+        return self._is_remote()
 
     def _send_remote_command(
         self,
@@ -378,8 +382,13 @@ def _parse_search_result(
     bestmove: chess.Move | None = None
     search_info = EngineSearchInfo()
     info_line: str | None = None
+    command_elapsed_ms: int | None = None
 
     for line in lines:
+        worker_elapsed_ms = parse_worker_command_elapsed(line)
+        if worker_elapsed_ms is not None:
+            command_elapsed_ms = worker_elapsed_ms
+            continue
         info = _parse_info_line(line, search_info)
         if info is not None:
             search_info = info
@@ -402,6 +411,7 @@ def _parse_search_result(
 
     return EngineSearchResult(
         bestmove=bestmove,
+        command_elapsed_ms=command_elapsed_ms,
         eval_cp=search_info.eval_cp,
         eval_mate=search_info.eval_mate,
         depth=search_info.depth,

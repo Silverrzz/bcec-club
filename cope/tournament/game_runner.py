@@ -53,7 +53,12 @@ class GameRunner:
 
         try:
             while engine.is_searching():
-                remaining = clock.probe_clock()
+                try:
+                    remaining = clock.probe_clock()
+                except TimeOutError:
+                    if not engine.uses_worker_search_clock():
+                        raise
+                    remaining = 0
                 if self._on_tick is not None:
                     self._on_tick(side_to_move, remaining)
                 time.sleep(self._clock_probe_interval)
@@ -76,7 +81,13 @@ class GameRunner:
         finally:
             if not self._get_game_state().is_finished():
                 try:
-                    clock.stop_clock()
+                    search = engine.get_last_search_result()
+                    elapsed_ms = (
+                        search.command_elapsed_ms
+                        if search is not None and engine.uses_worker_search_clock()
+                        else None
+                    )
+                    clock.stop_clock(elapsed_ms)
                     if self._on_clock_sync is not None:
                         self._on_clock_sync(side_to_move, False, _clock_remaining_ms(clock))
                 except TimeOutError:

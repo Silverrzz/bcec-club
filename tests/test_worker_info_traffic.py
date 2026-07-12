@@ -51,9 +51,14 @@ class EngineInfoTrafficTests(unittest.IsolatedAsyncioTestCase):
                     "info depth 1 score cp 5",
                     "info depth 2 score cp 8",
                     "bestmove e2e4 ponder e7e5",
-                ]
+                ],
+                17,
             ),
-            ["info depth 2 score cp 8", "bestmove e2e4 ponder e7e5"],
+            [
+                "info depth 2 score cp 8",
+                "info string cope-worker-command-elapsed-ms 17",
+                "bestmove e2e4 ponder e7e5",
+            ],
         )
 
 

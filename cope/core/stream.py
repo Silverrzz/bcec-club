@@ -13,6 +13,7 @@ from .models import StrictModel
 STREAM_PROTOCOL_VERSION = 1
 MAX_STREAM_MESSAGE_BYTES = 64 * 1024
 MAX_UCI_INFO_LINE = 4096
+WORKER_COMMAND_ELAPSED_PREFIX = "info string cope-worker-command-elapsed-ms "
 
 
 class StreamProtocolError(ValueError):
@@ -81,3 +82,18 @@ def clamp_uci_info_line(line: str) -> str:
     if len(line) <= MAX_UCI_INFO_LINE:
         return line
     return line[:MAX_UCI_INFO_LINE]
+
+
+def worker_command_elapsed_line(elapsed_ms: int) -> str:
+    return f"{WORKER_COMMAND_ELAPSED_PREFIX}{max(elapsed_ms, 0)}"
+
+
+def parse_worker_command_elapsed(line: str) -> int | None:
+    if not line.startswith(WORKER_COMMAND_ELAPSED_PREFIX):
+        return None
+    value = line[len(WORKER_COMMAND_ELAPSED_PREFIX) :]
+    try:
+        elapsed_ms = int(value)
+    except ValueError:
+        return None
+    return elapsed_ms if elapsed_ms >= 0 else None

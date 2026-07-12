@@ -139,8 +139,9 @@ class TimeManager:
         elif category is TimeControlCategory.MOVENODES:
             return self._nodes
 
-    def stop_clock(self):
-        elapsed_time = self._chess_clock.stop_clock()
+    def stop_clock(self, elapsed_time_ms: float | None = None):
+        wall_elapsed_time = self._chess_clock.stop_clock()
+        elapsed_time = wall_elapsed_time if elapsed_time_ms is None else elapsed_time_ms
         category = self._time_control.get_category()
 
         if category is TimeControlCategory.INCREMENT:

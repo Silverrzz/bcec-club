@@ -6,6 +6,7 @@ import hashlib
 import logging
 import os
 import platform
+import time
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -36,7 +37,7 @@ from cope.core.protocol import (
     encode_message,
     make_message,
 )
-from cope.core.stream import clamp_uci_info_line
+from cope.core.stream import clamp_uci_info_line, worker_command_elapsed_line
 
 from .uci_engine import EnginePreparationError, UciEngineProcess
 
@@ -259,8 +260,9 @@ async def _serve_assignment(
             )
             line_callback = None if info_publisher is None else info_publisher.publish
             try:
-                result_lines = await asyncio.to_thread(
-                    engine.handle_command,
+                result_lines, command_elapsed_ms = await asyncio.to_thread(
+                    _handle_engine_command_timed,
+                    engine,
                     command.command,
                     line_callback,
                 )
@@ -292,7 +294,7 @@ async def _serve_assignment(
 
             result = EngineCommandResult(
                 **command.model_dump(exclude={"command"}),
-                lines=_compact_search_result_lines(result_lines)
+                lines=_compact_search_result_lines(result_lines, command_elapsed_ms)
                 if info_publisher is not None
                 else result_lines,
             )
@@ -445,7 +447,18 @@ class _EngineInfoPublisher:
                 self._wake.set()
 
 
-def _compact_search_result_lines(lines: list[str]) -> list[str]:
+def _handle_engine_command_timed(
+    engine: UciEngineProcess,
+    command: str,
+    line_callback,
+) -> tuple[list[str], int]:
+    started_at = time.perf_counter()
+    lines = engine.handle_command(command, line_callback)
+    elapsed_ms = max(0, round((time.perf_counter() - started_at) * 1000))
+    return lines, elapsed_ms
+
+
+def _compact_search_result_lines(lines: list[str], elapsed_ms: int) -> list[str]:
     """Retain the final analysis snapshot and all non-analysis UCI output."""
     last_info: str | None = None
     result: list[str] = []
@@ -456,6 +469,7 @@ def _compact_search_result_lines(lines: list[str]) -> list[str]:
             result.append(line)
     if last_info is not None:
         result.insert(max(len(result) - 1, 0), last_info)
+    result.insert(max(len(result) - 1, 0), worker_command_elapsed_line(elapsed_ms))
     return result
 
 
