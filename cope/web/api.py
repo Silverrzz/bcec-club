@@ -195,8 +195,17 @@ class EnginePayload(BaseModel):
 
 
 class EngineVersionUpdatePayload(BaseModel):
+    version: str = Field(min_length=1, max_length=80)
     uci_options: dict[str, str | int | bool] = Field(default_factory=dict)
     active: bool = True
+
+    @field_validator("version")
+    @classmethod
+    def strip_version(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("version cannot be blank")
+        return value
 
 
 class CategoryPayload(BaseModel):
@@ -879,8 +888,17 @@ def register_api_routes(app: FastAPI) -> None:
         options = payload.uci_options
         if any(not str(name).strip() for name in options):
             raise HTTPException(status_code=422, detail="Default UCI options must be an object with non-empty names.")
-        update_engine_version(connection, version_id, uci_options=options, active=payload.active)
-        connection.commit()
+        try:
+            update_engine_version(
+                connection,
+                version_id,
+                version=payload.version,
+                uci_options=options,
+                active=payload.active,
+            )
+            connection.commit()
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(status_code=409, detail=web_app._friendly_error(exc)) from exc
         _publish_admin_change(web_app, request)
         return _json({"id": version_id, "message": "Engine version updated."})
 

@@ -404,12 +404,13 @@ def update_engine_version(
     connection: sqlite3.Connection,
     version_id: int,
     *,
+    version: str,
     uci_options: dict[str, Any],
     active: bool,
 ) -> None:
     connection.execute(
-        "UPDATE engine_versions SET uci_options = ?, active = ? WHERE id = ?",
-        (_json_dump(uci_options), int(active), version_id),
+        "UPDATE engine_versions SET version = ?, uci_options = ?, active = ? WHERE id = ?",
+        (version, _json_dump(uci_options), int(active), version_id),
     )
 
 

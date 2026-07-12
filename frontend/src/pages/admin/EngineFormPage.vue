@@ -84,9 +84,10 @@ async function uploadVersion(): Promise<void> {
 }
 
 async function saveVersion(version: Engine): Promise<void> {
+  if (!version.version.trim()) { error.value = 'Enter a version label.'; return }
   versionPending.value = version.id
   try {
-    const response = await api.put<{ message: string }>(`/api/admin/engine-versions/${version.id}`, { body: { active: version.active, uci_options: version.uci_options } })
+    const response = await api.put<{ message: string }>(`/api/admin/engine-versions/${version.id}`, { body: { version: version.version.trim(), active: version.active, uci_options: version.uci_options } })
     toast.success(response.message)
   } catch (cause) { error.value = errorText(cause); toast.error(cause) }
   finally { versionPending.value = null }
@@ -139,6 +140,7 @@ onMounted(load)
         <div class="section-heading"><div><h2>Versions</h2><p>{{ versions.length }} uploaded version{{ versions.length === 1 ? '' : 's' }}</p></div></div>
         <article v-for="version in versions" :key="version.id" class="panel version-card">
           <div class="version-heading"><div><h3>{{ form.name }} {{ version.version }}</h3><p>{{ version.binary_filename }} · {{ formatNumber(version.binary_size) }} bytes · {{ formatDate(version.created_at) }}</p><p v-if="version.storage_status !== 'ready'" class="artifact-error">Artifact {{ version.storage_status }} on the main server. Deactivate this version and re-upload it.</p></div><label class="switch-row"><input v-model="version.active" type="checkbox"><span><strong>Active</strong></span></label></div>
+          <label class="field"><span>Version</span><input v-model="version.version" class="input" required maxlength="80"></label>
           <dl><div><dt>SHA-256</dt><dd><code :title="version.binary_sha256">{{ version.binary_sha256 }}</code></dd></div><div><dt>Artifact ID</dt><dd>#{{ version.id }}</dd></div></dl>
           <EngineOptionsEditor v-model="version.uci_options" />
           <div class="form-actions"><button class="button button--danger" type="button" :disabled="versionPending === version.id" @click="removeVersion(version)">Delete</button><button class="button button--secondary" type="button" :disabled="versionPending === version.id" @click="saveVersion(version)">Save version</button></div>
