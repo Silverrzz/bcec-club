@@ -277,12 +277,22 @@ async function loadDetail(background: boolean): Promise<void> {
 }
 
 function applyDetail(response: TournamentDetailResponse): void {
-  const previousGame = data.value?.viewer_game?.id
+  const previousViewerGame = data.value?.viewer_game
+  const previousGame = previousViewerGame?.id
   const previousLength = data.value?.viewer_moves.length || 0
   const followedLatest = selectedPly.value >= previousLength
   const existingMessages = data.value?.chat_messages || []
   response.chat_messages = mergeMessages(response.chat_messages || [], existingMessages)
   data.value = response
+
+  if (
+    isActiveGame(previousViewerGame)
+    && response.viewer_game?.status === 'finished'
+    && sameId(previousViewerGame.id, response.viewer_game.id)
+    && sameId(previousViewerGame.id, selectedGameId.value)
+  ) {
+    awaitingNextLiveAfterGameId = String(previousViewerGame.id)
+  }
 
   if (String(previousGame ?? '') !== String(response.viewer_game?.id ?? '') || followedLatest) {
     selectedPly.value = response.viewer_moves.length
@@ -299,6 +309,8 @@ function applyDetail(response: TournamentDetailResponse): void {
     clockRuntime.value = null
     stopClock()
   }
+
+  followNextLiveGame()
 }
 
 function connectStream(): void {
@@ -397,9 +409,12 @@ function applySnapshot(snapshot: LiveSnapshot): void {
   const displayedGameUpdate = displayedGame
     ? data.value.games.find((game) => sameId(game.id, displayedGame.id))
     : undefined
+  const selectedGameUpdate = displayedGame && sameId(snapshot.game?.id, displayedGame.id)
+    ? snapshot.game
+    : displayedGameUpdate
   if (
-    displayedGame?.status === 'live'
-    && displayedGameUpdate?.status === 'finished'
+    isActiveGame(displayedGame)
+    && selectedGameUpdate?.status === 'finished'
     && sameId(displayedGame.id, selectedGameId.value)
   ) {
     awaitingNextLiveAfterGameId = String(displayedGame.id)
@@ -427,17 +442,24 @@ function applySnapshot(snapshot: LiveSnapshot): void {
   }
   if (snapshot.standings) data.value.standings = snapshot.standings
 
-  if (awaitingNextLiveAfterGameId && routeGameId.value === awaitingNextLiveAfterGameId) {
-    const nextLiveGame = isActiveGame(snapshot.game)
-      && !sameId(snapshot.game.id, awaitingNextLiveAfterGameId)
-      ? snapshot.game
-      : data.value.games.find((game) => isActiveGame(game) && !sameId(game.id, awaitingNextLiveAfterGameId))
-    if (nextLiveGame) void followLiveGame(nextLiveGame.id)
-  }
+  followNextLiveGame(snapshot.game)
 }
 
 function isActiveGame(game: GameRecord | null | undefined): game is GameRecord {
   return game?.status === 'assigned' || game?.status === 'live'
+}
+
+function followNextLiveGame(preferredGame?: GameRecord | null): void {
+  if (!data.value || !awaitingNextLiveAfterGameId) return
+  if (routeGameId.value !== awaitingNextLiveAfterGameId) return
+
+  const nextLiveGame = isActiveGame(preferredGame)
+    && !sameId(preferredGame.id, awaitingNextLiveAfterGameId)
+    ? preferredGame
+    : data.value.games.find(
+      (game) => isActiveGame(game) && !sameId(game.id, awaitingNextLiveAfterGameId),
+    )
+  if (nextLiveGame) void followLiveGame(nextLiveGame.id)
 }
 
 async function followLiveGame(gameId: Identifier): Promise<void> {
