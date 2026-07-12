@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import logging
 import os
@@ -43,6 +44,7 @@ from .uci_engine import EnginePreparationError, UciEngineProcess
 LOG = logging.getLogger("cope.worker")
 RECONNECT_INITIAL_DELAY_S = 1.0
 RECONNECT_MAX_DELAY_S = 30.0
+ENGINE_INFO_SEND_INTERVAL_S = 0.25
 
 
 @dataclass(frozen=True)
@@ -250,26 +252,23 @@ async def _serve_assignment(
 
             loop = asyncio.get_running_loop()
 
-            def publish_info(line: str) -> None:
-                line = clamp_uci_info_line(line)
-                info = EngineInfo(
-                    **command.model_dump(exclude={"command"}),
-                    lines=[line],
-                )
-                future = asyncio.run_coroutine_threadsafe(
-                    _send_message(websocket, "engine_info", info),
-                    loop,
-                )
-                future.result()
-
-            line_callback = publish_info if command.command.startswith("go") else None
+            info_publisher = (
+                _EngineInfoPublisher(websocket, command, loop)
+                if command.command.startswith("go")
+                else None
+            )
+            line_callback = None if info_publisher is None else info_publisher.publish
             try:
                 result_lines = await asyncio.to_thread(
                     engine.handle_command,
                     command.command,
                     line_callback,
                 )
+                if info_publisher is not None:
+                    await info_publisher.finish()
             except Exception as error:
+                if info_publisher is not None:
+                    await info_publisher.cancel()
                 failure = AssignmentFailed(
                     **assignment.assignment.message_fields(),
                     engine_id=command.engine_id,
@@ -293,7 +292,9 @@ async def _serve_assignment(
 
             result = EngineCommandResult(
                 **command.model_dump(exclude={"command"}),
-                lines=result_lines,
+                lines=_compact_search_result_lines(result_lines)
+                if info_publisher is not None
+                else result_lines,
             )
             commands_handled += 1
             LOG.info(
@@ -371,6 +372,91 @@ def _validate_assignment_message(
 ) -> None:
     if not message.matches_assignment(assignment.assignment):
         raise ProtocolValidationError(f"{label} assignment mismatch")
+
+
+class _EngineInfoPublisher:
+    """Keep engine stdout draining while bounding analysis traffic to the runner."""
+
+    def __init__(self, websocket, command: EngineCommand, loop) -> None:
+        self._websocket = websocket
+        self._command = command
+        self._loop = loop
+        self._latest_line: str | None = None
+        self._wake = asyncio.Event()
+        self._finish_requested = asyncio.Event()
+        self._finishing = False
+        self._task = loop.create_task(self._run())
+
+    def publish(self, line: str) -> None:
+        self._loop.call_soon_threadsafe(self._offer, clamp_uci_info_line(line))
+
+    def _offer(self, line: str) -> None:
+        if self._finishing or self._task.done():
+            return
+        self._latest_line = line
+        self._wake.set()
+
+    async def finish(self) -> None:
+        self._finishing = True
+        self._latest_line = None
+        self._finish_requested.set()
+        self._wake.set()
+        await self._task
+
+    async def cancel(self) -> None:
+        self._finishing = True
+        self._task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await self._task
+
+    async def _run(self) -> None:
+        next_send_at = 0.0
+        while True:
+            await self._wake.wait()
+            self._wake.clear()
+
+            if self._latest_line is None:
+                if self._finishing:
+                    return
+                continue
+
+            if not self._finishing:
+                delay = next_send_at - self._loop.time()
+                if delay > 0:
+                    try:
+                        await asyncio.wait_for(self._finish_requested.wait(), timeout=delay)
+                    except asyncio.TimeoutError:
+                        pass
+                    else:
+                        return
+
+            line = self._latest_line
+            self._latest_line = None
+            info = EngineInfo(
+                **self._command.model_dump(exclude={"command"}),
+                lines=[line],
+            )
+            await _send_message(self._websocket, "engine_info", info)
+            next_send_at = self._loop.time() + ENGINE_INFO_SEND_INTERVAL_S
+
+            if self._finishing and self._latest_line is None:
+                return
+            if self._latest_line is not None:
+                self._wake.set()
+
+
+def _compact_search_result_lines(lines: list[str]) -> list[str]:
+    """Retain the final analysis snapshot and all non-analysis UCI output."""
+    last_info: str | None = None
+    result: list[str] = []
+    for line in lines:
+        if line.startswith("info"):
+            last_info = line
+        else:
+            result.append(line)
+    if last_info is not None:
+        result.insert(max(len(result) - 1, 0), last_info)
+    return result
 
 
 async def _send_message(websocket, message_type: str, data) -> None:
