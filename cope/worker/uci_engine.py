@@ -212,7 +212,7 @@ class UciEngineProcess:
                 self._source_dir,
             )
             self._process = subprocess.Popen(
-                [str(self._binary_path)],
+                [str(self._binary_path.resolve())],
                 cwd=self._source_dir,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
